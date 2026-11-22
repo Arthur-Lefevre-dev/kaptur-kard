@@ -910,11 +910,10 @@ fn draw_effects_tab(ui: &mut egui::Ui, input: &DrawInput<'_>, actions: &mut UiAc
     ui.label(i18n.t("why_fsr_body"));
     ui.add_space(8.0);
 
-    let blocked = !fx.compute_ok || fx.native_res;
+    // Mode A/B stay selectable at native res — RCAS / NIS sharpen still apply.
+    let blocked = !fx.compute_ok;
     let reason = if !fx.compute_ok {
         i18n.t("effect_reason_no_compute")
-    } else if fx.native_res {
-        i18n.t("effect_reason_native")
     } else if fx.auto_disabled {
         i18n.t("effect_reason_budget")
     } else {
@@ -938,6 +937,8 @@ fn draw_effects_tab(ui: &mut egui::Ui, input: &DrawInput<'_>, actions: &mut UiAc
     });
     if blocked || fx.auto_disabled {
         ui.small(format!("{}: {}", i18n.t("label_unavailable"), reason));
+    } else if fx.native_res && fx.mode != "off" {
+        ui.small(i18n.t("tip_native_sharpen"));
     }
     ui.label(RichText::new(i18n.t("tip_upscale")).small().italics());
     ui.add_space(8.0);

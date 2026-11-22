@@ -448,7 +448,12 @@ impl UpscaleEngine {
         self.sharpness = s.clamp(0.0, 1.0);
     }
 
-    /// Returns true when upscale should run for this frame.
+    /// True when content already fills the window — FSR/NIS still run for sharpening only.
+    pub fn sharpen_only(&self, content: (u32, u32), view: (u32, u32)) -> bool {
+        is_native_or_downscale(content.0, content.1, view.0, view.1)
+    }
+
+    /// Returns true when upscale/sharpen should run for this frame.
     pub fn should_run(&mut self, content: (u32, u32), view: (u32, u32)) -> bool {
         if self.mode == UpscaleMode::Off || self.auto_disabled {
             if self.auto_disabled {
@@ -460,11 +465,10 @@ impl UpscaleEngine {
             self.block = UpscaleBlockReason::NoCompute;
             return false;
         }
-        if is_native_or_downscale(content.0, content.1, view.0, view.1) {
-            self.block = UpscaleBlockReason::NativeResolution;
-            return false;
-        }
+        // Native resolution: still run RCAS / NIS sharpen (no greying of Mode A/B).
         self.block = UpscaleBlockReason::None;
+        let _ = view;
+        let _ = content;
         true
     }
 
@@ -692,45 +696,52 @@ impl UpscaleEngine {
         out_w: u32,
         out_h: u32,
     ) {
-        let Some(easu) = self.easu_pipeline.as_ref() else {
-            return;
-        };
         let Some(rcas) = self.rcas_pipeline.as_ref() else {
             return;
         };
-        let con = easu_constants(in_w, in_h, out_w, out_h);
-        queue.write_buffer(&self.easu_buf, 0, bytemuck::bytes_of(&con));
-        let easu_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("easu-bg"),
-            layout: &self.easu_bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(src_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&mid.view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: self.easu_buf.as_entire_binding(),
-                },
-            ],
-        });
-        {
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("easu"),
-                timestamp_writes: None,
+        let sharpen_only = in_w == out_w && in_h == out_h;
+        let rcas_src = if sharpen_only {
+            // 1:1: skip EASU, RCAS sharpens the source directly.
+            src_view
+        } else {
+            let Some(easu) = self.easu_pipeline.as_ref() else {
+                return;
+            };
+            let con = easu_constants(in_w, in_h, out_w, out_h);
+            queue.write_buffer(&self.easu_buf, 0, bytemuck::bytes_of(&con));
+            let easu_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("easu-bg"),
+                layout: &self.easu_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(src_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(&mid.view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: self.easu_buf.as_entire_binding(),
+                    },
+                ],
             });
-            cpass.set_pipeline(easu);
-            cpass.set_bind_group(0, &easu_bg, &[]);
-            cpass.dispatch_workgroups((out_w + 7) / 8, (out_h + 7) / 8, 1);
-        }
+            {
+                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("easu"),
+                    timestamp_writes: None,
+                });
+                cpass.set_pipeline(easu);
+                cpass.set_bind_group(0, &easu_bg, &[]);
+                cpass.dispatch_workgroups((out_w + 7) / 8, (out_h + 7) / 8, 1);
+            }
+            &mid.view
+        };
 
         // Sharpness UI 0..1 → FSR stops (0 = max sharp, higher = softer). Invert.
         let stops = (1.0 - self.sharpness) * 2.0;
@@ -745,7 +756,7 @@ impl UpscaleEngine {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&mid.view),
+                    resource: wgpu::BindingResource::TextureView(rcas_src),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -1001,7 +1012,8 @@ mod tests {
     }
 
     #[test]
-    fn fsr_greyed_when_capture_fills_window() {
+    fn native_is_sharpen_only_not_blocked() {
+        // 1:1 still reports native for UI tip, but Mode A/B must remain usable.
         assert!(is_native_or_downscale(1920, 1080, 1920, 1080));
         assert!(is_native_or_downscale(2560, 1440, 1920, 1080));
     }

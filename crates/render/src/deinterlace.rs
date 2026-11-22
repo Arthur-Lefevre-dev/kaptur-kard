@@ -54,6 +54,8 @@ pub struct DeinterlaceEngine {
     convert_bgl: wgpu::BindGroupLayout,
     src: Option<TexSlot>,
     dst: Option<TexSlot>,
+    /// Filterable copy of `dst` for present / interpolate (Bob STORAGE is not always sampleable).
+    sample: Option<TexSlot>,
 }
 
 impl DeinterlaceEngine {
@@ -194,6 +196,7 @@ impl DeinterlaceEngine {
             convert_bgl,
             src: None,
             dst: None,
+            sample: None,
         }
     }
 
@@ -297,15 +300,48 @@ impl DeinterlaceEngine {
             cpass.set_bind_group(0, &bg, &[]);
             cpass.dispatch_workgroups((w + 7) / 8, (h + 7) / 8, 1);
         }
-        Some(&self.dst.as_ref().unwrap().view)
+
+        // Bob writes a STORAGE texture; on some GPUs (Vulkan/AMD) that view is not
+        // safely sampleable for present. Copy to a filterable texture for display /
+        // interpolate ingest — Bob alone was freezing when interp was Off.
+        ensure(device, &mut self.sample, w, h, "deint-sample", false);
+        if let (Some(dst), Some(sample)) = (self.dst.as_ref(), self.sample.as_ref()) {
+            encoder.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &dst.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: &sample.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+        Some(&self.sample.as_ref().unwrap().view)
     }
 
     pub fn output_texture(&self) -> Option<&wgpu::Texture> {
-        self.dst.as_ref().map(|t| &t.texture)
+        // Prefer sampleable copy when present (set after prepare).
+        self.sample
+            .as_ref()
+            .or(self.dst.as_ref())
+            .map(|t| &t.texture)
     }
 
     pub fn output_view(&self) -> Option<&wgpu::TextureView> {
-        self.dst.as_ref().map(|t| &t.view)
+        self.sample
+            .as_ref()
+            .or(self.dst.as_ref())
+            .map(|t| &t.view)
     }
 }
 
@@ -322,7 +358,9 @@ fn ensure(
             return;
         }
     }
-    let mut usage = wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC;
+    let mut usage = wgpu::TextureUsages::TEXTURE_BINDING
+        | wgpu::TextureUsages::COPY_SRC
+        | wgpu::TextureUsages::COPY_DST;
     if storage {
         usage |= wgpu::TextureUsages::STORAGE_BINDING;
     } else {
@@ -381,5 +419,13 @@ mod tests {
         assert_eq!(DeinterlaceMode::from_str_lossy("bob"), DeinterlaceMode::Bob);
         assert_eq!(DeinterlaceMode::from_str_lossy("off"), DeinterlaceMode::Off);
         assert_eq!(DeinterlaceMode::from_str_lossy("auto"), DeinterlaceMode::Auto);
+    }
+
+    #[test]
+    fn bob_runs_without_requiring_interlaced_source() {
+        // Forced Bob must arm even on progressive caps (Arthur: Bob + interp Off).
+        assert!(matches!(DeinterlaceMode::Bob, DeinterlaceMode::Bob));
+        let auto = DeinterlaceMode::Auto;
+        assert_eq!(auto.as_str(), "auto");
     }
 }

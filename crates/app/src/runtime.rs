@@ -1627,28 +1627,33 @@ impl App {
                     .prepare(&gpu.device, &gpu.queue, &mut encoder, &gpu.pipeline)
                     .is_some();
 
-            let interp_frame = if ran_deint {
-                if let Some(tex) = gpu.deinterlace.output_texture() {
-                    gpu.interpolate.prepare_from_texture(
+            // Only feed interpolate when it is active — otherwise Bob alone must present.
+            let interp_frame = if gpu.interpolate.active() {
+                if ran_deint {
+                    if let Some(tex) = gpu.deinterlace.output_texture() {
+                        gpu.interpolate.prepare_from_texture(
+                            &gpu.device,
+                            &gpu.queue,
+                            &mut encoder,
+                            tex,
+                            cw,
+                            ch,
+                            new_capture,
+                        )
+                    } else {
+                        None
+                    }
+                } else {
+                    gpu.interpolate.prepare(
                         &gpu.device,
                         &gpu.queue,
                         &mut encoder,
-                        tex,
-                        cw,
-                        ch,
+                        &gpu.pipeline,
                         new_capture,
                     )
-                } else {
-                    None
                 }
             } else {
-                gpu.interpolate.prepare(
-                    &gpu.device,
-                    &gpu.queue,
-                    &mut encoder,
-                    &gpu.pipeline,
-                    new_capture,
-                )
+                None
             };
 
             if let Some(frame_kind) = interp_frame {
@@ -1683,32 +1688,36 @@ impl App {
                         presented = true;
                     }
                 }
-            } else if let Some(rgba) = gpu.deinterlace.output_view() {
-                presented = gpu.upscale.encode_from_rgba(
-                    &gpu.device,
-                    &gpu.queue,
-                    &mut encoder,
-                    rgba,
-                    cw,
-                    ch,
-                    &view,
-                    gpu.config.width,
-                    gpu.config.height,
-                    clear,
-                );
-                if !presented {
-                    gpu.interpolate.present_view(
+            } else if ran_deint {
+                // Bob without interp: present the sampleable deinterlace copy only when
+                // this frame actually ran Bob (never a stale buffer after turning Bob off).
+                if let Some(rgba) = gpu.deinterlace.output_view() {
+                    presented = gpu.upscale.encode_from_rgba(
                         &gpu.device,
                         &gpu.queue,
                         &mut encoder,
                         rgba,
-                        (cw, ch),
+                        cw,
+                        ch,
                         &view,
                         gpu.config.width,
                         gpu.config.height,
                         clear,
                     );
-                    presented = true;
+                    if !presented {
+                        gpu.interpolate.present_view(
+                            &gpu.device,
+                            &gpu.queue,
+                            &mut encoder,
+                            rgba,
+                            (cw, ch),
+                            &view,
+                            gpu.config.width,
+                            gpu.config.height,
+                            clear,
+                        );
+                        presented = true;
+                    }
                 }
             } else {
                 presented = gpu.upscale.encode(
