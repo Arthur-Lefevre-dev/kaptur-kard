@@ -1543,17 +1543,25 @@ impl App {
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "(none)".into());
         let log_tail = crate::logging::log_tail();
+        let backend = self
+            .gpu
+            .as_ref()
+            .map(|g| g.upscale.backend.as_str())
+            .unwrap_or("?");
         let report = format!(
             "CaptureView support report\n\
+             build={} capture_wake={}\n\
              locale={:?}\n\
              device={}\n\
              format={}x{} {:?} @ {:?}\n\
              audio_in={} audio_out={}\n\
              fps={:.1} capture_fps={:.1} frame_gen_fps={:.1} display_limit={} vsync={} pipeline_delay_ms={:.1}\n\
-             dropped={} 1%low={:.1} gpu={}\n\
+             dropped={} 1%low={:.1} gpu={} backend={}\n\
              log_level={} log_file={}\n\
              -- support events --\n{}\n\
              -- log tail --\n{}\n",
+            env!("CAPTUREVIEW_GIT_HASH"),
+            env!("CAPTUREVIEW_CAPTURE_WAKE"),
             self.i18n.lang(),
             self.overlay.label,
             self.current_format.width,
@@ -1571,6 +1579,7 @@ impl App {
             self.overlay.dropped_frames,
             self.overlay.one_percent_low_fps,
             self.overlay.gpu_name,
+            backend,
             self.ui_prefs.log_level,
             log_path,
             self.support_log.join("\n"),
@@ -2242,20 +2251,64 @@ fn approx_black(frame: &VideoFrame) -> bool {
     (sum / count) < 8
 }
 
+fn adapter_score(info: &wgpu::AdapterInfo) -> i32 {
+    let backend = match info.backend {
+        // DX12 first on Windows — avoids TikTok/OBS Vulkan layer JSON spam + hitches.
+        wgpu::Backend::Dx12 => 400,
+        wgpu::Backend::Metal => 400,
+        wgpu::Backend::Vulkan => 150,
+        wgpu::Backend::Gl => 20,
+        _ => 0,
+    };
+    let power = match info.device_type {
+        wgpu::DeviceType::DiscreteGpu => 30,
+        wgpu::DeviceType::IntegratedGpu => 10,
+        wgpu::DeviceType::VirtualGpu => 5,
+        _ => 0,
+    };
+    backend + power
+}
+
+fn pick_adapter(
+    instance: &wgpu::Instance,
+    surface: &wgpu::Surface<'_>,
+) -> Option<wgpu::Adapter> {
+    let mut best: Option<(i32, wgpu::Adapter)> = None;
+    for adapter in instance.enumerate_adapters(wgpu::Backends::PRIMARY) {
+        if !adapter.is_surface_supported(surface) {
+            continue;
+        }
+        let score = adapter_score(&adapter.get_info());
+        if best.as_ref().map(|(s, _)| score > *s).unwrap_or(true) {
+            best = Some((score, adapter));
+        }
+    }
+    if let Some((_, adapter)) = best {
+        return Some(adapter);
+    }
+    // Fallback: default high-performance request (async path used by callers that await).
+    None
+}
+
 async fn init_gpu(window: Arc<Window>) -> anyhow::Result<GpuState> {
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
         backends: wgpu::Backends::PRIMARY,
         ..Default::default()
     });
     let surface = instance.create_surface(window.clone())?;
-    let adapter = instance
-        .request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            compatible_surface: Some(&surface),
-            force_fallback_adapter: false,
-        })
-        .await
-        .ok_or_else(|| anyhow::anyhow!("no suitable GPU adapter"))?;
+    // Prefer DX12 on Windows: Vulkan + overlay layers (TikTok JSON spam) hitch UI
+    // and tank 1% lows on Arthur's RX 7800 XT.
+    let adapter = match pick_adapter(&instance, &surface) {
+        Some(a) => a,
+        None => instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: Some(&surface),
+                force_fallback_adapter: false,
+            })
+            .await
+            .ok_or_else(|| anyhow::anyhow!("no suitable GPU adapter"))?,
+    };
     let adapter_info = adapter.get_info();
     let adapter_name = adapter_info.name.clone();
     let backend = adapter_info.backend;
@@ -2263,11 +2316,18 @@ async fn init_gpu(window: Arc<Window>) -> anyhow::Result<GpuState> {
         gpu = %adapter_name,
         backend = ?backend,
         vendor = adapter_info.vendor,
-        "GPU adapter selected (DX12/Vulkan preferred; GL is a fallback path)"
+        build = env!("CAPTUREVIEW_GIT_HASH"),
+        capture_wake = env!("CAPTUREVIEW_CAPTURE_WAKE"),
+        "GPU adapter selected (DX12 preferred on Windows)"
     );
     if matches!(backend, wgpu::Backend::Gl) {
         tracing::warn!(
             "running on OpenGL — FSR/NIS compute may be limited; prefer DX12 or Vulkan"
+        );
+    }
+    if matches!(backend, wgpu::Backend::Vulkan) {
+        tracing::warn!(
+            "Vulkan selected — overlay layers may spam logs; DX12 is preferred on Windows"
         );
     }
 
