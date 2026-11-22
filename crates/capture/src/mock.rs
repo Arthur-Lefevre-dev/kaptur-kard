@@ -9,6 +9,7 @@ use tracing::{debug, info};
 
 use crate::device::{DeviceId, DeviceInfo, FormatDesc};
 use crate::format::{PixelFormat, Rational};
+use crate::pool::BufferPool;
 use crate::source::{
     frame_channel, CaptureError, FrameReceiver, FrameSender, VideoFrame, VideoSource,
 };
@@ -23,6 +24,7 @@ pub struct MockVideoSource {
     running: Arc<AtomicBool>,
     frame_index: Arc<AtomicU64>,
     worker: Option<JoinHandle<()>>,
+    pool: Arc<BufferPool>,
 }
 
 impl MockVideoSource {
@@ -47,7 +49,12 @@ impl MockVideoSource {
             running: Arc::new(AtomicBool::new(false)),
             frame_index: Arc::new(AtomicU64::new(0)),
             worker: None,
+            pool: BufferPool::new(),
         }
+    }
+
+    pub fn device_info() -> DeviceInfo {
+        Self::new().info.clone()
     }
 }
 
@@ -88,6 +95,7 @@ impl VideoSource for MockVideoSource {
         let running = Arc::clone(&self.running);
         let sender = self.sender.clone();
         let frame_index = Arc::clone(&self.frame_index);
+        let pool = Arc::clone(&self.pool);
 
         info!(
             width,
@@ -96,34 +104,36 @@ impl VideoSource for MockVideoSource {
             "starting MockVideoSource"
         );
 
-        self.worker = Some(thread::Builder::new()
-            .name("mock-capture".into())
-            .spawn(move || {
-                let start = Instant::now();
-                let mut next = Instant::now();
-                while running.load(Ordering::Relaxed) {
-                    let now = Instant::now();
-                    if now < next {
-                        thread::sleep(next - now);
-                    }
-                    next += period;
+        self.worker = Some(
+            thread::Builder::new()
+                .name("mock-capture".into())
+                .spawn(move || {
+                    let start = Instant::now();
+                    let mut next = Instant::now();
+                    while running.load(Ordering::Relaxed) {
+                        let now = Instant::now();
+                        if now < next {
+                            thread::sleep(next - now);
+                        }
+                        next += period;
 
-                    let idx = frame_index.fetch_add(1, Ordering::Relaxed);
-                    let data = render_mock_frame(width, height, idx);
-                    let frame = VideoFrame {
-                        timestamp_ns: start.elapsed().as_nanos() as u64,
-                        width,
-                        height,
-                        pixel_format: PixelFormat::Bgra8,
-                        data,
-                    };
-                    if !sender.send_drop_oldest(frame) {
-                        debug!("mock frame channel disconnected");
-                        break;
+                        let idx = frame_index.fetch_add(1, Ordering::Relaxed);
+                        let data = render_mock_frame(&pool, width, height, idx);
+                        let frame = VideoFrame {
+                            timestamp_ns: start.elapsed().as_nanos() as u64,
+                            width,
+                            height,
+                            pixel_format: PixelFormat::Bgra8,
+                            data,
+                        };
+                        if !sender.send_drop_oldest(frame) {
+                            debug!("mock frame channel disconnected");
+                            break;
+                        }
                     }
-                }
-            })
-            .map_err(|e| CaptureError::Other(Box::new(e)))?);
+                })
+                .map_err(|e| CaptureError::Other(Box::new(e)))?,
+        );
 
         Ok(())
     }
@@ -153,20 +163,25 @@ impl Drop for MockVideoSource {
 }
 
 /// SMPTE-like color bars + bouncing square + decimal frame counter in BGRA8.
-fn render_mock_frame(width: u32, height: u32, frame_idx: u64) -> Arc<[u8]> {
+fn render_mock_frame(
+    pool: &Arc<BufferPool>,
+    width: u32,
+    height: u32,
+    frame_idx: u64,
+) -> Arc<crate::pool::PooledBytes> {
     let w = width as usize;
     let h = height as usize;
-    let mut buf = vec![0u8; w * h * 4];
+    let mut pooled = pool.take(w * h * 4);
+    let buf = pooled.as_mut_slice();
 
-    // Seven vertical color bars (BGRA).
     let bars: [(u8, u8, u8); 7] = [
-        (192, 192, 192), // white-ish
-        (0, 192, 192),   // yellow
-        (192, 192, 0),   // cyan
-        (0, 192, 0),     // green
-        (192, 0, 192),   // magenta
-        (0, 0, 192),     // red
-        (192, 0, 0),     // blue
+        (192, 192, 192),
+        (0, 192, 192),
+        (192, 192, 0),
+        (0, 192, 0),
+        (192, 0, 192),
+        (0, 0, 192),
+        (192, 0, 0),
     ];
     let bar_w = (w / bars.len()).max(1);
 
@@ -182,7 +197,6 @@ fn render_mock_frame(width: u32, height: u32, frame_idx: u64) -> Arc<[u8]> {
         }
     }
 
-    // Moving square (horizontal bounce).
     let square = (h / 8).max(16);
     let travel = (w.saturating_sub(square)).max(1);
     let period = (travel * 2) as u64;
@@ -193,12 +207,10 @@ fn render_mock_frame(width: u32, height: u32, frame_idx: u64) -> Arc<[u8]> {
         travel * 2 - phase
     };
     let sq_y = h / 2 - square / 2;
-    fill_rect(&mut buf, w, h, sq_x, sq_y, square, square, (40, 40, 40));
+    fill_rect(buf, w, h, sq_x, sq_y, square, square, (40, 40, 40));
+    draw_number(buf, w, h, 16, 16, frame_idx, (255, 255, 255));
 
-    // Frame counter digits (top-left).
-    draw_number(&mut buf, w, h, 16, 16, frame_idx, (255, 255, 255));
-
-    Arc::from(buf.into_boxed_slice())
+    pooled.into_arc()
 }
 
 fn fill_rect(
@@ -223,7 +235,6 @@ fn fill_rect(
     }
 }
 
-/// Tiny 3x5 digit font for the frame counter.
 fn draw_number(
     buf: &mut [u8],
     stride_w: usize,
@@ -260,7 +271,6 @@ fn draw_number(
 }
 
 fn digit_glyph(ch: char) -> Option<[u8; 5]> {
-    // 3-bit rows, MSB = left pixel.
     Some(match ch {
         '0' => [0b111, 0b101, 0b101, 0b101, 0b111],
         '1' => [0b010, 0b110, 0b010, 0b010, 0b111],

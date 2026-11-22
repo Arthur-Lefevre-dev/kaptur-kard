@@ -1,7 +1,10 @@
+use std::sync::Arc;
+
 use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError as CrossbeamTryRecv};
 use thiserror::Error;
 
 use crate::device::{DeviceInfo, FormatDesc};
+use crate::pool::PooledBytes;
 
 /// Bounded frame bus depth (drop-oldest). Locked decision: 2.
 pub const FRAME_CHANNEL_DEPTH: usize = 2;
@@ -16,6 +19,10 @@ pub enum CaptureError {
     UnsupportedFormat(String),
     #[error("platform backend unavailable: {0}")]
     Unsupported(String),
+    #[error("device open failed: {0}")]
+    DeviceOpen(String),
+    #[error("media type negotiation failed: {0}")]
+    Negotiate(String),
     #[error(transparent)]
     Other(#[from] Box<dyn std::error::Error + Send + Sync>),
 }
@@ -26,7 +33,8 @@ pub struct VideoFrame {
     pub width: u32,
     pub height: u32,
     pub pixel_format: crate::format::PixelFormat,
-    pub data: std::sync::Arc<[u8]>,
+    /// Pooled CPU bytes (BGRA8 / YUY2 / NV12). Drop returns capacity to the pool.
+    pub data: Arc<PooledBytes>,
 }
 
 /// Thin handle; actual queue lives with the capture producer.

@@ -1,10 +1,13 @@
-//! winit + wgpu + egui runtime wired to MockVideoSource.
+//! winit + wgpu + egui runtime with Mock and Media Foundation sources.
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use capture::{MockVideoSource, VideoSource};
+use capture::{
+    modes, CaptureMode, DeviceInfo, FormatDesc, FrameReceiver, MockVideoSource, PixelFormat,
+    Rational, VideoFrame, VideoSource,
+};
 use egui_wgpu::ScreenDescriptor;
 use egui_winit::State as EguiWinitState;
 use metrics::SharedMetrics;
@@ -16,7 +19,47 @@ use winit::event::WindowEvent;
 use winit::event_loop::ActiveEventLoop;
 use winit::window::{Window, WindowId};
 
-use crate::ui::{self, OverlayState};
+use crate::ui::{self, OverlayState, UiSelection};
+
+enum ActiveSource {
+    Mock(MockVideoSource),
+    #[cfg(windows)]
+    Mf(capture::MfVideoSource),
+}
+
+impl ActiveSource {
+    fn info(&self) -> &DeviceInfo {
+        match self {
+            Self::Mock(s) => s.info(),
+            #[cfg(windows)]
+            Self::Mf(s) => s.info(),
+        }
+    }
+
+    fn start(&mut self, selected: &FormatDesc) -> Result<(), capture::CaptureError> {
+        match self {
+            Self::Mock(s) => s.start(selected),
+            #[cfg(windows)]
+            Self::Mf(s) => s.start(selected),
+        }
+    }
+
+    fn stop(&mut self) -> Result<(), capture::CaptureError> {
+        match self {
+            Self::Mock(s) => s.stop(),
+            #[cfg(windows)]
+            Self::Mf(s) => s.stop(),
+        }
+    }
+
+    fn receiver(&self) -> FrameReceiver {
+        match self {
+            Self::Mock(s) => s.receiver(),
+            #[cfg(windows)]
+            Self::Mf(s) => s.receiver(),
+        }
+    }
+}
 
 struct GpuState {
     surface: wgpu::Surface<'static>,
@@ -32,24 +75,68 @@ struct GpuState {
 
 pub struct App {
     gpu: Option<GpuState>,
-    source: Option<MockVideoSource>,
+    devices: Vec<DeviceInfo>,
+    source: Option<ActiveSource>,
+    selection: UiSelection,
+    current_format: FormatDesc,
     metrics: Arc<SharedMetrics>,
     overlay: OverlayState,
     fps_window_start: Instant,
     frames_in_window: u32,
-    last_frame_size: (u32, u32),
+    last_frame_at: Instant,
+    black_since: Option<Instant>,
+    running: bool,
 }
 
 impl Default for App {
     fn default() -> Self {
+        let mock_info = MockVideoSource::device_info();
+        let mut devices = vec![mock_info.clone()];
+        #[cfg(windows)]
+        match capture::enumerate_devices() {
+            Ok(mut real) => {
+                tracing::info!(count = real.len(), "MF devices enumerated");
+                devices.append(&mut real);
+            }
+            Err(e) => tracing::warn!(error = %e, "MF enumeration failed; mock only"),
+        }
+
+        let device_idx = devices
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| d.backend != "mock" && !d.formats.is_empty())
+            .max_by_key(|(_, d)| capture::device_capture_score(&d.display_name))
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+
+        let caps = &devices[device_idx].formats;
+        let format = modes::select_format(CaptureMode::Auto, caps)
+            .or_else(|| caps.first().cloned())
+            .unwrap_or_else(|| mock_info.formats[0].clone());
+
         Self {
             gpu: None,
+            devices,
             source: None,
+            selection: UiSelection {
+                device_idx,
+                width: format.width,
+                height: format.height,
+                rate: format
+                    .frame_rates
+                    .first()
+                    .copied()
+                    .unwrap_or(Rational::new(60, 1)),
+                mode: CaptureMode::Auto,
+            },
+            current_format: format,
             metrics: SharedMetrics::new(),
             overlay: OverlayState::default(),
             fps_window_start: Instant::now(),
             frames_in_window: 0,
-            last_frame_size: (0, 0),
+            last_frame_at: Instant::now(),
+            black_since: None,
+            running: false,
         }
     }
 }
@@ -64,21 +151,27 @@ impl ApplicationHandler for App {
             event_loop
                 .create_window(
                     Window::default_attributes()
-                        .with_title("CaptureView — Mock")
+                        .with_title("CaptureView")
                         .with_inner_size(LogicalSize::new(1280.0, 720.0)),
                 )
                 .expect("create window"),
         );
 
         let gpu = pollster::block_on(init_gpu(window.clone())).expect("init gpu");
-
-        let mut source = MockVideoSource::new();
-        let format = source.info().formats[0].clone();
-        source.start(&format).expect("start mock source");
-
-        self.source = Some(source);
         self.gpu = Some(gpu);
-        tracing::info!("CaptureView window ready (MockVideoSource 1080p60)");
+
+        if let Err(e) = self.open_and_start(self.selection.device_idx, self.current_format.clone()) {
+            tracing::error!(error = %e, "failed to start capture; falling back to mock");
+            self.selection.device_idx = 0;
+            let fmt = self.devices[0].formats[0].clone();
+            self.current_format = fmt.clone();
+            self.selection.width = fmt.width;
+            self.selection.height = fmt.height;
+            self.selection.rate = fmt.frame_rates[0];
+            let _ = self.open_and_start(0, fmt);
+        }
+
+        tracing::info!("CaptureView ready");
     }
 
     fn window_event(
@@ -98,9 +191,7 @@ impl ApplicationHandler for App {
 
         match event {
             WindowEvent::CloseRequested => {
-                if let Some(mut source) = self.source.take() {
-                    let _ = source.stop();
-                }
+                self.stop_source();
                 event_loop.exit();
             }
             WindowEvent::Resized(size) => {
@@ -125,13 +216,140 @@ impl ApplicationHandler for App {
 }
 
 impl App {
-    fn redraw(&mut self) {
-        let Some(gpu) = self.gpu.as_mut() else {
-            return;
-        };
+    fn stop_source(&mut self) {
+        if let Some(mut source) = self.source.take() {
+            let _ = source.stop();
+        }
+        self.running = false;
+    }
 
-        // Drain drop-oldest bus; keep newest frame only.
-        let mut latest = None;
+    fn open_and_start(
+        &mut self,
+        device_idx: usize,
+        format: FormatDesc,
+    ) -> Result<(), capture::CaptureError> {
+        self.stop_source();
+        let info = self.devices[device_idx].clone();
+        let mut source = if info.backend == "mock" {
+            ActiveSource::Mock(MockVideoSource::new())
+        } else {
+            #[cfg(windows)]
+            {
+                ActiveSource::Mf(capture::MfVideoSource::open(info)?)
+            }
+            #[cfg(not(windows))]
+            {
+                return Err(capture::CaptureError::Unsupported(
+                    "MF only on Windows".into(),
+                ));
+            }
+        };
+        source.start(&format)?;
+        self.source = Some(source);
+        self.current_format = format;
+        self.running = true;
+        self.last_frame_at = Instant::now();
+        self.black_since = None;
+        Ok(())
+    }
+
+    fn restart_with_fallback(
+        &mut self,
+        new_format: FormatDesc,
+        on_fail_msg: &str,
+    ) -> bool {
+        let previous = self.current_format.clone();
+        let device_idx = self.selection.device_idx;
+        match self.open_and_start(device_idx, new_format.clone()) {
+            Ok(()) => {
+                self.current_format = new_format;
+                self.selection.width = self.current_format.width;
+                self.selection.height = self.current_format.height;
+                self.selection.rate = self
+                    .current_format
+                    .frame_rates
+                    .first()
+                    .copied()
+                    .unwrap_or(self.selection.rate);
+                self.overlay.status.clear();
+                true
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "format change failed; restoring previous");
+                let _ = self.open_and_start(device_idx, previous);
+                self.overlay.status = on_fail_msg.to_string();
+                false
+            }
+        }
+    }
+
+    fn apply_ui_actions(&mut self, actions: ui::UiActions) {
+        if let Some(idx) = actions.device_changed {
+            self.selection.device_idx = idx;
+            let caps = &self.devices[idx].formats;
+            let format = modes::select_format(self.selection.mode, caps)
+                .or_else(|| caps.first().cloned())
+                .unwrap_or_else(|| self.current_format.clone());
+            self.selection.width = format.width;
+            self.selection.height = format.height;
+            self.selection.rate = format
+                .frame_rates
+                .first()
+                .copied()
+                .unwrap_or(Rational::new(60, 1));
+            let _ = self.restart_with_fallback(
+                format,
+                "Impossible de démarrer ce périphérique, retour au précédent.",
+            );
+        }
+
+        if let Some((w, h)) = actions.resolution_changed {
+            self.selection.width = w;
+            self.selection.height = h;
+            let caps = &self.devices[self.selection.device_idx].formats;
+            let rates = modes::rates_for_resolution(caps, w, h);
+            if let Some(r) = rates.first() {
+                self.selection.rate = *r;
+            }
+            if let Some(fmt) = modes::pick_format_at(caps, w, h, self.selection.rate) {
+                let _ = self.restart_with_fallback(
+                    fmt,
+                    "Impossible d'appliquer cette résolution, retour au précédent.",
+                );
+            }
+        }
+
+        if let Some(rate) = actions.rate_changed {
+            self.selection.rate = rate;
+            let caps = &self.devices[self.selection.device_idx].formats;
+            if let Some(fmt) =
+                modes::pick_format_at(caps, self.selection.width, self.selection.height, rate)
+            {
+                let _ = self.restart_with_fallback(
+                    fmt,
+                    "Impossible d'appliquer cette fréquence, retour au précédent.",
+                );
+            }
+        }
+
+        if let Some(mode) = actions.mode_changed {
+            let previous_mode = self.selection.mode;
+            self.selection.mode = mode;
+            let caps = &self.devices[self.selection.device_idx].formats;
+            if let Some(fmt) = modes::select_format(mode, caps) {
+                if !self.restart_with_fallback(
+                    fmt,
+                    "Impossible d'appliquer ce mode, retour au précédent.",
+                ) {
+                    self.selection.mode = previous_mode;
+                }
+            }
+        }
+    }
+
+    fn redraw(&mut self) {
+        // Drain frames before borrowing GPU exclusively for UI state updates.
+        let mut latest: Option<VideoFrame> = None;
         if let Some(source) = self.source.as_ref() {
             let rx = source.receiver();
             while let Ok(frame) = rx.try_recv() {
@@ -142,12 +360,56 @@ impl App {
             }
         }
 
+        if let Some(ref frame) = latest {
+            self.last_frame_at = Instant::now();
+            if approx_black(frame) {
+                self.black_since.get_or_insert_with(Instant::now);
+            } else {
+                self.black_since = None;
+            }
+        }
+
+        let no_signal = self.last_frame_at.elapsed() > Duration::from_secs(1);
+        let soft_black = self
+            .black_since
+            .map(|t| t.elapsed() > Duration::from_secs(3))
+            .unwrap_or(false)
+            && !no_signal;
+
+        self.frames_in_window += 1;
+        let elapsed = self.fps_window_start.elapsed().as_secs_f32();
+        if elapsed >= 0.5 {
+            self.overlay.fps = self.frames_in_window as f32 / elapsed;
+            self.frames_in_window = 0;
+            self.fps_window_start = Instant::now();
+        }
+        self.overlay.frame_w = self.current_format.width;
+        self.overlay.frame_h = self.current_format.height;
+        self.overlay.label = self
+            .source
+            .as_ref()
+            .map(|s| s.info().display_name.clone())
+            .unwrap_or_else(|| "—".into());
+        self.overlay.no_signal = no_signal;
+        self.overlay.soft_black = soft_black;
+
+        let devices = self.devices.clone();
+        let selection = self.selection.clone();
+        let current = self.current_format.clone();
+        let overlay = self.overlay.clone();
+
+        let mut actions = ui::UiActions::default();
+        {
+        let Some(gpu) = self.gpu.as_mut() else {
+            return;
+        };
+
         if let Some(frame) = latest {
-            self.last_frame_size = (frame.width, frame.height);
-            upload_frame(&gpu.device, &gpu.queue, &mut gpu.pipeline, &frame);
-            self.metrics
-                .frames_presented
-                .fetch_add(1, Ordering::Relaxed);
+            if upload_frame(&gpu.device, &gpu.queue, &mut gpu.pipeline, &frame) {
+                self.metrics
+                    .frames_presented
+                    .fetch_add(1, Ordering::Relaxed);
+            }
         }
 
         gpu.pipeline
@@ -169,27 +431,9 @@ impl App {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
-        // egui overlay metrics (copied so the GPU borrow stays exclusive).
-        self.frames_in_window += 1;
-        let elapsed = self.fps_window_start.elapsed().as_secs_f32();
-        if elapsed >= 0.5 {
-            self.overlay.fps = self.frames_in_window as f32 / elapsed;
-            self.frames_in_window = 0;
-            self.fps_window_start = Instant::now();
-        }
-        self.overlay.frame_w = self.last_frame_size.0;
-        self.overlay.frame_h = self.last_frame_size.1;
-        self.overlay.label = "Mock".into();
-        let overlay = OverlayState {
-            fps: self.overlay.fps,
-            label: self.overlay.label.clone(),
-            frame_w: self.overlay.frame_w,
-            frame_h: self.overlay.frame_h,
-        };
-
         let raw_input = gpu.egui_state.take_egui_input(&gpu.window);
         let full_output = gpu.egui_ctx.run(raw_input, |ctx| {
-            ui::draw_overlay(ctx, &overlay);
+            actions = ui::draw_ui(ctx, &devices, &selection, &current, &overlay);
         });
         gpu.egui_state
             .handle_platform_output(&gpu.window, full_output.platform_output);
@@ -206,6 +450,22 @@ impl App {
                 .update_texture(&gpu.device, &gpu.queue, *id, delta);
         }
 
+        let clear = if no_signal || soft_black {
+            wgpu::Color {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 1.0,
+            }
+        } else {
+            wgpu::Color {
+                r: 0.02,
+                g: 0.02,
+                b: 0.02,
+                a: 1.0,
+            }
+        };
+
         let mut encoder = gpu
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -219,12 +479,7 @@ impl App {
                     view: &view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.02,
-                            g: 0.02,
-                            b: 0.02,
-                            a: 1.0,
-                        }),
+                        load: wgpu::LoadOp::Clear(clear),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -232,7 +487,9 @@ impl App {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            gpu.pipeline.draw(&mut pass);
+            if !no_signal {
+                gpu.pipeline.draw(&mut pass);
+            }
         }
 
         let cmd_buffers =
@@ -254,7 +511,6 @@ impl App {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            // egui-wgpu 0.31 expects RenderPass<'static>; wgpu 24 provides forget_lifetime.
             let mut pass = pass.forget_lifetime();
             gpu.egui_renderer.render(&mut pass, &tris, &screen);
         }
@@ -269,7 +525,38 @@ impl App {
                 .chain(std::iter::once(encoder.finish())),
         );
         frame.present();
+        }
+
+        // GPU borrow ended with the block above; safe to restart capture from UI.
+        self.apply_ui_actions(actions);
     }
+}
+
+fn approx_black(frame: &VideoFrame) -> bool {
+    let data = frame.data.as_ref();
+    if data.is_empty() {
+        return true;
+    }
+    let step = match frame.pixel_format {
+        PixelFormat::Bgra8 => 4,
+        PixelFormat::Yuy2 => 2,
+        PixelFormat::Nv12 => 1,
+        _ => 4,
+    };
+    let mut sum = 0u64;
+    let mut count = 0u64;
+    let stride = (step * 64).max(step);
+    let limit = data.len().min(frame.width as usize * frame.height as usize * step);
+    let mut i = 0;
+    while i < limit {
+        sum += data[i] as u64;
+        count += 1;
+        i += stride;
+    }
+    if count == 0 {
+        return true;
+    }
+    (sum / count) < 8
 }
 
 async fn init_gpu(window: Arc<Window>) -> anyhow::Result<GpuState> {

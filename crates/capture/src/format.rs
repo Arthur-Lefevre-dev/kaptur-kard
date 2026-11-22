@@ -4,6 +4,8 @@ pub enum PixelFormat {
     Yuy2,
     Rgb24,
     Bgra8,
+    /// Motion-JPEG from the device; capture path asks MF to decode to NV12.
+    Mjpeg,
     /// Extensible: unknown fourcc kept as raw for passthrough diagnostics.
     Unknown(u32),
 }

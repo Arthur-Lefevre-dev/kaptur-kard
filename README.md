@@ -2,12 +2,22 @@
 
 Desktop preview app for generic UVC / capture-card sources. Product name **CaptureView**; workspace/binary crate **`captureview`**; repository folder **`kaptur-kard`**.
 
-This repository currently ships **step (a)**: a wgpu window that displays a synthetic `MockVideoSource` (color bars + moving square + frame counter). No real capture card / Media Foundation yet.
+## Status
+
+**Step (b)** — Windows Media Foundation capture behind `VideoSource`, plus Mock for card-free work.
+
+- Enumerates real video capture devices / modes (MF)
+- Prefers native NV12 / YUY2 / BGRA; MJPEG is decoded by MF to NV12 (or RGB32 fallback)
+- GPU shader converts YUY2/NV12 → RGB with letterboxing
+- UI: device, resolution, Hz, mode (Auto / Game / Quality / Economy)
+- No-signal (>1s) and soft-black (>3s) hints
+- Frame bus depth **2**, drop-oldest; CPU buffer pool on the capture path
 
 ## Requirements (Windows)
 
 - Rust stable (1.78+, tested with 1.100)
-- A GPU with a working DirectX 12 / Vulkan driver (wgpu)
+- GPU with DirectX 12 / Vulkan (wgpu)
+- Optional: UVC / capture card for live MF testing
 
 ## Build & run
 
@@ -17,7 +27,7 @@ cargo build -p captureview
 cargo run -p captureview
 ```
 
-Release (fat LTO, stripped):
+Release:
 
 ```powershell
 cargo build --release -p captureview
@@ -27,37 +37,27 @@ cargo build --release -p captureview
 Tests:
 
 ```powershell
-cargo test
+cargo test --workspace
 ```
 
-## Step (a) behaviour
+The device list always includes **Mock Color Bars**. Real MF devices appear below (capture-card names ranked first). Default mode is **Auto**.
 
-- Starts `MockVideoSource` at **1920×1080 @ 60 fps** (BGRA8)
-- Bounded frame bus depth **2**, drop-oldest
-- Uploads frames to wgpu, presents with **letterboxing**
-- Minimal **egui** overlay: FPS + “Mock”
+## Out of scope (v1 / later steps)
 
-## Workspace layout
-
-| Crate | Role |
-|-------|------|
-| `crates/capture` | `VideoSource`, formats, modes, `MockVideoSource` |
-| `crates/audio` | Stub (cpal wiring later) |
-| `crates/render` | wgpu upload / letterbox / present |
-| `crates/metrics` | Atomic counters |
-| `crates/app` | `captureview` binary (winit + wgpu + egui) |
-
-## Out of scope (v1)
-
-Documented for later work — **not** in this step:
-
+- Audio
 - Recording, streaming, HDR
-- H.264/HEVC-only cards
+- H.264/HEVC-only cards (beyond what MF can decode to NV12/RGB)
 - Proprietary SDKs (DeckLink, etc.)
-- DLSS / FSR2 / FSR3 (and FSR1/NIS upscale)
-- Full Linux / macOS capture backends (API stubs only)
-- Real Media Foundation device capture (planned next)
-- Frame interpolation
+- DLSS / FSR / NIS / interpolation
+- Full Linux / macOS capture backends
+- DirectShow
+- Full consumer chrome polish
+
+## Gaps (step b)
+
+- Some exotic FourCCs are skipped at enum time
+- MJPEG relies on MF decoder insertion; if both NV12 and RGB32 output fail, start errors and UI falls back
+- RAM budget target &lt;100 Mo @1080p60 without effects is **not** met with the CPU mock path (full BGRA fill); live MF should be lower — see `internal/step-b-report.md` in the Project store
 
 ## Licence
 

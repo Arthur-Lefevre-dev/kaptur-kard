@@ -18,7 +18,6 @@ parking_lot = { workspace = true }
 crossbeam-channel = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
-# Media Foundation backend lands in a later step; keep the dep ready.
 windows = { version = "0.58", features = [
     "Win32_Media_MediaFoundation",
     "Win32_System_Com",
