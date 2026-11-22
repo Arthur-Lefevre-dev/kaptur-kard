@@ -98,13 +98,22 @@ Use an external LED / high-speed camera / dedicated lag tester for absolute HDMI
 - DLSS / FSR 2 / FSR 3
 - Hardware lag meters
 
+## Releases
+
+Prebuilt binaries (Windows / Linux / macOS) are published on the GitHub Releases page for this repository. Local packaging on Windows:
+
+```powershell
+.\scripts\package-windows.ps1
+```
+
+CI workflow: `.github/workflows/release.yml` (tag `v*` or `workflow_dispatch`).
+
 ## What’s next
 
 1. Finish DirectShow for MF-missing Windows cards (real filter graph).
 2. Complete macOS AVFoundation device I/O.
 3. Expand Linux V4L2 format probing / MJPEG decode path on real hardware.
 4. Optional: field-aware deinterlace (weave / motion-adaptive) beyond Bob.
-5. Add a GitHub remote for `kaptur-kard` when ready (`git remote add origin …`) — local commits are enough until then; no PR without a remote.
 
 ## Licence
 

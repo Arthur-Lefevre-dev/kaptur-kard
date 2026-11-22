@@ -1,0 +1,166 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to create or refresh (e.g. v0.1.0)"
+        required: true
+        default: "v0.1.0"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  PACKAGE_NAME: captureview
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: captureview-windows-x64
+            archive: zip
+          - os: ubuntu-latest
+            artifact: captureview-linux-x64
+            archive: tar.gz
+          - os: macos-latest
+            artifact: captureview-macos-arm64
+            archive: tar.gz
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-${{ matrix.os }}
+
+      - name: Install Linux capture deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libv4l-dev pkg-config libasound2-dev
+
+      - name: Build release binary
+        run: cargo build --release -p captureview
+
+      - name: Package Windows zip
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $out = "dist/${{ matrix.artifact }}"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          Copy-Item "target/release/captureview.exe" "$out/captureview.exe"
+          Copy-Item "README.md" "$out/README.md"
+          Copy-Item "LICENSE" "$out/LICENSE"
+          if (Test-Path "licenses") { Copy-Item "licenses" "$out/licenses" -Recurse }
+          if (Test-Path "assets/kapturkard-logo.png") {
+            New-Item -ItemType Directory -Force -Path "$out/assets" | Out-Null
+            Copy-Item "assets/kapturkard-logo.png" "$out/assets/"
+          }
+          @"
+          CaptureView / KapturKard ${{ github.ref_name }}
+          Windows x64 release build.
+
+          Run: captureview.exe
+          Mock source works without a capture card.
+          Logs: %APPDATA%\CaptureView\logs\
+          "@ | Set-Content -Encoding utf8 "$out/RELEASE.txt"
+          Compress-Archive -Path "$out/*" -DestinationPath "dist/${{ matrix.artifact }}.zip" -Force
+
+      - name: Package Unix archive
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          out="dist/${{ matrix.artifact }}"
+          mkdir -p "$out/assets"
+          BIN="target/release/captureview"
+          test -f "$BIN"
+          cp "$BIN" "$out/captureview"
+          chmod +x "$out/captureview"
+          cp README.md LICENSE "$out/"
+          if [ -d licenses ]; then cp -R licenses "$out/"; fi
+          if [ -f assets/kapturkard-logo.png ]; then cp assets/kapturkard-logo.png "$out/assets/"; fi
+          cat > "$out/RELEASE.txt" <<EOF
+          CaptureView / KapturKard ${{ github.ref_name }}
+          Native release build for ${{ runner.os }}.
+
+          Run: ./captureview
+          Mock source works without a capture card.
+          EOF
+          tar -C dist -czf "dist/${{ matrix.artifact }}.tar.gz" "${{ matrix.artifact }}"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            dist/${{ matrix.artifact }}.zip
+            dist/${{ matrix.artifact }}.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Flatten archives
+        shell: bash
+        run: |
+          mkdir -p upload
+          find artifacts -type f \( -name '*.zip' -o -name '*.tar.gz' \) -print -exec cp {} upload/ \;
+          ls -la upload
+
+      - name: Resolve tag name
+        id: meta
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create or update release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: CaptureView ${{ steps.meta.outputs.tag }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          files: upload/*
+          body: |
+            ## CaptureView / KapturKard ${{ steps.meta.outputs.tag }}
+
+            Desktop preview for UVC / capture-card sources (product name **KapturKard**).
+
+            ### Artifacts
+            | File | Platform |
+            |------|----------|
+            | `captureview-windows-x64.zip` | Windows 10/11 x64 |
+            | `captureview-linux-x64.tar.gz` | Linux x64 (V4L2) |
+            | `captureview-macos-arm64.tar.gz` | macOS arm64 (AVFoundation still stub) |
+
+            Windows Media Foundation is the primary capture path. Mock source is always available.
+            MIT licensed — see `LICENSE` inside each archive.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
