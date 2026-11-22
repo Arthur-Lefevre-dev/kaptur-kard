@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError as CrossbeamTryRecv};
@@ -10,6 +10,9 @@ use crate::pool::PooledBytes;
 
 /// Bounded frame bus depth (drop-oldest). Locked decision: 2.
 pub const FRAME_CHANNEL_DEPTH: usize = 2;
+
+/// Optional wake after a frame is queued (winit `EventLoopProxy` for capture-driven present).
+pub type FrameWake = Arc<dyn Fn() + Send + Sync>;
 
 #[derive(Debug, Error)]
 pub enum CaptureError {
@@ -130,12 +133,27 @@ pub struct FrameSender {
     /// Extra receiver used only to drain the oldest slot under pressure.
     drain: Receiver<VideoFrame>,
     drops: Arc<AtomicU64>,
+    /// Wakes the UI event loop when a frame is queued (capture-driven present).
+    wake: Arc<Mutex<Option<FrameWake>>>,
 }
 
 impl FrameSender {
+    /// Attach a wake callback before `start` (clones share the same slot).
+    pub fn set_wake(&self, wake: FrameWake) {
+        *self.wake.lock().unwrap_or_else(|e| e.into_inner()) = Some(wake);
+    }
+
+    fn notify_wake(&self) {
+        if let Ok(guard) = self.wake.lock() {
+            if let Some(w) = guard.as_ref() {
+                w();
+            }
+        }
+    }
+
     /// Returns true if the frame was accepted (possibly after dropping oldest).
     pub fn send_drop_oldest(&self, frame: VideoFrame) -> bool {
-        match self.tx.try_send(frame) {
+        let ok = match self.tx.try_send(frame) {
             Ok(()) => true,
             Err(crossbeam_channel::TrySendError::Full(frame)) => {
                 // Drop oldest, then push the newest frame.
@@ -145,7 +163,11 @@ impl FrameSender {
                 self.tx.try_send(frame).is_ok()
             }
             Err(crossbeam_channel::TrySendError::Disconnected(_)) => false,
+        };
+        if ok {
+            self.notify_wake();
         }
+        ok
     }
 
     pub fn dropped_count(&self) -> u64 {
@@ -163,6 +185,7 @@ pub fn frame_channel() -> (FrameSender, FrameReceiver) {
             tx,
             drain,
             drops: drops.clone(),
+            wake: Arc::new(Mutex::new(None)),
         },
         FrameReceiver { inner: rx, drops },
     )
@@ -177,6 +200,10 @@ pub trait VideoSource: Send {
     /// Live health (busy / waiting / ok). Default is always Ok.
     fn stream_status(&self) -> StreamStatus {
         StreamStatus::new()
+    }
+    /// Wake the UI when a frame is queued (capture-driven present).
+    fn set_frame_wake(&mut self, wake: FrameWake) {
+        let _ = wake;
     }
 }
 
@@ -221,5 +248,25 @@ mod tests {
             n += 1;
         }
         assert_eq!(n, FRAME_CHANNEL_DEPTH);
+    }
+
+    #[test]
+    fn wake_fires_on_send() {
+        let fired = Arc::new(AtomicU64::new(0));
+        let flag = Arc::clone(&fired);
+        let (tx, _rx) = frame_channel();
+        tx.set_wake(Arc::new(move || {
+            flag.fetch_add(1, Ordering::SeqCst);
+        }));
+        let pool = BufferPool::new();
+        let data = pool.take(16).into_arc();
+        assert!(tx.send_drop_oldest(VideoFrame {
+            captured_at: Instant::now(),
+            width: 2,
+            height: 2,
+            pixel_format: PixelFormat::Bgra8,
+            data,
+        }));
+        assert_eq!(fired.load(Ordering::SeqCst), 1);
     }
 }

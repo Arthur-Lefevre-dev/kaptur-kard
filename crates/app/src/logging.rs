@@ -23,10 +23,17 @@ static LOG_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
 const TAIL_BYTES: u64 = 24 * 1024;
 const KEEP_LOG_FILES: usize = 14;
 
-/// Default filter: app level + mute Vulkan loader / OBS-Overwolf layer spam.
+/// Default filter: app level + mute Vulkan loader / overlay-layer JSON spam (TikTok, OBS…).
 fn build_filter(level: &str) -> EnvFilter {
     let directive = format!(
-        "{level},wgpu_hal::vulkan::instance=error,wgpu_hal::vulkan::conv=warn,naga=warn,wgpu_core=warn"
+        "{level},\
+         wgpu_hal::vulkan=error,\
+         wgpu_hal::vulkan::instance=error,\
+         wgpu_hal::vulkan::conv=error,\
+         wgpu_hal::gles=error,\
+         naga=warn,\
+         wgpu_core=warn,\
+         wgpu_hal=warn"
     );
     EnvFilter::try_new(&directive).unwrap_or_else(|_| EnvFilter::new(level))
 }

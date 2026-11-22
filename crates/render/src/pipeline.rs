@@ -5,7 +5,7 @@ use capture::PixelFormat;
 use wgpu::util::DeviceExt;
 
 use crate::color::{gpu_mode, ColorConvertParams, GpuPixelMode};
-use crate::present::{compute_letterbox, LetterboxUniforms};
+use crate::present::{compute_present_fit, PresentFilter};
 
 const COPY_ALIGN: u32 = 256;
 
@@ -159,12 +159,12 @@ impl VideoPipeline {
         self.color = color;
     }
 
-    fn format_pad(&self) -> [u32; 4] {
+    fn format_pad(&self, nearest: bool) -> [u32; 4] {
         [
             self.mode as u32,
             u32::from(self.color.limited),
             u32::from(self.color.bt709),
-            0,
+            u32::from(nearest),
         ]
     }
 
@@ -297,13 +297,14 @@ impl VideoPipeline {
         if cw == 0 || ch == 0 {
             return;
         }
-        let LetterboxUniforms { scale_offset } = compute_letterbox(cw, ch, view_w, view_h);
+        let fit = compute_present_fit(cw, ch, view_w, view_h);
+        let nearest = matches!(fit.filter, PresentFilter::Nearest);
         queue.write_buffer(
             &self.params_buf,
             0,
             bytemuck::bytes_of(&ParamsGpu {
-                scale_offset,
-                format_pad: self.format_pad(),
+                scale_offset: fit.scale_offset,
+                format_pad: self.format_pad(nearest),
             }),
         );
     }
@@ -327,7 +328,8 @@ impl VideoPipeline {
             0,
             bytemuck::bytes_of(&ParamsGpu {
                 scale_offset: [1.0, 1.0, 0.0, 0.0],
-                format_pad: self.format_pad(),
+                // Convert is always 1:1 into rgba_src — sample filter unused for identity UV.
+                format_pad: self.format_pad(false),
             }),
         );
     }

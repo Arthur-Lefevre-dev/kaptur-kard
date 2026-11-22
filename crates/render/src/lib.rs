@@ -2,6 +2,7 @@
 
 pub mod color;
 pub mod deinterlace;
+pub mod dlss;
 pub mod gpu;
 pub mod interpolate;
 pub mod pipeline;
@@ -14,11 +15,16 @@ pub use color::{
     ColorRangeMode,
 };
 pub use deinterlace::{DeinterlaceEngine, DeinterlaceMode};
+pub use dlss::{
+    preferred_backends, DlssAvailability, DlssEngine, DlssGAvailability, DlssGMultiplier,
+    DlssGStatus, DlssStatus, FgPresentFrame, DLSS_MARKETING_NOTE, STREAMLINE_DOC_VERSION,
+};
 pub use gpu::GpuContext;
 pub use pipeline::VideoPipeline;
 pub use interpolate::{
     InterpBlockReason, InterpFrame, InterpMode, InterpolateEngine, InterpStatus,
 };
+pub use present::{compute_present_fit, PresentFilter, PresentFit};
 pub use upscale::{
     is_native_or_downscale, target_size, UpscaleBlockReason, UpscaleEngine, UpscaleMode,
     UpscaleStatus,

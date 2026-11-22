@@ -1,0 +1,11 @@
+*.obj
+*.exp
+*.lib
+*.pdb
+bin/*.dll
+bin/*.exp
+bin/*.lib
+bin/*.pdb
+# Built bridges stay local; do not commit NVIDIA BYO DLLs either.
+runtime/nvngx_*.dll
+runtime/_nvngx.dll

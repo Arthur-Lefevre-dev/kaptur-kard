@@ -1,15 +1,20 @@
-//! FSR 1 (EASU+RCAS) and NIS upscaling via WGSL compute.
+//! FSR 1 (EASU+RCAS), NIS, and DLSS (Streamline) upscaling.
 //!
 //! Runs after color conversion, before present. Textures are reused across frames.
 //! Shader ports: see `licenses/AMD-FSR1-MIT.txt` and `licenses/NVIDIA-NIS-MIT.txt`.
+//! DLSS / Streamline: see `docs/DLSS.md` (SDK not vendored; Mode C falls back to NIS).
 
 use std::time::Instant;
 
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
+use crate::dlss::{
+    enhance_rgba8_with_nr, write_rgba8_texture, DlssAvailability, DlssEngine, DlssStatus,
+    FgPresentFrame,
+};
 use crate::pipeline::VideoPipeline;
-use crate::present::{compute_letterbox, LetterboxUniforms};
+use crate::present::{compute_present_fit, PresentFilter, PresentFit};
 
 /// Frames over budget before auto-disable.
 const OVER_BUDGET_LIMIT: u32 = 45;
@@ -21,6 +26,8 @@ pub enum UpscaleMode {
     Off,
     Fsr1,
     Nis,
+    /// Mode C — NVIDIA DLSS via Streamline/NGX when available; otherwise NIS fallback.
+    Dlss,
 }
 
 impl UpscaleMode {
@@ -29,6 +36,7 @@ impl UpscaleMode {
             Self::Off => "off",
             Self::Fsr1 => "fsr1",
             Self::Nis => "nis",
+            Self::Dlss => "dlss",
         }
     }
 
@@ -36,6 +44,7 @@ impl UpscaleMode {
         match s {
             "fsr1" | "Fsr1" | "FSR1" => Self::Fsr1,
             "nis" | "Nis" | "NIS" => Self::Nis,
+            "dlss" | "Dlss" | "DLSS" | "dlss5" | "DLSS5" => Self::Dlss,
             _ => Self::Off,
         }
     }
@@ -62,6 +71,9 @@ pub struct UpscaleStatus {
     pub backend: String,
     pub last_gpu_ms: f32,
     pub over_budget_streak: u32,
+    pub dlss: DlssStatus,
+    /// True when Mode C ran real DLSS 5 NR on the last status snapshot path.
+    pub dlss_nr_active: bool,
 }
 
 #[repr(C)]
@@ -93,7 +105,8 @@ struct NisGpu {
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct PresentGpu {
     scale_offset: [f32; 4],
-    pad: [u32; 4],
+    /// x = 1 → nearest (textureLoad), 0 → bilinear.
+    flags: [u32; 4],
 }
 
 #[repr(C)]
@@ -156,6 +169,7 @@ pub struct UpscaleEngine {
     cached_present_bg: Option<(u64, wgpu::BindGroup)>,
     /// Rate-limit "RCAS/NIS ran" tracing to ~1 Hz while Mode A/B is active.
     last_sharpen_log: Instant,
+    pub dlss: DlssEngine,
 }
 
 impl UpscaleEngine {
@@ -252,7 +266,7 @@ impl UpscaleEngine {
             label: Some("upscale-present-ub"),
             contents: bytemuck::bytes_of(&PresentGpu {
                 scale_offset: [1.0, 1.0, 0.0, 0.0],
-                pad: [0; 4],
+                flags: [0; 4],
             }),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -483,10 +497,13 @@ impl UpscaleEngine {
             cached_nis_bg: None,
             cached_present_bg: None,
             last_sharpen_log: Instant::now() - std::time::Duration::from_secs(2),
+            dlss: DlssEngine::new(adapter, backend),
         }
     }
 
     pub fn status(&self) -> UpscaleStatus {
+        let dlss = self.dlss.status();
+        let dlss_nr_active = self.mode == UpscaleMode::Dlss && dlss.nr_active;
         UpscaleStatus {
             mode: self.mode,
             sharpness: self.sharpness,
@@ -496,7 +513,13 @@ impl UpscaleEngine {
             backend: self.backend.clone(),
             last_gpu_ms: self.last_gpu_ms,
             over_budget_streak: self.over_budget_streak,
+            dlss,
+            dlss_nr_active,
         }
+    }
+
+    pub fn dlss_availability(&self) -> DlssAvailability {
+        self.dlss.availability()
     }
 
     pub fn set_mode(&mut self, mode: UpscaleMode) {
@@ -527,6 +550,13 @@ impl UpscaleEngine {
             }
             return false;
         }
+        // Mode C uses a separate D3D12 NGX path — does not need wgpu compute shaders.
+        if self.mode == UpscaleMode::Dlss {
+            self.block = UpscaleBlockReason::None;
+            let _ = view;
+            let _ = content;
+            return self.dlss.can_evaluate();
+        }
         if !self.compute_ok {
             self.block = UpscaleBlockReason::NoCompute;
             return false;
@@ -554,7 +584,13 @@ impl UpscaleEngine {
         if cw == 0 || ch == 0 || !self.should_run((cw, ch), (view_w, view_h)) {
             return false;
         }
-        let (out_w, out_h) = target_size(cw, ch, view_w, view_h);
+        let (out_w, out_h) = if self.mode == UpscaleMode::Dlss {
+            // DLSS 5 NR is same-resolution neural enhance (not SR); letterbox at present.
+            (cw, ch)
+        } else {
+            // Snap near-1:1 / integer so FSR RCAS stays sharpen_only (no soft EASU).
+            target_size(cw, ch, view_w, view_h)
+        };
         let Some(src_bg) = video.bind_group_ref() else {
             return false;
         };
@@ -598,6 +634,13 @@ impl UpscaleEngine {
             UpscaleMode::Nis => {
                 self.dispatch_nis(device, queue, encoder, &sample, true, cw, ch, out_w, out_h);
             }
+            UpscaleMode::Dlss => {
+                let _ = sample;
+                if !self.dispatch_dlss_nr(device, queue, cw, ch) {
+                    // Unsupported / failed: pass through unenhanced (not NIS).
+                    return false;
+                }
+            }
             UpscaleMode::Off => return false,
         }
 
@@ -625,7 +668,11 @@ impl UpscaleEngine {
         if src_w == 0 || src_h == 0 || !self.should_run((src_w, src_h), (view_w, view_h)) {
             return false;
         }
-        let (out_w, out_h) = target_size(src_w, src_h, view_w, view_h);
+        let (out_w, out_h) = if self.mode == UpscaleMode::Dlss {
+            (src_w, src_h)
+        } else {
+            target_size(src_w, src_h, view_w, view_h)
+        };
         self.ensure_slots(device, src_w, src_h, out_w, out_h);
 
         let blit_ok = self.dispatch_blit(device, queue, encoder, src_view, src_w, src_h);
@@ -646,10 +693,85 @@ impl UpscaleEngine {
                     device, queue, encoder, &sample, stable_src, src_w, src_h, out_w, out_h,
                 );
             }
+            UpscaleMode::Dlss => {
+                let _ = (sample, stable_src);
+                if !self.dispatch_dlss_nr(device, queue, src_w, src_h) {
+                    return false;
+                }
+            }
             UpscaleMode::Off => return false,
         }
         self.present_dst(device, queue, encoder, out_w, out_h, surface_view, view_w, view_h, clear);
         true
+    }
+
+    /// Present one DLSS-G generated CPU frame through the upscale letterbox path.
+    pub fn present_fg_frame(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        frame: &FgPresentFrame,
+        surface_view: &wgpu::TextureView,
+        view_w: u32,
+        view_h: u32,
+        clear: wgpu::Color,
+    ) -> bool {
+        let (w, h) = (frame.width, frame.height);
+        if w == 0 || h == 0 || frame.rgba.len() < (w as usize) * (h as usize) * 4 {
+            return false;
+        }
+        self.ensure_slots(device, w, h, w, h);
+        let Some(dst) = self.rgba_dst.as_ref() else {
+            return false;
+        };
+        write_rgba8_texture(queue, &dst.texture, w, h, &frame.rgba);
+        self.present_dst(device, queue, encoder, w, h, surface_view, view_w, view_h, clear);
+        true
+    }
+
+    /// Pop a pending DLSS-G generated frame, if any.
+    pub fn pop_fg_present_frame(&mut self) -> Option<FgPresentFrame> {
+        self.dlss.fg_mut().pop_present_frame()
+    }
+
+    /// DLSS 5 Neural Rendering (NGX feature 18) via CPU staging D3D12 bridge.
+    /// Reads `rgba_src`, enhances, writes `rgba_dst` at the same resolution.
+    fn dispatch_dlss_nr(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        width: u32,
+        height: u32,
+    ) -> bool {
+        if !self.dlss.can_evaluate() {
+            return false;
+        }
+        let Some(src_tex) = self.rgba_src.as_ref().map(|s| s.texture.clone()) else {
+            return false;
+        };
+        let Some(dst_tex) = self.rgba_dst.as_ref().map(|s| s.texture.clone()) else {
+            return false;
+        };
+        match enhance_rgba8_with_nr(device, queue, &mut self.dlss, &src_tex, &dst_tex, width, height)
+        {
+            Ok(true) => {
+                // Debug only — INFO once/sec hitch the UI thread (same issue as RCAS).
+                if self.last_sharpen_log.elapsed().as_secs_f32() >= 5.0 {
+                    tracing::debug!(width, height, "DLSS 5 NR (feature 18) enhanced frame");
+                    self.last_sharpen_log = Instant::now();
+                }
+                true
+            }
+            Ok(false) => false,
+            Err(e) => {
+                if self.last_sharpen_log.elapsed().as_millis() > 2000 {
+                    tracing::warn!(%e, "DLSS 5 NR enhance failed — pass-through");
+                    self.last_sharpen_log = Instant::now();
+                }
+                false
+            }
+        }
     }
 
     /// Copy `src_view` into `rgba_src` via textureLoad (works for storage Mid).
@@ -736,13 +858,19 @@ impl UpscaleEngine {
         if self.rgba_dst.is_none() {
             return;
         }
-        let LetterboxUniforms { scale_offset } = compute_letterbox(out_w, out_h, view_w, view_h);
+        // Fit the upscale output into the window: 1:1 / integer → nearest, else linear.
+        let PresentFit {
+            scale_offset,
+            filter,
+            ..
+        } = compute_present_fit(out_w, out_h, view_w, view_h);
+        let nearest = matches!(filter, PresentFilter::Nearest) as u32;
         queue.write_buffer(
             &self.present_buf,
             0,
             bytemuck::bytes_of(&PresentGpu {
                 scale_offset,
-                pad: [0; 4],
+                flags: [nearest, 0, 0, 0],
             }),
         );
         let gen = self.tex_gen;
@@ -1042,9 +1170,10 @@ impl UpscaleEngine {
             }
         }
         // Present always samples rgba_dst (RCAS output) — never the pre-sharpen src.
-        if self.last_sharpen_log.elapsed().as_secs_f32() >= 1.0 {
+        // Debug only — INFO once/sec on the UI thread hitch 1% lows (Arthur: ~25 fps).
+        if self.last_sharpen_log.elapsed().as_secs_f32() >= 5.0 {
             self.last_sharpen_log = Instant::now();
-            tracing::info!(
+            tracing::debug!(
                 mode = "fsr1",
                 sharpness = self.sharpness,
                 con = con_x,
@@ -1162,9 +1291,9 @@ impl UpscaleEngine {
             cpass.set_bind_group(0, &bg, &[]);
             cpass.dispatch_workgroups((out_w + 7) / 8, (out_h + 7) / 8, 1);
         }
-        if self.last_sharpen_log.elapsed().as_secs_f32() >= 1.0 {
+        if self.last_sharpen_log.elapsed().as_secs_f32() >= 5.0 {
             self.last_sharpen_log = Instant::now();
-            tracing::info!(
+            tracing::debug!(
                 mode = "nis",
                 sharpness = self.sharpness,
                 sharp_param = sharp,
@@ -1193,8 +1322,10 @@ fn ensure_tex(
             return false;
         }
     }
-    // Convert path needs RENDER_ATTACHMENT; blit (encode_from_rgba) needs STORAGE.
-    let mut usage = wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC;
+    // Convert path needs RENDER_ATTACHMENT; blit needs STORAGE; DLSS NR needs COPY_SRC/DST.
+    let mut usage = wgpu::TextureUsages::TEXTURE_BINDING
+        | wgpu::TextureUsages::COPY_SRC
+        | wgpu::TextureUsages::COPY_DST;
     if storage {
         usage |= wgpu::TextureUsages::STORAGE_BINDING;
     } else {
@@ -1224,10 +1355,8 @@ fn ensure_tex(
 }
 
 pub fn target_size(content_w: u32, content_h: u32, view_w: u32, view_h: u32) -> (u32, u32) {
-    let u = compute_letterbox(content_w, content_h, view_w, view_h);
-    let out_w = ((view_w as f32) * u.scale_offset[0]).round().max(1.0) as u32;
-    let out_h = ((view_h as f32) * u.scale_offset[1]).round().max(1.0) as u32;
-    (out_w, out_h)
+    let fit = compute_present_fit(content_w, content_h, view_w, view_h);
+    (fit.out_w, fit.out_h)
 }
 
 /// True when capture already fills (or exceeds) the letterboxed window target —
@@ -1378,7 +1507,10 @@ mod tests {
     fn mode_roundtrip() {
         assert_eq!(UpscaleMode::from_str_lossy("fsr1"), UpscaleMode::Fsr1);
         assert_eq!(UpscaleMode::from_str_lossy("nis"), UpscaleMode::Nis);
+        assert_eq!(UpscaleMode::from_str_lossy("dlss"), UpscaleMode::Dlss);
+        assert_eq!(UpscaleMode::from_str_lossy("dlss5"), UpscaleMode::Dlss);
         assert_eq!(UpscaleMode::from_str_lossy("nope"), UpscaleMode::Off);
+        assert_eq!(UpscaleMode::Dlss.as_str(), "dlss");
     }
 
     #[test]

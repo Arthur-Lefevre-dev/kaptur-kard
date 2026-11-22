@@ -101,8 +101,15 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let limited = params.format_pad.y != 0u;
     let bt709 = params.format_pad.z != 0u;
 
+    let nearest = params.format_pad.w != 0u;
+
     if (fmt == 0u) {
         // BGRA uploaded as Bgra8Unorm — sampled as rgba in shader (wgpu swizzle).
+        if (nearest) {
+            let dims = vec2<f32>(textureDimensions(tex_primary));
+            let coord = vec2<i32>(floor(clamp(content_uv * dims, vec2<f32>(0.0), dims - vec2<f32>(1.0))));
+            return textureLoad(tex_primary, coord, 0);
+        }
         return textureSampleLevel(tex_primary, frame_sampler, content_uv, 0.0);
     }
 
@@ -122,6 +129,16 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     }
 
     // NV12: Y plane + UV plane
+    if (nearest) {
+        let y_dims = vec2<f32>(textureDimensions(tex_primary));
+        let uv_dims = vec2<f32>(textureDimensions(tex_uv));
+        let y_coord = vec2<i32>(floor(clamp(content_uv * y_dims, vec2<f32>(0.0), y_dims - vec2<f32>(1.0))));
+        let uv_coord = vec2<i32>(floor(clamp(content_uv * uv_dims, vec2<f32>(0.0), uv_dims - vec2<f32>(1.0))));
+        let y = textureLoad(tex_primary, y_coord, 0).r;
+        let uv = textureLoad(tex_uv, uv_coord, 0).rg;
+        let rgb = yuv_to_rgb(y, uv.r, uv.g, limited, bt709);
+        return vec4<f32>(rgb, 1.0);
+    }
     let y = textureSampleLevel(tex_primary, frame_sampler, content_uv, 0.0).r;
     let uv = textureSampleLevel(tex_uv, frame_sampler, content_uv, 0.0).rg;
     let rgb = yuv_to_rgb(y, uv.r, uv.g, limited, bt709);

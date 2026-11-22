@@ -11,7 +11,7 @@ use crate::device::{DeviceId, DeviceInfo, FormatDesc};
 use crate::format::{PixelFormat, Rational};
 use crate::pool::BufferPool;
 use crate::source::{
-    frame_channel, CaptureError, FrameReceiver, FrameSender, VideoFrame, VideoSource,
+    frame_channel, CaptureError, FrameReceiver, FrameSender, FrameWake, VideoFrame, VideoSource,
 };
 
 const DEFAULT_WIDTH: u32 = 1920;
@@ -69,6 +69,10 @@ impl Default for MockVideoSource {
 impl VideoSource for MockVideoSource {
     fn info(&self) -> &DeviceInfo {
         &self.info
+    }
+
+    fn set_frame_wake(&mut self, wake: FrameWake) {
+        self.sender.set_wake(wake);
     }
 
     fn start(&mut self, selected: &FormatDesc) -> Result<(), CaptureError> {

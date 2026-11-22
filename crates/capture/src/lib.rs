@@ -26,7 +26,7 @@ pub use labels::{
 };
 pub use pool::{BufferPool, PooledBytes};
 pub use source::{
-    CaptureError, FrameReceiver, FrameSender, StreamHealth, StreamStatus, TryRecvError,
+    CaptureError, FrameReceiver, FrameSender, FrameWake, StreamHealth, StreamStatus, TryRecvError,
     VideoFrame, VideoSource, FRAME_CHANNEL_DEPTH,
 };
 

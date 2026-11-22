@@ -234,6 +234,8 @@ pub struct UiActions {
     pub lag_test_stop: bool,
     pub upscale_mode: Option<&'static str>,
     pub sharpness_changed: Option<f32>,
+    pub dlss_boost_changed: Option<bool>,
+    pub dlssg_multiplier: Option<&'static str>,
     pub interp_mode: Option<&'static str>,
     pub deinterlace_mode: Option<&'static str>,
     /// None = unchanged; Some(0)=Auto, Some(9999)=unlimited, else Hz cap.
@@ -267,6 +269,17 @@ pub struct EffectsUiState {
     pub deinterlace_active: bool,
     /// auto | on | off
     pub vsync_mode: String,
+    /// Mode C — DLSS 5 NR ready.
+    pub dlss_ok: bool,
+    /// i18n key explaining why Mode C is limited.
+    pub dlss_reason_key: String,
+    /// Mode C selected but NR not running (pass-through).
+    pub dlss_fallback_nis: bool,
+    /// Boost (half-res NR + composite).
+    pub dlss_boost: bool,
+    pub dlssg_ok: bool,
+    pub dlssg_reason_key: String,
+    pub dlssg_multiplier: String,
 }
 
 impl Default for EffectsUiState {
@@ -288,6 +301,13 @@ impl Default for EffectsUiState {
             source_interlaced: false,
             deinterlace_active: false,
             vsync_mode: "auto".into(),
+            dlss_ok: false,
+            dlss_reason_key: String::new(),
+            dlss_fallback_nis: false,
+            dlss_boost: true,
+            dlssg_ok: false,
+            dlssg_reason_key: String::new(),
+            dlssg_multiplier: "off".into(),
         }
     }
 }
@@ -945,7 +965,7 @@ fn draw_effects_tab(ui: &mut egui::Ui, input: &DrawInput<'_>, actions: &mut UiAc
     ui.label(i18n.t("why_fsr_body"));
     ui.add_space(8.0);
 
-    // Mode A/B stay selectable at native res — RCAS / NIS sharpen still apply.
+    // Mode A/B/C stay selectable at native res — RCAS / NIS sharpen still apply.
     let blocked = !fx.compute_ok;
     let reason = if !fx.compute_ok {
         i18n.t("effect_reason_no_compute")
@@ -956,24 +976,70 @@ fn draw_effects_tab(ui: &mut egui::Ui, input: &DrawInput<'_>, actions: &mut UiAc
     };
 
     ui.label(i18n.t("label_upscale_mode"));
-    ui.add_enabled_ui(!blocked, |ui| {
-        ui.horizontal(|ui| {
-            for (id, key) in [
-                ("off", "effect_off"),
-                ("fsr1", "effect_fsr"),
-                ("nis", "effect_nis"),
-            ] {
-                let selected = fx.mode == id;
+    // Mode A/B on the first row; Mode C always on its own row so a long FR label
+    // never clips off the panel. When unavailable we paint a muted chip ourselves
+    // (egui add_enabled can be nearly invisible on dark themes).
+    ui.horizontal_wrapped(|ui| {
+        for (id, key) in [
+            ("off", "effect_off"),
+            ("fsr1", "effect_fsr"),
+            ("nis", "effect_nis"),
+        ] {
+            let selected = fx.mode == id;
+            ui.add_enabled_ui(!blocked, |ui| {
                 if ui.selectable_label(selected, i18n.t(key)).clicked() {
                     actions.upscale_mode = Some(id);
                 }
+            });
+        }
+    });
+    ui.horizontal(|ui| {
+        let label = i18n.t("effect_dlss");
+        if !blocked && fx.dlss_ok {
+            let selected = fx.mode == "dlss";
+            if ui.selectable_label(selected, label).clicked() {
+                actions.upscale_mode = Some("dlss");
             }
-        });
+        } else {
+            // Always visible greyed Mode C — not egui-disabled (too faint on AMD dark UI).
+            let chip = format!("{} · {}", label, i18n.t("label_unavailable"));
+            ui.label(
+                RichText::new(chip)
+                    .color(ui.visuals().weak_text_color())
+                    .strong(),
+            );
+        }
     });
     if blocked || fx.auto_disabled {
         ui.small(format!("{}: {}", i18n.t("label_unavailable"), reason));
-    } else if fx.native_res && fx.mode != "off" {
+    } else if fx.native_res && fx.mode != "off" && fx.mode != "dlss" {
         ui.small(i18n.t("tip_native_sharpen"));
+    }
+    // Always explain Mode C status (greyed AMD/missing DLL included).
+    {
+        let key = if fx.dlss_ok {
+            "effect_reason_dlss_active"
+        } else if fx.dlss_reason_key.is_empty() {
+            "effect_reason_dlss_needs_rtx"
+        } else {
+            fx.dlss_reason_key.as_str()
+        };
+        ui.label(
+            RichText::new(format!("{}: {}", i18n.t("label_dlss_status"), i18n.t(key))).small(),
+        );
+    }
+    if fx.mode == "dlss" && fx.dlss_ok {
+        ui.label(RichText::new(i18n.t("tip_dlss")).small().italics());
+        let mut boost = fx.dlss_boost;
+        if ui
+            .checkbox(&mut boost, i18n.t("label_dlss_boost"))
+            .changed()
+        {
+            actions.dlss_boost_changed = Some(boost);
+        }
+        ui.label(RichText::new(i18n.t("tip_dlss_boost")).small().italics());
+    } else if !fx.dlss_ok {
+        ui.label(RichText::new(i18n.t("tip_dlss_greyed")).small().italics());
     }
     ui.label(RichText::new(i18n.t("tip_upscale")).small().italics());
     ui.add_space(8.0);
@@ -1037,6 +1103,50 @@ fn draw_effects_tab(ui: &mut egui::Ui, input: &DrawInput<'_>, actions: &mut UiAc
     }
     ui.label(RichText::new(i18n.t("tip_interp")).small().italics());
     ui.label(RichText::new(i18n.t("explain_interp")).small());
+
+    ui.add_space(10.0);
+    ui.separator();
+    ui.label(RichText::new(i18n.t("label_dlssg")).strong());
+    ui.label(RichText::new(i18n.t("tip_dlssg")).small().italics());
+    // Always show FG multipliers; grey ×2+ when RTX + BYO dlssg DLL is missing.
+    ui.horizontal(|ui| {
+        let selected_off = fx.dlssg_multiplier == "off";
+        if ui
+            .selectable_label(selected_off, i18n.t("effect_dlssg_off"))
+            .clicked()
+        {
+            actions.dlssg_multiplier = Some("off");
+        }
+        for (id, key) in [
+            ("x2", "effect_dlssg_x2"),
+            ("x3", "effect_dlssg_x3"),
+            ("x4", "effect_dlssg_x4"),
+        ] {
+            let selected = fx.dlssg_multiplier == id;
+            ui.add_enabled_ui(fx.dlssg_ok, |ui| {
+                if ui.selectable_label(selected, i18n.t(key)).clicked() {
+                    actions.dlssg_multiplier = Some(id);
+                }
+            });
+        }
+    });
+    {
+        let key = if fx.dlssg_ok {
+            "effect_reason_dlssg_active"
+        } else if fx.dlssg_reason_key.is_empty() {
+            "effect_reason_dlssg_needs_rtx"
+        } else {
+            fx.dlssg_reason_key.as_str()
+        };
+        let style = if fx.dlssg_ok {
+            RichText::new(format!("{}: {}", i18n.t("label_dlssg_status"), i18n.t(key))).small()
+        } else {
+            RichText::new(format!("{}: {}", i18n.t("label_dlssg_status"), i18n.t(key)))
+                .small()
+                .weak()
+        };
+        ui.label(style);
+    }
 
     ui.add_space(10.0);
     ui.label(RichText::new(i18n.t("label_display_fps_limit")).strong());

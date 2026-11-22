@@ -13,7 +13,7 @@ use audio::{
     AudioEngineConfig, NONE_INPUT_ID,
 };
 use capture::{
-    hz_label, modes, CaptureError, CaptureMode, DeviceInfo, FormatDesc, FrameReceiver,
+    hz_label, modes, CaptureError, CaptureMode, DeviceInfo, FormatDesc, FrameReceiver, FrameWake,
     MockVideoSource, PixelFormat, Rational, StreamHealth, StreamStatus, VideoFrame, VideoSource,
 };
 use egui_wgpu::ScreenDescriptor;
@@ -23,14 +23,20 @@ use render::pipeline::VideoPipeline;
 use render::upload::upload_frame;
 use render::{
     is_native_or_downscale, resolve_color_convert, ColorMatrixMode, ColorRangeMode,
-    DeinterlaceEngine, DeinterlaceMode, InterpBlockReason, InterpMode,
+    DeinterlaceEngine, DeinterlaceMode, DlssGMultiplier, InterpBlockReason, InterpMode,
     InterpolateEngine, UpscaleBlockReason, UpscaleEngine, UpscaleMode,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::WindowEvent;
-use winit::event_loop::{ActiveEventLoop, ControlFlow};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy};
 use winit::window::{Window, WindowId};
+
+/// Wakes the UI when the capture thread queues a frame (capture-driven present).
+#[derive(Debug, Clone, Copy)]
+pub enum UserEvent {
+    FrameReady,
+}
 
 use crate::discord_presence::{resolve_app_id, DiscordPresence};
 use crate::i18n::I18n;
@@ -70,6 +76,18 @@ impl ActiveSource {
             Self::V4l2(s) => s.info(),
             #[cfg(target_os = "macos")]
             Self::Avf(s) => s.info(),
+        }
+    }
+
+    fn set_frame_wake(&mut self, wake: FrameWake) {
+        match self {
+            Self::Mock(s) => s.set_frame_wake(wake),
+            #[cfg(windows)]
+            Self::Mf(s) => s.set_frame_wake(wake),
+            #[cfg(target_os = "linux")]
+            Self::V4l2(s) => s.set_frame_wake(wake),
+            #[cfg(target_os = "macos")]
+            Self::Avf(s) => s.set_frame_wake(wake),
         }
     }
 
@@ -158,6 +176,8 @@ pub struct App {
     gen_frames_in_window: u32,
     last_frame_at: Instant,
     last_present_at: Option<Instant>,
+    /// Absolute present phase (deadline pacing). Avoids WaitUntil slip → ~59 fps.
+    next_present_at: Instant,
     last_redraw_at: Instant,
     last_channel_drops: u64,
     black_since: Option<Instant>,
@@ -194,6 +214,8 @@ pub struct App {
     discord: DiscordPresence,
     last_discord_push: Instant,
     logo_tex: Option<egui::TextureHandle>,
+    /// Wakes `about_to_wait` / redraw when capture queues a frame.
+    proxy: Option<EventLoopProxy<UserEvent>>,
 }
 
 impl Default for App {
@@ -380,6 +402,7 @@ impl Default for App {
             gen_frames_in_window: 0,
             last_frame_at: Instant::now(),
             last_present_at: None,
+            next_present_at: Instant::now(),
             last_redraw_at: Instant::now(),
             last_channel_drops: 0,
             black_since: None,
@@ -395,6 +418,8 @@ impl Default for App {
                 deinterlace_mode: ui_prefs.deinterlace_mode.clone(),
                 source_interlaced: format.interlaced,
                 vsync_mode: normalize_vsync_mode(&ui_prefs.vsync_mode),
+                dlss_boost: ui_prefs.dlss_boost,
+                dlssg_multiplier: ui_prefs.dlssg_multiplier.clone(),
                 ..EffectsUiState::default()
             },
             color_ui,
@@ -424,11 +449,54 @@ impl Default for App {
                 .checked_sub(Duration::from_secs(60))
                 .unwrap_or_else(Instant::now),
             logo_tex: None,
+            proxy: None,
         }
     }
 }
 
-impl ApplicationHandler for App {
+impl App {
+    pub fn with_proxy(proxy: EventLoopProxy<UserEvent>) -> Self {
+        let mut app = Self::default();
+        app.proxy = Some(proxy);
+        app
+    }
+}
+
+impl ApplicationHandler<UserEvent> for App {
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
+        match event {
+            UserEvent::FrameReady => {
+                // Present as soon as a capture frame lands (min gap avoids double-present).
+                let period = Duration::from_secs_f64(1.0 / self.target_display_hz());
+                let now = Instant::now();
+                let since = self
+                    .last_present_at
+                    .map(|t| now.duration_since(t))
+                    .unwrap_or(Duration::from_secs(1));
+                let framegen = self.framegen_wants_2x();
+                let min_gap = Duration::from_millis(1);
+                let due = if framegen {
+                    // Keep Mid/Curr on the 2× deadline grid.
+                    now + Duration::from_millis(1) >= self.next_present_at
+                } else {
+                    since >= min_gap
+                };
+                if due {
+                    if let Some(gpu) = self.gpu.as_ref() {
+                        gpu.window.request_redraw();
+                    }
+                } else if !framegen {
+                    // Too soon after last present — schedule the remainder of the period.
+                    self.next_present_at = self
+                        .last_present_at
+                        .unwrap_or(now)
+                        .checked_add(period)
+                        .unwrap_or(now);
+                }
+            }
+        }
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.gpu.is_some() {
             return;
@@ -453,6 +521,10 @@ impl ApplicationHandler for App {
         gpu.upscale
             .set_mode(UpscaleMode::from_str_lossy(&self.effects_ui.mode));
         gpu.upscale.set_sharpness(self.effects_ui.sharpness);
+        gpu.upscale.dlss.set_boost(self.effects_ui.dlss_boost);
+        gpu.upscale.dlss.set_fg_multiplier(DlssGMultiplier::from_str_lossy(
+            &self.effects_ui.dlssg_multiplier,
+        ));
         gpu.interpolate
             .set_mode(InterpMode::from_str_lossy(&self.effects_ui.interp_mode));
         gpu.deinterlace
@@ -503,8 +575,7 @@ impl ApplicationHandler for App {
         event: WindowEvent,
     ) {
         // Compute before borrowing GPU (egui repaint must honor the same FPS cap).
-        let period = Duration::from_secs_f64(1.0 / self.target_display_hz());
-        let redraw_due = self.last_redraw_at.elapsed() >= period;
+        let redraw_due = Instant::now() >= self.next_present_at;
 
         let Some(gpu) = self.gpu.as_mut() else {
             return;
@@ -542,15 +613,28 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        // Always honor the display FPS cap — never let has_pending alone bypass it
-        // (Arthur saw 240 FPS écran with limit 120 when pending woke every tick).
-        let period = Duration::from_secs_f64(1.0 / self.target_display_hz());
-        let elapsed = self.last_redraw_at.elapsed();
-        let until_due = period.saturating_sub(elapsed);
-        let due = until_due.is_zero();
+        // Capture-driven (no framegen): FrameReady wakes us when a frame is queued.
+        // Framegen: absolute 2× deadline so Mid then Curr each get a present.
+        let now = Instant::now();
+        let framegen = self.framegen_wants_2x();
+        let pending = self
+            .source
+            .as_ref()
+            .map(|s| !s.receiver().is_empty())
+            .unwrap_or(false);
+        let since_present = self
+            .last_present_at
+            .map(|t| now.duration_since(t))
+            .unwrap_or(Duration::from_secs(1));
+
+        // Min gap ~1ms (not 0.92×period): old gate still aged frames on the bus → sawtooth.
+        let min_gap = Duration::from_millis(1);
+        let capture_due = !framegen && pending && since_present >= min_gap;
+        let due = now >= self.next_present_at || capture_due;
+        let until_due = self.next_present_at.saturating_duration_since(now);
 
         // Apply finished presence polls; only start a new one when not near a present.
-        self.poll_hotplug_async(until_due > HOTPLUG_PRESENT_SLACK);
+        self.poll_hotplug_async(until_due > HOTPLUG_PRESENT_SLACK && !due);
         self.flush_prefs_if_due();
         self.push_discord_activity(false);
 
@@ -563,11 +647,9 @@ impl ApplicationHandler for App {
             event_loop.set_control_flow(ControlFlow::Wait);
             return;
         }
-        // Wake when the next present is legal under the FPS cap.
-        let wait = until_due
-            .max(Duration::from_micros(200))
-            .min(Duration::from_millis(33));
-        event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + wait));
+        // Without framegen, FrameReady is the primary wake; deadline is a stall fallback.
+        let wake_at = self.next_present_at;
+        event_loop.set_control_flow(ControlFlow::WaitUntil(wake_at));
     }
 }
 
@@ -577,6 +659,21 @@ impl App {
             let _ = source.stop();
         }
         self.running = false;
+    }
+
+    /// True when optical-flow x2 should drive a 2× present cadence (LS-style).
+    fn framegen_wants_2x(&self) -> bool {
+        let mode = InterpMode::from_str_lossy(&self.effects_ui.interp_mode);
+        if !mode.wants_effect() {
+            return false;
+        }
+        match self.gpu.as_ref() {
+            Some(g) => {
+                g.interpolate.compute_ok
+                    && g.interpolate.status().block != InterpBlockReason::AutoDisabled
+            }
+            None => true,
+        }
     }
 
     /// Target on-screen present rate from prefs + capture / frame-gen.
@@ -589,14 +686,36 @@ impl App {
             .unwrap_or(60.0)
             .clamp(24.0, 240.0);
         let limit = self.ui_prefs.display_fps_limit;
-        let auto = if self.effects_ui.interp_mode != "off" {
-            (capture_hz * 2.0).min(240.0)
+        // Optical framegen inserts one Mid per capture — needs ~2× swapchain presents
+        // (Lossless Scaling does the same). A 60 Hz VSync/monitor still caps it.
+        let framegen_hz = (capture_hz * 2.0).min(240.0);
+        let fg_mult = match self.effects_ui.dlssg_multiplier.as_str() {
+            "x2" => 2.0,
+            "x3" => 3.0,
+            "x4" => 4.0,
+            "x5" => 5.0,
+            "x6" => 6.0,
+            _ => 1.0,
+        };
+        let dlssg_active = self.effects_ui.dlssg_ok && fg_mult > 1.0;
+        let dlssg_hz = if dlssg_active {
+            (capture_hz * fg_mult).min(240.0)
+        } else {
+            capture_hz
+        };
+        let auto = if self.framegen_wants_2x() {
+            framegen_hz.max(dlssg_hz)
+        } else if dlssg_active {
+            dlssg_hz
         } else {
             capture_hz
         };
         let hz = match limit {
             0 => auto,
             9999 => 360.0,
+            // Explicit 60 while framegen is on would silently drop Curr — bump.
+            n if self.framegen_wants_2x() && (n as f64) + 0.5 < framegen_hz => framegen_hz,
+            n if dlssg_active && (n as f64) + 0.5 < dlssg_hz => dlssg_hz,
             n => n as f64,
         };
         hz.clamp(24.0, 360.0)
@@ -604,7 +723,9 @@ impl App {
 
     /// Apply swapchain present mode from the VSync pref (auto/on/off).
     /// Auto: Auto/Game → NoVsync (avoids Fifo phase-beat with software pacing);
-    /// Quality/Economy → VSync. Explicit on/off overrides the profile.
+    /// Quality/Economy → VSync. Framegen x2 forces NoVsync under Auto (needs >monitor
+    /// refresh when the panel is 60 Hz — same idea as Lossless Scaling).
+    /// Explicit on/off overrides the profile.
     fn apply_present_mode_for_profile(&mut self) {
         let Some(gpu) = self.gpu.as_mut() else {
             return;
@@ -614,10 +735,12 @@ impl App {
             self.selection.mode,
             CaptureMode::Game | CaptureMode::Auto
         );
+        let framegen = InterpMode::from_str_lossy(&self.effects_ui.interp_mode).wants_effect();
         let use_vsync = match mode.as_str() {
             "on" => true,
             "off" => false,
-            _ => !profile_low_latency,
+            // Auto: NoVsync for Game/Auto profiles, or whenever framegen needs 2× presents.
+            _ => !(profile_low_latency || framegen),
         };
         let want = if use_vsync {
             wgpu::PresentMode::AutoVsync
@@ -673,6 +796,12 @@ impl App {
                     )));
                 }
             };
+            // Wake UI on each queued frame so presents follow capture (kills latency sawtooth).
+            if let Some(proxy) = self.proxy.clone() {
+                source.set_frame_wake(Arc::new(move || {
+                    let _ = proxy.send_event(UserEvent::FrameReady);
+                }));
+            }
             source.start(&format)?;
             Ok(source)
         })();
@@ -1041,27 +1170,48 @@ impl App {
         }
 
         if let Some((w, h)) = actions.resolution_changed {
-            self.selection.width = w;
-            self.selection.height = h;
             let caps = &self.devices[self.selection.device_idx].formats;
             let rates = modes::rates_for_resolution(caps, w, h);
-            if let Some(r) = rates.first() {
-                self.selection.rate = *r;
-            }
-            if let Some(fmt) = modes::pick_format_at(caps, w, h, self.selection.rate) {
+            let rate = rates.first().copied().unwrap_or(self.selection.rate);
+            if let Some(fmt) = modes::pick_format_at(caps, w, h, rate) {
                 let msg = self.i18n.t("err_resolution");
-                let _ = self.restart_with_fallback(fmt, &msg);
+                if self.restart_with_fallback(fmt, &msg) {
+                    // Match client area to capture so windowed 1080 can stay 1:1 crisp.
+                    self.request_window_for_capture();
+                }
             }
+            // Keep dropdown in sync with the live MF format (never a stale preset).
+            self.selection.width = self.current_format.width;
+            self.selection.height = self.current_format.height;
+            self.selection.rate = self
+                .current_format
+                .frame_rates
+                .first()
+                .copied()
+                .unwrap_or(self.selection.rate);
         }
 
         if let Some(rate) = actions.rate_changed {
-            self.selection.rate = rate;
             let caps = &self.devices[self.selection.device_idx].formats;
             if let Some(fmt) =
                 modes::pick_format_at(caps, self.selection.width, self.selection.height, rate)
             {
                 let msg = self.i18n.t("err_rate");
-                let _ = self.restart_with_fallback(fmt, &msg);
+                if !self.restart_with_fallback(fmt, &msg) {
+                    self.selection.rate = self
+                        .current_format
+                        .frame_rates
+                        .first()
+                        .copied()
+                        .unwrap_or(self.selection.rate);
+                }
+            } else {
+                self.selection.rate = self
+                    .current_format
+                    .frame_rates
+                    .first()
+                    .copied()
+                    .unwrap_or(self.selection.rate);
             }
         }
 
@@ -1254,12 +1404,36 @@ impl App {
             }
             self.persist_ui_prefs();
         }
+        if let Some(boost) = actions.dlss_boost_changed {
+            self.effects_ui.dlss_boost = boost;
+            self.ui_prefs.dlss_boost = boost;
+            if let Some(gpu) = self.gpu.as_mut() {
+                gpu.upscale.dlss.set_boost(boost);
+            }
+            self.persist_ui_prefs();
+        }
+        if let Some(m) = actions.dlssg_multiplier {
+            self.effects_ui.dlssg_multiplier = m.to_string();
+            self.ui_prefs.dlssg_multiplier = m.to_string();
+            if let Some(gpu) = self.gpu.as_mut() {
+                gpu.upscale
+                    .dlss
+                    .set_fg_multiplier(DlssGMultiplier::from_str_lossy(m));
+            }
+            self.persist_ui_prefs();
+        }
         if let Some(mode) = actions.interp_mode {
             self.effects_ui.interp_mode = mode.to_string();
             self.ui_prefs.interp_mode = mode.to_string();
             if let Some(gpu) = self.gpu.as_mut() {
                 gpu.interpolate
                     .set_mode(InterpMode::from_str_lossy(mode));
+            }
+            // Framegen needs 2× presents + NoVsync (Auto) — resync phase immediately.
+            self.next_present_at = Instant::now();
+            self.apply_present_mode_for_profile();
+            if InterpMode::from_str_lossy(mode).wants_effect() {
+                self.show_toast(self.i18n.t("msg_interp_needs_120"));
             }
             self.persist_ui_prefs();
         }
@@ -1342,6 +1516,8 @@ impl App {
         self.ui_prefs.wizard_step = self.chrome.wizard_step;
         self.ui_prefs.upscale_mode = self.effects_ui.mode.clone();
         self.ui_prefs.sharpness = self.effects_ui.sharpness;
+        self.ui_prefs.dlss_boost = self.effects_ui.dlss_boost;
+        self.ui_prefs.dlssg_multiplier = self.effects_ui.dlssg_multiplier.clone();
         self.ui_prefs.interp_mode = self.effects_ui.interp_mode.clone();
         self.ui_prefs.deinterlace_mode = self.effects_ui.deinterlace_mode.clone();
         self.ui_prefs.vsync_mode = normalize_vsync_mode(&self.effects_ui.vsync_mode);
@@ -1366,6 +1542,8 @@ impl App {
             self.ui_prefs.wizard_step = self.chrome.wizard_step;
             self.ui_prefs.upscale_mode = self.effects_ui.mode.clone();
             self.ui_prefs.sharpness = self.effects_ui.sharpness;
+            self.ui_prefs.dlss_boost = self.effects_ui.dlss_boost;
+            self.ui_prefs.dlssg_multiplier = self.effects_ui.dlssg_multiplier.clone();
             self.ui_prefs.interp_mode = self.effects_ui.interp_mode.clone();
             self.ui_prefs.deinterlace_mode = self.effects_ui.deinterlace_mode.clone();
             self.ui_prefs.vsync_mode = normalize_vsync_mode(&self.effects_ui.vsync_mode);
@@ -1403,6 +1581,13 @@ impl App {
             self.effects_ui.last_gpu_ms = st.last_gpu_ms.max(gpu.interpolate.last_gpu_ms);
             self.effects_ui.vendor = st.vendor;
             self.effects_ui.backend = st.backend;
+            self.effects_ui.dlss_ok = st.dlss.availability.can_evaluate();
+            self.effects_ui.dlss_reason_key = st.dlss.availability.as_reason_key().into();
+            self.effects_ui.dlss_fallback_nis = !st.dlss_nr_active && st.mode.as_str() == "dlss";
+            self.effects_ui.dlss_boost = st.dlss.boost;
+            self.effects_ui.dlssg_ok = st.dlss.fg.availability.can_evaluate();
+            self.effects_ui.dlssg_reason_key = st.dlss.fg.availability.as_reason_key().into();
+            self.effects_ui.dlssg_multiplier = st.dlss.fg.multiplier.as_str().into();
             let ist = gpu.interpolate.status();
             self.effects_ui.interp_mode = ist.mode.as_str().into();
             self.effects_ui.interp_compute_ok = ist.compute_ok;
@@ -1431,17 +1616,25 @@ impl App {
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "(none)".into());
         let log_tail = crate::logging::log_tail();
+        let backend = self
+            .gpu
+            .as_ref()
+            .map(|g| g.upscale.backend.as_str())
+            .unwrap_or("?");
         let report = format!(
             "CaptureView support report\n\
+             build={} capture_wake={}\n\
              locale={:?}\n\
              device={}\n\
              format={}x{} {:?} @ {:?}\n\
              audio_in={} audio_out={}\n\
              fps={:.1} capture_fps={:.1} frame_gen_fps={:.1} display_limit={} vsync={} pipeline_delay_ms={:.1}\n\
-             dropped={} 1%low={:.1} gpu={}\n\
+             dropped={} 1%low={:.1} gpu={} backend={}\n\
              log_level={} log_file={}\n\
              -- support events --\n{}\n\
              -- log tail --\n{}\n",
+            env!("CAPTUREVIEW_GIT_HASH"),
+            env!("CAPTUREVIEW_CAPTURE_WAKE"),
             self.i18n.lang(),
             self.overlay.label,
             self.current_format.width,
@@ -1459,6 +1652,7 @@ impl App {
             self.overlay.dropped_frames,
             self.overlay.one_percent_low_fps,
             self.overlay.gpu_name,
+            backend,
             self.ui_prefs.log_level,
             log_path,
             self.support_log.join("\n"),
@@ -1476,6 +1670,24 @@ impl App {
     fn show_toast(&mut self, msg: String) {
         self.overlay.toast = msg;
         self.toast_until = Some(Instant::now() + Duration::from_secs(3));
+    }
+
+    /// Resize the windowed client area to the active capture size (physical pixels).
+    /// Keeps windowed 1080 at a true 1:1 present instead of a soft fractional fit.
+    fn request_window_for_capture(&mut self) {
+        let Some(gpu) = self.gpu.as_mut() else {
+            return;
+        };
+        if self.chrome.fullscreen {
+            return;
+        }
+        let w = self.current_format.width;
+        let h = self.current_format.height;
+        if w == 0 || h == 0 {
+            return;
+        }
+        let _ = gpu.window.request_inner_size(winit::dpi::PhysicalSize::new(w, h));
+        tracing::info!(w, h, "requested windowed client size for capture 1:1");
     }
 
     fn toggle_fullscreen(&mut self) {
@@ -1533,11 +1745,34 @@ impl App {
 
     fn redraw(&mut self) {
         let period = Duration::from_secs_f64(1.0 / self.target_display_hz());
+        let now = Instant::now();
+        let framegen = self.framegen_wants_2x();
+        let pending = self
+            .source
+            .as_ref()
+            .map(|s| !s.receiver().is_empty())
+            .unwrap_or(false);
+        let since_present = self
+            .last_present_at
+            .map(|t| now.duration_since(t))
+            .unwrap_or(Duration::from_secs(1));
+        let min_gap = Duration::from_millis(1);
+        let capture_due = !framegen && pending && since_present >= min_gap;
         // Hard drop surplus RedrawRequested (egui may queue many under NoVsync).
-        if self.last_redraw_at.elapsed() + Duration::from_micros(500) < period {
+        if !capture_due && now + Duration::from_micros(500) < self.next_present_at {
             return;
         }
-        self.last_redraw_at = Instant::now();
+        // Capture-driven: snap phase to the capture clock so latency stays flat.
+        // Framegen: advance absolute 2× grid (catch-up capped).
+        if capture_due || (!framegen && pending) {
+            self.next_present_at = now + period;
+        } else {
+            self.next_present_at += period;
+            if self.next_present_at + period < now {
+                self.next_present_at = now + period;
+            }
+        }
+        self.last_redraw_at = now;
         // Drain frames before borrowing GPU exclusively for UI state updates.
         let mut latest: Option<VideoFrame> = None;
         let mut drained = 0u64;
@@ -1676,6 +1911,10 @@ impl App {
             .first()
             .copied()
             .unwrap_or(self.selection.rate);
+        // Dropdown must mirror the live MF format (avoids 720p preset vs 1080 capture).
+        self.selection.width = self.current_format.width;
+        self.selection.height = self.current_format.height;
+        self.selection.rate = rate;
         self.overlay.format_label = format!(
             "{}×{} {:?} @ {}",
             self.current_format.width,
@@ -1731,10 +1970,11 @@ impl App {
         };
 
         let new_capture = latest.is_some();
-        // Pipeline delay only updates on a fresh capture; frame-time / 1% low are
-        // recorded after swapchain present so they match FPS écran (not coalesce gaps).
+        // Pipeline delay = capture Instant → this present, only on a fresh upload.
+        // Present-only / Mid→Curr ticks keep the last reading (no sawtooth from aging).
         let mut latency_ns = self.metrics.last_latency_ns.load(Ordering::Relaxed);
-        if let Some(frame) = latest {
+        if let Some(ref frame) = latest {
+            // With capture-driven wake, this stays ~GPU path (few ms), not 2→16 phase walk.
             latency_ns = frame.captured_at.elapsed().as_nanos() as u64;
             if upload_frame(&gpu.device, &gpu.queue, &mut gpu.pipeline, &frame) {
                 let rate = self
@@ -1836,8 +2076,26 @@ impl App {
             });
 
         // Pipeline: upload → color → deinterlace → interpolate → upscale → present.
+        // DLSS-G: between captures, drain EvaluateFeature frames from the FG present queue.
         let mut presented = false;
-        if !no_signal {
+        if !no_signal && !new_capture {
+            if let Some(fg_frame) = gpu.upscale.pop_fg_present_frame() {
+                presented = gpu.upscale.present_fg_frame(
+                    &gpu.device,
+                    &gpu.queue,
+                    &mut encoder,
+                    &fg_frame,
+                    &view,
+                    gpu.config.width,
+                    gpu.config.height,
+                    clear,
+                );
+                if presented {
+                    self.gen_frames_in_window = self.gen_frames_in_window.saturating_add(1);
+                }
+            }
+        }
+        if !no_signal && !presented {
             let (cw, ch) = gpu.pipeline.content_size;
             let source_interlaced = self.current_format.interlaced;
             gpu.deinterlace.set_source_interlaced(source_interlaced);
@@ -2106,20 +2364,66 @@ fn approx_black(frame: &VideoFrame) -> bool {
     (sum / count) < 8
 }
 
+fn adapter_score(info: &wgpu::AdapterInfo) -> i32 {
+    let backend = match info.backend {
+        // DX12 first on Windows — avoids TikTok/OBS Vulkan layer JSON spam + hitches.
+        wgpu::Backend::Dx12 => 400,
+        wgpu::Backend::Metal => 400,
+        wgpu::Backend::Vulkan => 150,
+        wgpu::Backend::Gl => 20,
+        _ => 0,
+    };
+    let power = match info.device_type {
+        wgpu::DeviceType::DiscreteGpu => 30,
+        wgpu::DeviceType::IntegratedGpu => 10,
+        wgpu::DeviceType::VirtualGpu => 5,
+        _ => 0,
+    };
+    backend + power
+}
+
+fn pick_adapter(
+    instance: &wgpu::Instance,
+    surface: &wgpu::Surface<'_>,
+) -> Option<wgpu::Adapter> {
+    let mut best: Option<(i32, wgpu::Adapter)> = None;
+    for adapter in instance.enumerate_adapters(wgpu::Backends::PRIMARY) {
+        if !adapter.is_surface_supported(surface) {
+            continue;
+        }
+        let score = adapter_score(&adapter.get_info());
+        if best.as_ref().map(|(s, _)| score > *s).unwrap_or(true) {
+            best = Some((score, adapter));
+        }
+    }
+    if let Some((_, adapter)) = best {
+        return Some(adapter);
+    }
+    // Fallback: default high-performance request (async path used by callers that await).
+    None
+}
+
 async fn init_gpu(window: Arc<Window>) -> anyhow::Result<GpuState> {
+    // With --features dlss prefer DX12 (NGX NR/FG host); else PRIMARY (DX12/VK/GL).
+    let backends = render::preferred_backends();
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::PRIMARY,
+        backends,
         ..Default::default()
     });
     let surface = instance.create_surface(window.clone())?;
-    let adapter = instance
-        .request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            compatible_surface: Some(&surface),
-            force_fallback_adapter: false,
-        })
-        .await
-        .ok_or_else(|| anyhow::anyhow!("no suitable GPU adapter"))?;
+    // Prefer DX12 on Windows: Vulkan + overlay layers (TikTok JSON spam) hitch UI
+    // and tank 1% lows on Arthur's RX 7800 XT.
+    let adapter = match pick_adapter(&instance, &surface) {
+        Some(a) => a,
+        None => instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: Some(&surface),
+                force_fallback_adapter: false,
+            })
+            .await
+            .ok_or_else(|| anyhow::anyhow!("no suitable GPU adapter"))?,
+    };
     let adapter_info = adapter.get_info();
     let adapter_name = adapter_info.name.clone();
     let backend = adapter_info.backend;
@@ -2127,11 +2431,19 @@ async fn init_gpu(window: Arc<Window>) -> anyhow::Result<GpuState> {
         gpu = %adapter_name,
         backend = ?backend,
         vendor = adapter_info.vendor,
-        "GPU adapter selected (DX12/Vulkan preferred; GL is a fallback path)"
+        ?backends,
+        build = env!("CAPTUREVIEW_GIT_HASH"),
+        capture_wake = env!("CAPTUREVIEW_CAPTURE_WAKE"),
+        "GPU adapter selected (DX12 preferred; DLSS builds keep RTX path; AMD uses FSR/NIS + optical FG)"
     );
     if matches!(backend, wgpu::Backend::Gl) {
         tracing::warn!(
-            "running on OpenGL — FSR/NIS compute may be limited; prefer DX12 or Vulkan"
+            "running on OpenGL — FSR/NIS compute may be limited; DLSS NR/FG need DX12"
+        );
+    }
+    if matches!(backend, wgpu::Backend::Vulkan) {
+        tracing::warn!(
+            "Vulkan selected — overlay layers may spam logs; DX12 is preferred on Windows"
         );
     }
 

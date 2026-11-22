@@ -40,6 +40,12 @@ pub struct UiPrefs {
     pub upscale_mode: String,
     #[serde(default = "default_sharpness")]
     pub sharpness: f32,
+    /// DLSS 5 NR Boost (half-res + composite).
+    #[serde(default = "default_true")]
+    pub dlss_boost: bool,
+    /// NVIDIA DLSS-G multiplier: off | x2 | x3 | x4 | x5 | x6
+    #[serde(default)]
+    pub dlssg_multiplier: String,
     #[serde(default)]
     pub interp_mode: String,
     #[serde(default = "default_deinterlace")]
@@ -130,6 +136,8 @@ impl Default for UiPrefs {
             source_confirmed: false,
             upscale_mode: "off".into(),
             sharpness: 0.4,
+            dlss_boost: true,
+            dlssg_multiplier: "off".into(),
             interp_mode: "off".into(),
             deinterlace_mode: "auto".into(),
             display_fps_limit: 0,

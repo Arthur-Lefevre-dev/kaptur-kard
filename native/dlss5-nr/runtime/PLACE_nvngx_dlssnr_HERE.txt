@@ -1,0 +1,9 @@
+﻿Place your legally obtained nvngx_dlssnr.dll (and optional nvngx_dlssg.dll) in this folder.
+
+Then either:
+  set CAPTUREVIEW_DLSSNR_DIR=C:\Users\kingd\Documents\GitHub\kaptur-kard-dlss\native\dlss5-nr\runtime
+or copy this whole runtime\ tree to %APPDATA%\CaptureView\dlss5-nr\
+
+Also need dlss5nr_bridge.dll / dlss5g_bridge.dll from this build script (copied beside runtime or from bin\).
+
+Official GPU support: RTX 50-series NR + Ada+ FG typical; driver 616.56+. See docs/DLSS.md.
