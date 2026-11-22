@@ -310,8 +310,13 @@ pub fn draw_ui(ctx: &Context, input: DrawInput<'_>) -> UiActions {
         if i.key_pressed(Key::M) && !i.modifiers.matches_logically(Modifiers::CTRL) {
             actions.mute_toggled = Some(!input.audio.muted);
         }
-        if i.key_pressed(Key::Escape) && input.chrome.settings_open {
-            actions.close_settings = true;
+        if i.key_pressed(Key::Escape) {
+            // Settings first, then leave fullscreen (Esc must exit plein écran).
+            if input.chrome.settings_open {
+                actions.close_settings = true;
+            } else if input.chrome.fullscreen {
+                actions.toggle_fullscreen = true;
+            }
         }
     });
 
