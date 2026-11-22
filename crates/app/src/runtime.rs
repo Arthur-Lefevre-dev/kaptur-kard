@@ -29,6 +29,7 @@ use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow};
 use winit::window::{Window, WindowId};
 
+use crate::discord_presence::{resolve_app_id, DiscordPresence};
 use crate::i18n::I18n;
 use crate::prefs::{
     load_audio_prefs, load_ui_prefs, save_audio_prefs, save_ui_prefs, AudioPrefs, UiPrefs,
@@ -168,6 +169,8 @@ pub struct App {
     prefs_dirty_at: Instant,
     /// Per-device last FormatDesc for reconnect-after-unplug.
     device_settings: HashMap<String, FormatDesc>,
+    discord: DiscordPresence,
+    last_discord_push: Instant,
 }
 
 impl Default for App {
@@ -386,6 +389,10 @@ impl Default for App {
             prefs_dirty: false,
             prefs_dirty_at: Instant::now(),
             device_settings: HashMap::new(),
+            discord: DiscordPresence::start(false, ""),
+            last_discord_push: Instant::now()
+                .checked_sub(Duration::from_secs(60))
+                .unwrap_or_else(Instant::now),
         }
     }
 }
@@ -451,6 +458,8 @@ impl ApplicationHandler for App {
         if self.devices.iter().all(|d| d.backend == "mock") {
             self.overlay.status = self.i18n.t("status_no_card");
         }
+        self.restart_discord_presence();
+        self.push_discord_activity(true);
         tracing::info!("CaptureView ready");
     }
 
@@ -477,6 +486,7 @@ impl ApplicationHandler for App {
 
         match event {
             WindowEvent::CloseRequested => {
+                self.discord.shutdown();
                 self.persist_audio_prefs();
                 self.persist_ui_prefs();
                 self.flush_prefs_now();
@@ -501,6 +511,7 @@ impl ApplicationHandler for App {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.poll_hotplug();
         self.flush_prefs_if_due();
+        self.push_discord_activity(false);
 
         // Always honor the display FPS cap — never let has_pending alone bypass it
         // (Arthur saw 240 FPS écran with limit 120 when pending woke every tick).
@@ -1175,6 +1186,20 @@ impl App {
             self.apply_present_mode_for_profile();
             self.persist_ui_prefs();
         }
+        if let Some(on) = actions.discord_presence_changed {
+            self.ui_prefs.discord_presence = on;
+            self.overlay.discord_presence = on;
+            self.restart_discord_presence();
+            self.push_discord_activity(true);
+            self.persist_ui_prefs();
+        }
+        if let Some(id) = actions.discord_app_id_changed {
+            self.ui_prefs.discord_app_id = id.trim().to_string();
+            self.overlay.discord_app_id = self.ui_prefs.discord_app_id.clone();
+            self.restart_discord_presence();
+            self.push_discord_activity(true);
+            self.persist_ui_prefs();
+        }
         if let Some(mode) = actions.deinterlace_mode {
             self.effects_ui.deinterlace_mode = mode.to_string();
             self.ui_prefs.deinterlace_mode = mode.to_string();
@@ -1451,6 +1476,9 @@ impl App {
         }
         self.overlay.display_fps_limit = self.ui_prefs.display_fps_limit;
         self.overlay.vsync_mode = normalize_vsync_mode(&self.ui_prefs.vsync_mode);
+        self.overlay.discord_presence = self.ui_prefs.discord_presence;
+        self.overlay.discord_app_id = self.ui_prefs.discord_app_id.clone();
+        self.overlay.discord_active = self.discord.is_active();
 
         // Refresh process CPU/RAM ~2 Hz (UI thread only).
         if self.process_sample_at.elapsed() >= Duration::from_millis(500) {
@@ -1874,6 +1902,34 @@ fn normalize_vsync_mode(mode: &str) -> String {
         "on" | "On" | "ON" => "on".into(),
         "off" | "Off" | "OFF" => "off".into(),
         _ => "auto".into(),
+    }
+}
+
+impl App {
+    fn restart_discord_presence(&mut self) {
+        self.discord.shutdown();
+        let id = resolve_app_id(&self.ui_prefs.discord_app_id);
+        self.discord = DiscordPresence::start(self.ui_prefs.discord_presence, &id);
+        self.overlay.discord_active = self.discord.is_active();
+    }
+
+    fn push_discord_activity(&mut self, force: bool) {
+        if !self.discord.is_active() {
+            return;
+        }
+        if !force && self.last_discord_push.elapsed() < Duration::from_secs(12) {
+            return;
+        }
+        self.last_discord_push = Instant::now();
+        let details = self.overlay.format_label.clone();
+        let state = if self.overlay.no_signal {
+            self.i18n.t("label_no_signal")
+        } else if !self.overlay.label.is_empty() {
+            self.overlay.label.clone()
+        } else {
+            "Capture".into()
+        };
+        self.discord.update(details, state);
     }
 }
 

@@ -50,6 +50,12 @@ pub struct UiPrefs {
     /// VSync: "auto" (profile default), "on", or "off".
     #[serde(default = "default_vsync")]
     pub vsync_mode: String,
+    /// Show **KapturKard** on Discord Rich Presence.
+    #[serde(default = "default_true")]
+    pub discord_presence: bool,
+    /// Discord Developer Portal Application ID (public). Empty → env KAPTURKARD_DISCORD_APP_ID.
+    #[serde(default)]
+    pub discord_app_id: String,
     #[serde(default)]
     pub metrics_pinned: bool,
     #[serde(default)]
@@ -97,6 +103,10 @@ fn default_vsync() -> String {
     "auto".into()
 }
 
+fn default_true() -> bool {
+    true
+}
+
 fn default_color_range() -> String {
     "auto".into()
 }
@@ -117,6 +127,8 @@ impl Default for UiPrefs {
             deinterlace_mode: "auto".into(),
             display_fps_limit: 0,
             vsync_mode: default_vsync(),
+            discord_presence: true,
+            discord_app_id: String::new(),
             metrics_pinned: false,
             settings_pinned: false,
             last_device_id: String::new(),

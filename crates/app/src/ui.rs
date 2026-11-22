@@ -72,6 +72,10 @@ pub struct OverlayState {
     pub display_fps_limit: u32,
     /// VSync preference: auto | on | off.
     pub vsync_mode: String,
+    pub discord_presence: bool,
+    pub discord_app_id: String,
+    /// True when the Discord IPC worker is running (ID present).
+    pub discord_active: bool,
     pub label: String,
     pub frame_w: u32,
     pub frame_h: u32,
@@ -107,6 +111,9 @@ impl Default for OverlayState {
             frame_gen_fps: 0.0,
             display_fps_limit: 0,
             vsync_mode: "auto".into(),
+            discord_presence: true,
+            discord_app_id: String::new(),
+            discord_active: false,
             label: String::new(),
             frame_w: 0,
             frame_h: 0,
@@ -227,6 +234,8 @@ pub struct UiActions {
     pub display_fps_limit: Option<u32>,
     /// None = unchanged; Some("auto"|"on"|"off").
     pub vsync_mode: Option<&'static str>,
+    pub discord_presence_changed: Option<bool>,
+    pub discord_app_id_changed: Option<String>,
     pub color_range_changed: Option<&'static str>,
     pub color_matrix_changed: Option<&'static str>,
     pub color_range_toggle: bool,
@@ -1097,6 +1106,34 @@ fn draw_info_tab(ui: &mut egui::Ui, input: &DrawInput<'_>, actions: &mut UiActio
     ui.label(RichText::new(i18n.t("metrics_disclaimer")).small().weak());
     ui.add_space(4.0);
     draw_metrics_body(ui, i18n, o, true);
+    ui.add_space(8.0);
+    ui.separator();
+    ui.label(RichText::new(i18n.t("label_discord")).strong());
+    ui.label(RichText::new(i18n.t("tip_discord")).small().italics());
+    let mut enabled = o.discord_presence;
+    if ui
+        .checkbox(&mut enabled, i18n.t("label_discord_enable"))
+        .changed()
+    {
+        actions.discord_presence_changed = Some(enabled);
+    }
+    ui.horizontal(|ui| {
+        ui.label(i18n.t("label_discord_app_id"));
+        let mut id = o.discord_app_id.clone();
+        let resp = ui.add(
+            egui::TextEdit::singleline(&mut id)
+                .desired_width(220.0)
+                .hint_text("123456789012345678"),
+        );
+        if resp.changed() {
+            actions.discord_app_id_changed = Some(id);
+        }
+    });
+    if o.discord_active {
+        ui.small(i18n.t("discord_status_on"));
+    } else if o.discord_presence {
+        ui.small(i18n.t("discord_status_need_id"));
+    }
     ui.add_space(8.0);
     ui.separator();
     ui.label(i18n.t("lag_test_title"));

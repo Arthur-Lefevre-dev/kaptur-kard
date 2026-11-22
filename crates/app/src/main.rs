@@ -1,5 +1,6 @@
 //! CaptureView step (a): wgpu window + MockVideoSource preview.
 
+mod discord_presence;
 mod i18n;
 mod prefs;
 mod runtime;
