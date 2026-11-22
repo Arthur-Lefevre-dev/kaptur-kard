@@ -33,8 +33,7 @@ use crate::prefs::{
     load_audio_prefs, load_ui_prefs, save_audio_prefs, save_ui_prefs, AudioPrefs, UiPrefs,
 };
 use crate::ui::{
-    self, AudioUiState, ColorUiState, EffectsUiState, MetricsMode, OverlayState, UiChrome,
-    UiSelection,
+    self, AudioUiState, ColorUiState, EffectsUiState, OverlayState, UiChrome, UiSelection,
 };
 
 enum ActiveSource {
@@ -273,6 +272,8 @@ impl Default for App {
         } else {
             ui_prefs.wizard_step.min(2)
         };
+        chrome.metrics_pinned = ui_prefs.metrics_pinned;
+        chrome.settings_pinned = ui_prefs.settings_pinned;
 
         // Prefer last resolution/rate for this device when still advertised.
         let format = if ui_prefs.last_width > 0
@@ -988,11 +989,22 @@ impl App {
         if let Some(tab) = actions.open_settings {
             self.chrome.settings_open = true;
             self.chrome.settings_tab = tab;
+            // F1 / settings: show toolbar for quick tabs; F2 must not open this path.
             self.chrome.toolbar_visible = true;
             self.last_pointer_at = Instant::now();
         }
         if actions.close_settings {
             self.chrome.settings_open = false;
+        }
+        if actions.toggle_settings_pin {
+            self.chrome.settings_pinned = !self.chrome.settings_pinned;
+            self.ui_prefs.settings_pinned = self.chrome.settings_pinned;
+            self.persist_ui_prefs();
+        }
+        if actions.toggle_metrics_pin {
+            self.chrome.metrics_pinned = !self.chrome.metrics_pinned;
+            self.ui_prefs.metrics_pinned = self.chrome.metrics_pinned;
+            self.persist_ui_prefs();
         }
         if actions.toggle_advanced {
             self.chrome.advanced_open = !self.chrome.advanced_open;
@@ -1080,10 +1092,8 @@ impl App {
             self.persist_ui_prefs();
         }
         if actions.cycle_metrics {
+            // F2: metrics overlay only — never open Image/Son/Effets toolbar.
             self.overlay.metrics_mode = self.overlay.metrics_mode.next();
-            // Keep toolbar visible briefly so the user sees the mode change.
-            self.chrome.toolbar_visible = true;
-            self.last_pointer_at = Instant::now();
         }
         if actions.lag_test_start {
             self.lag_test_started = Some(Instant::now());
@@ -1469,10 +1479,10 @@ impl App {
                 self.overlay.gpu_name = gpu.adapter_name.clone();
             }
         }
-        // Hide floating toolbar after 3s without pointer motion (unless settings/metrics open).
+        // Hide floating toolbar after 3s without pointer motion.
+        // Metrics (F2) alone must not keep Image/Son/Effets visible.
         if !self.chrome.settings_open
             && !self.chrome.wizard_open
-            && self.overlay.metrics_mode == MetricsMode::Off
             && self.last_pointer_at.elapsed() > Duration::from_secs(3)
         {
             self.chrome.toolbar_visible = false;

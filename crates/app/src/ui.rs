@@ -16,7 +16,7 @@ pub enum SettingsTab {
     Info,
 }
 
-/// F2 cycles: Off → Simple → Detailed → Off.
+/// F2 cycles metrics only (Off → Simple → Detailed → Off). F1 toggles settings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum MetricsMode {
     #[default]
@@ -161,6 +161,9 @@ pub struct UiChrome {
     /// Returning user: only the video-source step (Continue closes).
     pub source_only: bool,
     pub fullscreen: bool,
+    /// Pinned windows stay put and are not auto-hidden with the toolbar.
+    pub metrics_pinned: bool,
+    pub settings_pinned: bool,
 }
 
 impl Default for UiChrome {
@@ -174,6 +177,8 @@ impl Default for UiChrome {
             wizard_step: 0,
             source_only: false,
             fullscreen: false,
+            metrics_pinned: false,
+            settings_pinned: false,
         }
     }
 }
@@ -207,6 +212,8 @@ pub struct UiActions {
     pub source_confirmed: bool,
     pub show_toolbar: bool,
     pub cycle_metrics: bool,
+    pub toggle_metrics_pin: bool,
+    pub toggle_settings_pin: bool,
     pub lag_test_start: bool,
     pub lag_test_stop: bool,
     pub upscale_mode: Option<&'static str>,
@@ -305,10 +312,14 @@ pub fn draw_ui(ctx: &Context, input: DrawInput<'_>) -> UiActions {
         actions.show_toolbar = true;
     }
 
-    // Keyboard shortcuts.
+    // Keyboard shortcuts: F1 = settings menu, F2 = metrics only (no toolbar).
     ctx.input(|i| {
         if i.key_pressed(Key::F1) {
-            actions.open_settings = Some(SettingsTab::Image);
+            if input.chrome.settings_open {
+                actions.close_settings = true;
+            } else {
+                actions.open_settings = Some(SettingsTab::Image);
+            }
         }
         if i.key_pressed(Key::F2) {
             actions.cycle_metrics = true;
@@ -335,7 +346,7 @@ pub fn draw_ui(ctx: &Context, input: DrawInput<'_>) -> UiActions {
     }
 
     if input.overlay.metrics_mode != MetricsMode::Off {
-        draw_metrics_overlay(ctx, i18n, input.overlay);
+        draw_metrics_overlay(ctx, i18n, input.overlay, input.chrome, &mut actions);
     }
 
     if input.chrome.toolbar_visible {
@@ -478,13 +489,19 @@ fn toolbar_btn(
 fn draw_settings(ctx: &Context, input: &DrawInput<'_>, actions: &mut UiActions) {
     let i18n = input.i18n;
     let mut open = true;
-    egui::Window::new(i18n.t("app_title"))
+    let pinned = input.chrome.settings_pinned;
+    let mut win = egui::Window::new(i18n.t("app_title"))
         .id(egui::Id::new("settings_window"))
         .open(&mut open)
         .resizable(true)
         .default_width(460.0)
-        .anchor(egui::Align2::RIGHT_CENTER, [-24.0, 0.0])
-        .show(ctx, |ui| {
+        .default_pos(egui::pos2(920.0, 80.0))
+        .movable(!pinned);
+    if pinned {
+        // Keep last position while pinned; do not re-anchor every frame.
+        win = win.movable(false);
+    }
+    win.show(ctx, |ui| {
             ui.horizontal(|ui| {
                 for (tab, key) in [
                     (SettingsTab::Image, "tab_image"),
@@ -497,6 +514,20 @@ fn draw_settings(ctx: &Context, input: &DrawInput<'_>, actions: &mut UiActions) 
                         actions.open_settings = Some(tab);
                     }
                 }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let pin_label = if pinned {
+                        i18n.t("btn_unpin")
+                    } else {
+                        i18n.t("btn_pin")
+                    };
+                    if ui
+                        .selectable_label(pinned, pin_label)
+                        .on_hover_text(i18n.t("tip_pin_window"))
+                        .clicked()
+                    {
+                        actions.toggle_settings_pin = true;
+                    }
+                });
             });
             ui.separator();
 
@@ -1078,31 +1109,57 @@ fn display_fps_limit_label(i18n: &I18n, limit: u32) -> String {
     }
 }
 
-fn draw_metrics_overlay(ctx: &Context, i18n: &I18n, overlay: &OverlayState) {
-    egui::Area::new(egui::Id::new("metrics_overlay"))
-        .anchor(egui::Align2::LEFT_TOP, [12.0, 12.0])
-        .order(egui::Order::Foreground)
-        .show(ctx, |ui| {
+fn draw_metrics_overlay(
+    ctx: &Context,
+    i18n: &I18n,
+    overlay: &OverlayState,
+    chrome: &UiChrome,
+    actions: &mut UiActions,
+) {
+    let detailed = overlay.metrics_mode == MetricsMode::Detailed;
+    let title = if detailed {
+        i18n.t("metrics_detailed")
+    } else {
+        i18n.t("metrics_simple")
+    };
+    let pinned = chrome.metrics_pinned;
+    egui::Window::new(title)
+        .id(egui::Id::new("metrics_overlay"))
+        .collapsible(false)
+        .resizable(false)
+        .default_pos(egui::pos2(12.0, 12.0))
+        .movable(!pinned)
+        .frame(
             egui::Frame::NONE
                 .fill(Color32::from_rgba_unmultiplied(12, 14, 18, 200))
                 .corner_radius(egui::CornerRadius::same(8))
-                .inner_margin(egui::Margin::symmetric(10, 10))
-                .show(ui, |ui| {
-                    let detailed = overlay.metrics_mode == MetricsMode::Detailed;
-                    let title = if detailed {
-                        i18n.t("metrics_detailed")
+                .inner_margin(egui::Margin::symmetric(10, 10)),
+        )
+        .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(i18n.t("hint_f2_metrics")).small().weak());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let pin_label = if pinned {
+                        i18n.t("btn_unpin")
                     } else {
-                        i18n.t("metrics_simple")
+                        i18n.t("btn_pin")
                     };
-                    ui.label(RichText::new(title).strong());
-                    draw_metrics_body(ui, i18n, overlay, detailed);
-                    ui.add_space(4.0);
-                    ui.label(
-                        RichText::new(i18n.t("metrics_disclaimer"))
-                            .small()
-                            .weak(),
-                    );
+                    if ui
+                        .selectable_label(pinned, pin_label)
+                        .on_hover_text(i18n.t("tip_pin_window"))
+                        .clicked()
+                    {
+                        actions.toggle_metrics_pin = true;
+                    }
                 });
+            });
+            draw_metrics_body(ui, i18n, overlay, detailed);
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(i18n.t("metrics_disclaimer"))
+                    .small()
+                    .weak(),
+            );
         });
 }
 

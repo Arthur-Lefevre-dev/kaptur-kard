@@ -89,6 +89,8 @@ mod tests {
         assert!(i18n.t("btn_source_auto").contains("Automatique"));
         assert_eq!(i18n.t("label_frame_gen_fps"), "FPS frame gen");
         assert_eq!(i18n.t("label_display_fps_limit"), "Limite FPS écran");
+        assert_eq!(i18n.t("btn_pin"), "Épingler");
+        assert!(i18n.t("hint_f2_metrics").contains("F2"));
     }
 
     #[test]
