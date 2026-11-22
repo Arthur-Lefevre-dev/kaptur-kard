@@ -33,6 +33,9 @@ impl Default for AudioPrefs {
 pub struct UiPrefs {
     pub wizard_done: bool,
     pub wizard_step: u8,
+    /// User confirmed (or skipped) the startup video-source picker.
+    #[serde(default)]
+    pub source_confirmed: bool,
     #[serde(default)]
     pub upscale_mode: String,
     #[serde(default = "default_sharpness")]
@@ -93,6 +96,7 @@ impl Default for UiPrefs {
         Self {
             wizard_done: false,
             wizard_step: 0,
+            source_confirmed: false,
             upscale_mode: "off".into(),
             sharpness: 0.4,
             interp_mode: "off".into(),

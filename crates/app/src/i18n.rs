@@ -85,6 +85,8 @@ mod tests {
         assert!(i18n.t("why_fsr_body").contains("retard"));
         assert!(i18n.t("err_device_busy").contains("autre application"));
         assert_eq!(i18n.t("label_device_busy"), "Carte de capture indisponible");
+        assert_eq!(i18n.t("wizard_step1_title"), "Source vidéo entrante");
+        assert!(i18n.t("btn_source_auto").contains("Automatique"));
     }
 
     #[test]

@@ -18,9 +18,9 @@ use metrics::{sample_process, SharedMetrics};
 use render::pipeline::VideoPipeline;
 use render::upload::upload_frame;
 use render::{
-    resolve_color_convert, target_size, ColorMatrixMode, ColorRangeMode, DeinterlaceEngine,
-    DeinterlaceMode, InterpBlockReason, InterpMode, InterpolateEngine, UpscaleBlockReason,
-    UpscaleEngine, UpscaleMode,
+    is_native_or_downscale, resolve_color_convert, ColorMatrixMode, ColorRangeMode,
+    DeinterlaceEngine, DeinterlaceMode, InterpBlockReason, InterpMode, InterpolateEngine,
+    UpscaleBlockReason, UpscaleEngine, UpscaleMode,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -255,8 +255,17 @@ impl Default for App {
         let ui_prefs = ui_prefs_early;
         let i18n = I18n::load();
         let mut chrome = UiChrome::default();
-        chrome.wizard_open = !ui_prefs.wizard_done;
-        chrome.wizard_step = ui_prefs.wizard_step.min(2);
+        let real_device_count = devices.iter().filter(|d| d.backend != "mock").count();
+        let multi_sources = real_device_count >= 2;
+        // First-run wizard, or one-shot source picker when several capture devices exist.
+        let need_source_pick = multi_sources && !ui_prefs.source_confirmed;
+        chrome.source_only = ui_prefs.wizard_done && need_source_pick;
+        chrome.wizard_open = !ui_prefs.wizard_done || need_source_pick;
+        chrome.wizard_step = if need_source_pick {
+            0
+        } else {
+            ui_prefs.wizard_step.min(2)
+        };
 
         // Prefer last resolution/rate for this device when still advertised.
         let format = if ui_prefs.last_width > 0
@@ -928,6 +937,30 @@ impl App {
         if actions.copy_support {
             self.copy_support_report();
         }
+        if actions.wizard_pick_auto {
+            if let Some(idx) = capture::pick_preferred_device_index(&self.devices) {
+                // Reuse the same path as a manual device change.
+                let caps = &self.devices[idx].formats;
+                if let Some(format) = modes::select_format(self.selection.mode, caps)
+                    .or_else(|| caps.first().cloned())
+                {
+                    self.selection.device_idx = idx;
+                    self.selection.width = format.width;
+                    self.selection.height = format.height;
+                    self.selection.rate = format
+                        .frame_rates
+                        .first()
+                        .copied()
+                        .unwrap_or(Rational::new(60, 1));
+                    let msg = self.i18n.t("err_device_start");
+                    let _ = self.restart_with_fallback(format, &msg);
+                    self.suggest_audio_for_current_video();
+                    self.restart_audio();
+                } else {
+                    self.selection.device_idx = idx;
+                }
+            }
+        }
         if actions.wizard_next {
             self.chrome.wizard_step = (self.chrome.wizard_step + 1).min(2);
             self.persist_ui_prefs();
@@ -936,9 +969,15 @@ impl App {
             self.chrome.wizard_step = self.chrome.wizard_step.saturating_sub(1);
             self.persist_ui_prefs();
         }
+        if actions.source_confirmed {
+            self.ui_prefs.source_confirmed = true;
+            self.persist_ui_prefs();
+        }
         if actions.wizard_skip || actions.wizard_finish {
             self.chrome.wizard_open = false;
+            self.chrome.source_only = false;
             self.ui_prefs.wizard_done = true;
+            self.ui_prefs.source_confirmed = true;
             self.persist_ui_prefs();
         }
         if actions.cycle_metrics {
@@ -1041,13 +1080,19 @@ impl App {
             .as_ref()
             .map(|g| g.pipeline.content_size)
             .unwrap_or((0, 0));
+        // Prefer live frame size; fall back to negotiated capture format before first frame.
+        let (cw, ch) = if cw > 0 && ch > 0 {
+            (cw, ch)
+        } else {
+            (self.current_format.width, self.current_format.height)
+        };
         let (vw, vh) = self
             .gpu
             .as_ref()
             .map(|g| (g.config.width, g.config.height))
             .unwrap_or((1, 1));
-        let (tw, th) = target_size(cw, ch, vw, vh);
-        let native = cw > 0 && ch > 0 && cw >= tw && ch >= th;
+        // Grey FSR/NIS only when capture already fills the letterboxed window (not 1080→1440).
+        let native = is_native_or_downscale(cw, ch, vw, vh);
         if let Some(gpu) = self.gpu.as_ref() {
             let st = gpu.upscale.status();
             self.effects_ui.mode = st.mode.as_str().into();

@@ -151,6 +151,8 @@ pub struct UiChrome {
     pub toolbar_visible: bool,
     pub wizard_open: bool,
     pub wizard_step: u8,
+    /// Returning user: only the video-source step (Continue closes).
+    pub source_only: bool,
     pub fullscreen: bool,
 }
 
@@ -163,6 +165,7 @@ impl Default for UiChrome {
             toolbar_visible: true,
             wizard_open: false,
             wizard_step: 0,
+            source_only: false,
             fullscreen: false,
         }
     }
@@ -191,6 +194,10 @@ pub struct UiActions {
     pub wizard_back: bool,
     pub wizard_skip: bool,
     pub wizard_finish: bool,
+    /// Select preferred capture card (Auto) in the startup source step.
+    pub wizard_pick_auto: bool,
+    /// User confirmed the startup source choice (Continue / Finish / Skip).
+    pub source_confirmed: bool,
     pub show_toolbar: bool,
     pub cycle_metrics: bool,
     pub lag_test_start: bool,
@@ -1133,30 +1140,38 @@ fn draw_wizard(
     chrome: &UiChrome,
     actions: &mut UiActions,
 ) {
-    egui::Window::new(i18n.t("wizard_title"))
+    let title = if chrome.source_only {
+        i18n.t("wizard_source_title")
+    } else {
+        i18n.t("wizard_title")
+    };
+    egui::Window::new(title)
         .collapsible(false)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .resizable(false)
         .show(ctx, |ui| {
-            match chrome.wizard_step {
+            let step = if chrome.source_only {
+                0
+            } else {
+                chrome.wizard_step
+            };
+            match step {
                 0 => {
                     ui.heading(i18n.t("wizard_step1_title"));
                     ui.label(i18n.t("wizard_step1_body"));
-                    let label = devices
-                        .get(selection.device_idx)
-                        .map(capture::device_list_label)
-                        .unwrap_or_else(|| "—".into());
-                    egui::ComboBox::from_id_salt("wiz_dev")
-                        .selected_text(label)
-                        .width(320.0)
-                        .show_ui(ui, |ui| {
-                            ui.set_min_width(320.0);
+                    ui.add_space(8.0);
+                    if ui.button(i18n.t("btn_source_auto")).clicked() {
+                        actions.wizard_pick_auto = true;
+                    }
+                    ui.add_space(6.0);
+                    egui::ScrollArea::vertical()
+                        .max_height(220.0)
+                        .show(ui, |ui| {
+                            ui.set_min_width(360.0);
                             for (i, d) in devices.iter().enumerate() {
                                 let row = capture::device_list_label(d);
-                                if ui
-                                    .selectable_label(i == selection.device_idx, row)
-                                    .clicked()
-                                {
+                                let selected = i == selection.device_idx;
+                                if ui.selectable_label(selected, row).clicked() {
                                     actions.device_changed = Some(i);
                                 }
                             }
@@ -1192,16 +1207,28 @@ fn draw_wizard(
             ui.horizontal(|ui| {
                 if ui.button(i18n.t("btn_skip")).clicked() {
                     actions.wizard_skip = true;
+                    actions.source_confirmed = true;
                 }
-                if chrome.wizard_step > 0 && ui.button(i18n.t("btn_back")).clicked() {
-                    actions.wizard_back = true;
+                if !chrome.source_only && chrome.wizard_step > 0 {
+                    if ui.button(i18n.t("btn_back")).clicked() {
+                        actions.wizard_back = true;
+                    }
                 }
-                if chrome.wizard_step < 2 {
+                if chrome.source_only {
+                    if ui.button(i18n.t("btn_continue")).clicked() {
+                        actions.wizard_finish = true;
+                        actions.source_confirmed = true;
+                    }
+                } else if chrome.wizard_step < 2 {
                     if ui.button(i18n.t("btn_next")).clicked() {
                         actions.wizard_next = true;
+                        if chrome.wizard_step == 0 {
+                            actions.source_confirmed = true;
+                        }
                     }
                 } else if ui.button(i18n.t("btn_finish")).clicked() {
                     actions.wizard_finish = true;
+                    actions.source_confirmed = true;
                 }
             });
         });

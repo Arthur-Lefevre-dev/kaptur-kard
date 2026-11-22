@@ -460,8 +460,7 @@ impl UpscaleEngine {
             self.block = UpscaleBlockReason::NoCompute;
             return false;
         }
-        let (out_w, out_h) = target_size(content.0, content.1, view.0, view.1);
-        if content.0 >= out_w && content.1 >= out_h {
+        if is_native_or_downscale(content.0, content.1, view.0, view.1) {
             self.block = UpscaleBlockReason::NativeResolution;
             return false;
         }
@@ -878,6 +877,17 @@ pub fn target_size(content_w: u32, content_h: u32, view_w: u32, view_h: u32) -> 
     (out_w, out_h)
 }
 
+/// True when capture already fills (or exceeds) the letterboxed window target —
+/// FSR/NIS would not enlarge the image (1080p on 1080p window, or downscale cases).
+/// False for 1080p on a 1440p/4K window (upscale useful).
+pub fn is_native_or_downscale(content_w: u32, content_h: u32, view_w: u32, view_h: u32) -> bool {
+    if content_w == 0 || content_h == 0 {
+        return false;
+    }
+    let (tw, th) = target_size(content_w, content_h, view_w, view_h);
+    content_w >= tw && content_h >= th
+}
+
 fn easu_constants(in_w: u32, in_h: u32, out_w: u32, out_h: u32) -> EasuGpu {
     let iw = in_w as f32;
     let ih = in_h as f32;
@@ -981,6 +991,19 @@ mod tests {
     fn native_content_not_larger_target() {
         let (w, h) = target_size(1920, 1080, 1280, 720);
         assert!(w <= 1920 && h <= 1080);
+    }
+
+    #[test]
+    fn fsr_not_greyed_for_1080_on_1440() {
+        // Arthur case: 1080p capture on a 1440p window must keep FSR/NIS available.
+        assert!(!is_native_or_downscale(1920, 1080, 2560, 1440));
+        assert!(!is_native_or_downscale(1920, 1080, 3840, 2160));
+    }
+
+    #[test]
+    fn fsr_greyed_when_capture_fills_window() {
+        assert!(is_native_or_downscale(1920, 1080, 1920, 1080));
+        assert!(is_native_or_downscale(2560, 1440, 1920, 1080));
     }
 
     #[test]

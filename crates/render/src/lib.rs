@@ -20,5 +20,6 @@ pub use interpolate::{
     InterpBlockReason, InterpFrame, InterpMode, InterpolateEngine, InterpStatus,
 };
 pub use upscale::{
-    target_size, UpscaleBlockReason, UpscaleEngine, UpscaleMode, UpscaleStatus,
+    is_native_or_downscale, target_size, UpscaleBlockReason, UpscaleEngine, UpscaleMode,
+    UpscaleStatus,
 };
