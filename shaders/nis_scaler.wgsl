@@ -2,9 +2,8 @@
 // Based on NVIDIA Image Scaling SDK (MIT). See licenses/NVIDIA-NIS-MIT.txt
 // Copyright (c) 2022 NVIDIA CORPORATION & AFFILIATES.
 //
-// This is a WGSL spatial scaler inspired by NVScaler: 6-tap support +
-// directional edge sharpening. Coefficient LUTs are approximated analytically
-// for a dependency-light wgpu path (full SDK ships coef textures).
+// Vendor-neutral compute: runs on AMD / NVIDIA / Intel via wgpu (not a
+// driver feature). At 1:1, sharp=0 is a true passthrough.
 
 struct NisParams {
     scale: vec4<f32>,      // xy = src/dst scale, zw = sharpness (0..1) + detect
@@ -45,8 +44,18 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let dst = vec2<f32>(f32(gid.x) + 0.5, f32(gid.y) + 0.5);
     let src = dst * params.scale.xy;
     let src_uv_base = src * params.src_norm.xy;
+    let c0 = textureSampleLevel(src_tex, src_samp, src_uv_base, 0.0).rgb;
+    let sharp = params.scale.z; // 0..1 UI (1 = max sharp)
+    let detect = params.scale.w;
+    let native = abs(params.scale.x - 1.0) < 0.001 && abs(params.scale.y - 1.0) < 0.001;
 
-    // Horizontal / vertical 6-tap separable scale.
+    // Native 1:1 + sharpness 0 → exact passthrough (avoids 6-tap soft/grain).
+    if (native && sharp < 0.001) {
+        textureStore(dst_tex, vec2<i32>(i32(gid.x), i32(gid.y)), vec4<f32>(c0, 1.0));
+        return;
+    }
+
+    // 6-tap separable scale (also used as blur reference for USM).
     var sum = vec3<f32>(0.0);
     var wsum = 0.0;
     let fx = fract(src.x) - 0.5;
@@ -60,10 +69,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             wsum = wsum + w;
         }
     }
-    var scaled = sum / max(wsum, 1e-5);
+    let scaled = sum / max(wsum, 1e-5);
 
-    // Directional edge detect + USM-style sharpen (NVScaler spirit).
-    let c0 = textureSampleLevel(src_tex, src_samp, src_uv_base, 0.0).rgb;
     let cx1 = textureSampleLevel(src_tex, src_samp, src_uv_base + vec2<f32>(params.src_norm.x, 0.0), 0.0).rgb;
     let cy1 = textureSampleLevel(src_tex, src_samp, src_uv_base + vec2<f32>(0.0, params.src_norm.y), 0.0).rgb;
     let cx0 = textureSampleLevel(src_tex, src_samp, src_uv_base - vec2<f32>(params.src_norm.x, 0.0), 0.0).rgb;
@@ -72,11 +79,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let gx = luma(cx1) - luma(cx0);
     let gy = luma(cy1) - luma(cy0);
     let edge = clamp(length(vec2<f32>(gx, gy)) * 4.0, 0.0, 1.0);
-    let sharp = params.scale.z; // 0..1 UI (1 = max sharp)
-    let detect = params.scale.w;
-    // Unsharp mask: add highpass (c0 - blurred). The old (scaled - c0) *sign flipped* and blurred.
-    let usm = (c0 - scaled) * (sharp * (0.45 + 0.55 * edge) * detect);
-    var outc = clamp(scaled + usm, vec3<f32>(0.0), vec3<f32>(1.0));
+    let usm = (c0 - scaled) * (sharp * (0.55 + 0.65 * edge) * detect);
+
+    // Upscale: scaled + USM. Native sharpen: c0 + USM (base stays sharp).
+    let base = select(scaled, c0, native);
+    var outc = clamp(base + usm, vec3<f32>(0.0), vec3<f32>(1.0));
 
     textureStore(dst_tex, vec2<i32>(i32(gid.x), i32(gid.y)), vec4<f32>(outc, 1.0));
 }

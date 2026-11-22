@@ -11,8 +11,8 @@ use crate::present::{compute_letterbox, LetterboxUniforms};
 
 /// Frames over budget before auto-disable.
 const OVER_BUDGET_LIMIT: u32 = 45;
-/// Soft per-frame budget when upscale is active (~half of 60 Hz).
-const FRAME_BUDGET_MS: f32 = 20.0;
+/// Display present interval is not GPU cost — only trip on real stalls (>1 frame @ 30 Hz).
+const FRAME_BUDGET_MS: f32 = 40.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UpscaleMode {
