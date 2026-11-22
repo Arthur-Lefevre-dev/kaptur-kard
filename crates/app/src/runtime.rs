@@ -125,7 +125,8 @@ struct GpuState {
     adapter_name: String,
 }
 
-const HOTPLUG_INTERVAL: Duration = Duration::from_secs(2);
+/// Presence-only check interval. Full MF probe runs only when the id set changes.
+const HOTPLUG_INTERVAL: Duration = Duration::from_secs(5);
 
 pub struct App {
     gpu: Option<GpuState>,
@@ -140,6 +141,7 @@ pub struct App {
     captures_in_window: u32,
     last_frame_at: Instant,
     last_present_at: Option<Instant>,
+    last_redraw_at: Instant,
     last_channel_drops: u64,
     black_since: Option<Instant>,
     running: bool,
@@ -344,6 +346,7 @@ impl Default for App {
             captures_in_window: 0,
             last_frame_at: Instant::now(),
             last_present_at: None,
+            last_redraw_at: Instant::now(),
             last_channel_drops: 0,
             black_since: None,
             running: false,
@@ -479,17 +482,7 @@ impl ApplicationHandler for App {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.poll_hotplug();
 
-        // Pace redraws to capture rate when UI is idle. Spinning at ~200+ Hz on a high-Hz
-        // display (AutoVsync/NoVsync) caused Arthur's hitch spikes and channel drops.
-        let ui_busy = self.chrome.toolbar_visible
-            || self.chrome.settings_open
-            || self.chrome.wizard_open
-            || self.overlay.metrics_mode != MetricsMode::Off
-            || !self.overlay.toast.is_empty()
-            || !self.overlay.status.is_empty()
-            || self.overlay.lag_flash
-            || self.overlay.no_signal
-            || self.overlay.device_busy;
+        // Hard-cap redraw rate. Metrics open used to keep ~240 Hz presents → drops + spikes.
         let has_pending = self
             .source
             .as_ref()
@@ -501,25 +494,35 @@ impl ApplicationHandler for App {
             .first()
             .map(|r| r.as_f64())
             .unwrap_or(60.0)
-            .clamp(24.0, 144.0);
-        let period = Duration::from_secs_f64(1.0 / capture_hz);
-        let present_due = self
-            .last_present_at
-            .map(|t| t.elapsed() >= period)
-            .unwrap_or(true);
+            .clamp(24.0, 120.0);
+        let capture_period = Duration::from_secs_f64(1.0 / capture_hz);
+        // UI / metrics: at most ~60 Hz. Idle video: capture period only.
+        let min_gap = if has_pending {
+            Duration::from_millis(0)
+        } else if self.chrome.settings_open
+            || self.chrome.wizard_open
+            || self.chrome.toolbar_visible
+            || self.overlay.metrics_mode != MetricsMode::Off
+        {
+            Duration::from_millis(16)
+        } else {
+            capture_period
+        };
 
-        if ui_busy || has_pending || present_due {
+        let due = self.last_redraw_at.elapsed() >= min_gap;
+        if has_pending || due {
             if let Some(gpu) = self.gpu.as_ref() {
                 gpu.window.request_redraw();
             }
         }
 
-        let wait = if ui_busy {
-            Duration::from_millis(8)
-        } else if has_pending {
+        let wait = if has_pending {
             Duration::from_millis(1)
         } else {
-            period.min(Duration::from_millis(20))
+            min_gap
+                .saturating_sub(self.last_redraw_at.elapsed())
+                .max(Duration::from_millis(1))
+                .min(Duration::from_millis(20))
         };
         event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + wait));
     }
@@ -646,24 +649,37 @@ impl App {
         );
     }
 
-    /// Light ~2s poll: refresh device list, reconnect last settings by device id.
+    /// Presence poll: cheap id scan; full MF format probe only when devices appear/disappear.
+    /// Re-opening the active NZXT every 2s was Arthur's periodic frametime spike.
     fn poll_hotplug(&mut self) {
         if self.last_hotplug_at.elapsed() < HOTPLUG_INTERVAL {
             return;
         }
         self.last_hotplug_at = Instant::now();
 
+        let Ok(presence) = capture::list_device_presence() else {
+            return;
+        };
+        let ids_after: std::collections::HashSet<String> =
+            presence.iter().map(|(id, _)| id.clone()).collect();
+        let ids_before: std::collections::HashSet<String> = self
+            .devices
+            .iter()
+            .filter(|d| d.backend != "mock")
+            .map(|d| d.id.as_str().to_string())
+            .collect();
+        if ids_after == ids_before {
+            return;
+        }
+
+        tracing::info!(
+            before = ids_before.len(),
+            after = ids_after.len(),
+            "device set changed — full MF re-probe"
+        );
         let Ok(real) = capture::list_devices() else {
             return;
         };
-        for d in &real {
-            tracing::info!(
-                name = %d.display_name,
-                id = %d.id.as_str(),
-                formats = d.formats.len(),
-                "hot-plug refresh device"
-            );
-        }
         let mut next = real;
         next.push(MockVideoSource::device_info());
 
@@ -677,8 +693,6 @@ impl App {
             .map(|d| d.backend != "mock")
             .unwrap_or(false);
 
-        let ids_before: std::collections::HashSet<String> =
-            self.devices.iter().map(|d| d.id.as_str().to_string()).collect();
         let ids_after: std::collections::HashSet<String> =
             next.iter().map(|d| d.id.as_str().to_string()).collect();
 
@@ -1258,6 +1272,7 @@ impl App {
     }
 
     fn redraw(&mut self) {
+        self.last_redraw_at = Instant::now();
         // Drain frames before borrowing GPU exclusively for UI state updates.
         let mut latest: Option<VideoFrame> = None;
         let mut drained = 0u64;

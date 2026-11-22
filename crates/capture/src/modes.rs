@@ -211,7 +211,8 @@ pub fn pick_format_at(
     for c in &mut candidates {
         c.frame_rates = vec![rate];
     }
-    candidates.sort_by(|a, b| chroma_rank(b.pixel_format).cmp(&chroma_rank(a.pixel_format)));
+    // Prefer NV12 over YUY2 at the same res/rate (USB / upload cost).
+    candidates.sort_by(|a, b| stream_rank(b.pixel_format).cmp(&stream_rank(a.pixel_format)));
     candidates.into_iter().next()
 }
 

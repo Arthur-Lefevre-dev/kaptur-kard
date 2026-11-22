@@ -323,6 +323,52 @@ fn open_reader_from_symlink(
     }
 }
 
+/// Lightweight presence scan: id + friendly name only (no SourceReader open).
+/// Safe to call while another device is streaming — does not contend for the active card.
+pub fn enumerate_device_presence() -> Result<Vec<(String, String)>, CaptureError> {
+    run_on_mta(|| {
+        ensure_mf()?;
+        let mut out = Vec::new();
+        unsafe {
+            let attrs = create_attributes(1)?;
+            attrs
+                .SetGUID(
+                    &MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE,
+                    &MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID,
+                )
+                .map_err(|e| CaptureError::DeviceOpen(format!("SetGUID: {e}")))?;
+            let mut activates: *mut Option<IMFActivate> = std::ptr::null_mut();
+            let mut count = 0u32;
+            MFEnumDeviceSources(&attrs, &mut activates, &mut count)
+                .map_err(|e| CaptureError::DeviceOpen(format!("MFEnumDeviceSources: {e}")))?;
+            if activates.is_null() || count == 0 {
+                return Ok(out);
+            }
+            let slice = std::slice::from_raw_parts(activates, count as usize);
+            for activate_opt in slice {
+                let Some(activate) = activate_opt else {
+                    continue;
+                };
+                let name = read_allocated_string(activate, &MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME)
+                    .unwrap_or_else(|_| "Unknown device".into());
+                let symlink = read_allocated_string(
+                    activate,
+                    &MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK,
+                )
+                .unwrap_or_default();
+                let id = if symlink.is_empty() {
+                    format!("mf:name:{}", name.replace(['\\', '/', ':'], "_"))
+                } else {
+                    format!("mf:{symlink}")
+                };
+                out.push((id, name));
+            }
+            CoTaskMemFree(Some(activates as *const _));
+        }
+        Ok(out)
+    })
+}
+
 /// Enumerate UVC / capture devices and discovered modes.
 pub fn enumerate_devices() -> Result<Vec<DeviceInfo>, CaptureError> {
     run_on_mta(|| {

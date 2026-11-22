@@ -12,6 +12,22 @@ pub mod linux_v4l2;
 #[cfg(target_os = "macos")]
 pub mod macos_avf;
 
+/// Id + name only (no format probe). Used for hot-plug presence checks.
+pub fn list_device_presence() -> Result<Vec<(String, String)>, crate::source::CaptureError> {
+    #[cfg(windows)]
+    {
+        return windows_mf::enumerate_device_presence();
+    }
+    #[cfg(not(windows))]
+    {
+        // Fallback: full enum, then strip to id/name.
+        Ok(list_devices()?
+            .into_iter()
+            .map(|d| (d.id.as_str().to_string(), d.display_name))
+            .collect())
+    }
+}
+
 /// Cross-platform device enumeration entry point.
 ///
 /// Windows: Media Foundation (primary). Optional DirectShow devices are merged

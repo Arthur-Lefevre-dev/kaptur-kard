@@ -34,7 +34,7 @@ pub use source::{
 pub use mock::MockVideoSource;
 
 /// Platform device list (MF / V4L2 / AVF depending on OS).
-pub use platform::list_devices;
+pub use platform::{list_device_presence, list_devices};
 
 #[cfg(windows)]
 pub use platform::windows_mf::{enumerate_devices, MfVideoSource};
