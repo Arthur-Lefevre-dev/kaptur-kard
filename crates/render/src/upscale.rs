@@ -14,7 +14,7 @@ use crate::dlss::{
     FgPresentFrame,
 };
 use crate::pipeline::VideoPipeline;
-use crate::present::{compute_letterbox, LetterboxUniforms};
+use crate::present::{compute_present_fit, PresentFilter, PresentFit};
 
 /// Frames over budget before auto-disable.
 const OVER_BUDGET_LIMIT: u32 = 45;
@@ -105,7 +105,8 @@ struct NisGpu {
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct PresentGpu {
     scale_offset: [f32; 4],
-    pad: [u32; 4],
+    /// x = 1 → nearest (textureLoad), 0 → bilinear.
+    flags: [u32; 4],
 }
 
 #[repr(C)]
@@ -265,7 +266,7 @@ impl UpscaleEngine {
             label: Some("upscale-present-ub"),
             contents: bytemuck::bytes_of(&PresentGpu {
                 scale_offset: [1.0, 1.0, 0.0, 0.0],
-                pad: [0; 4],
+                flags: [0; 4],
             }),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -587,6 +588,7 @@ impl UpscaleEngine {
             // DLSS 5 NR is same-resolution neural enhance (not SR); letterbox at present.
             (cw, ch)
         } else {
+            // Snap near-1:1 / integer so FSR RCAS stays sharpen_only (no soft EASU).
             target_size(cw, ch, view_w, view_h)
         };
         let Some(src_bg) = video.bind_group_ref() else {
@@ -856,13 +858,19 @@ impl UpscaleEngine {
         if self.rgba_dst.is_none() {
             return;
         }
-        let LetterboxUniforms { scale_offset } = compute_letterbox(out_w, out_h, view_w, view_h);
+        // Fit the upscale output into the window: 1:1 / integer → nearest, else linear.
+        let PresentFit {
+            scale_offset,
+            filter,
+            ..
+        } = compute_present_fit(out_w, out_h, view_w, view_h);
+        let nearest = matches!(filter, PresentFilter::Nearest) as u32;
         queue.write_buffer(
             &self.present_buf,
             0,
             bytemuck::bytes_of(&PresentGpu {
                 scale_offset,
-                pad: [0; 4],
+                flags: [nearest, 0, 0, 0],
             }),
         );
         let gen = self.tex_gen;
@@ -1347,10 +1355,8 @@ fn ensure_tex(
 }
 
 pub fn target_size(content_w: u32, content_h: u32, view_w: u32, view_h: u32) -> (u32, u32) {
-    let u = compute_letterbox(content_w, content_h, view_w, view_h);
-    let out_w = ((view_w as f32) * u.scale_offset[0]).round().max(1.0) as u32;
-    let out_h = ((view_h as f32) * u.scale_offset[1]).round().max(1.0) as u32;
-    (out_w, out_h)
+    let fit = compute_present_fit(content_w, content_h, view_w, view_h);
+    (fit.out_w, fit.out_h)
 }
 
 /// True when capture already fills (or exceeds) the letterboxed window target —

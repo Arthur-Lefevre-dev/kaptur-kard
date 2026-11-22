@@ -7,7 +7,7 @@ use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
 use crate::pipeline::VideoPipeline;
-use crate::present::{compute_letterbox, LetterboxUniforms};
+use crate::present::{compute_present_fit, PresentFilter, PresentFit};
 
 const OVER_BUDGET_LIMIT: u32 = 45;
 /// Display present dt is not GPU cost — only trip on real stalls (Arthur: CPU spin).
@@ -85,7 +85,8 @@ struct WarpGpu {
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct PresentGpu {
     scale_offset: [f32; 4],
-    pad: [u32; 4],
+    /// x = 1 → nearest (textureLoad), 0 → bilinear.
+    flags: [u32; 4],
 }
 
 struct TexSlot {
@@ -192,7 +193,7 @@ impl InterpolateEngine {
             label: Some("interp-present-ub"),
             contents: bytemuck::bytes_of(&PresentGpu {
                 scale_offset: [1.0, 1.0, 0.0, 0.0],
-                pad: [0; 4],
+                flags: [0; 4],
             }),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -696,14 +697,18 @@ impl InterpolateEngine {
         view_h: u32,
         clear: wgpu::Color,
     ) {
-        let LetterboxUniforms { scale_offset } =
-            compute_letterbox(content.0, content.1, view_w, view_h);
+        let PresentFit {
+            scale_offset,
+            filter,
+            ..
+        } = compute_present_fit(content.0, content.1, view_w, view_h);
+        let nearest = matches!(filter, PresentFilter::Nearest) as u32;
         queue.write_buffer(
             &self.present_buf,
             0,
             bytemuck::bytes_of(&PresentGpu {
                 scale_offset,
-                pad: [0; 4],
+                flags: [nearest, 0, 0, 0],
             }),
         );
         let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {

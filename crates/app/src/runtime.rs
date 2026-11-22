@@ -1170,27 +1170,48 @@ impl App {
         }
 
         if let Some((w, h)) = actions.resolution_changed {
-            self.selection.width = w;
-            self.selection.height = h;
             let caps = &self.devices[self.selection.device_idx].formats;
             let rates = modes::rates_for_resolution(caps, w, h);
-            if let Some(r) = rates.first() {
-                self.selection.rate = *r;
-            }
-            if let Some(fmt) = modes::pick_format_at(caps, w, h, self.selection.rate) {
+            let rate = rates.first().copied().unwrap_or(self.selection.rate);
+            if let Some(fmt) = modes::pick_format_at(caps, w, h, rate) {
                 let msg = self.i18n.t("err_resolution");
-                let _ = self.restart_with_fallback(fmt, &msg);
+                if self.restart_with_fallback(fmt, &msg) {
+                    // Match client area to capture so windowed 1080 can stay 1:1 crisp.
+                    self.request_window_for_capture();
+                }
             }
+            // Keep dropdown in sync with the live MF format (never a stale preset).
+            self.selection.width = self.current_format.width;
+            self.selection.height = self.current_format.height;
+            self.selection.rate = self
+                .current_format
+                .frame_rates
+                .first()
+                .copied()
+                .unwrap_or(self.selection.rate);
         }
 
         if let Some(rate) = actions.rate_changed {
-            self.selection.rate = rate;
             let caps = &self.devices[self.selection.device_idx].formats;
             if let Some(fmt) =
                 modes::pick_format_at(caps, self.selection.width, self.selection.height, rate)
             {
                 let msg = self.i18n.t("err_rate");
-                let _ = self.restart_with_fallback(fmt, &msg);
+                if !self.restart_with_fallback(fmt, &msg) {
+                    self.selection.rate = self
+                        .current_format
+                        .frame_rates
+                        .first()
+                        .copied()
+                        .unwrap_or(self.selection.rate);
+                }
+            } else {
+                self.selection.rate = self
+                    .current_format
+                    .frame_rates
+                    .first()
+                    .copied()
+                    .unwrap_or(self.selection.rate);
             }
         }
 
@@ -1651,6 +1672,24 @@ impl App {
         self.toast_until = Some(Instant::now() + Duration::from_secs(3));
     }
 
+    /// Resize the windowed client area to the active capture size (physical pixels).
+    /// Keeps windowed 1080 at a true 1:1 present instead of a soft fractional fit.
+    fn request_window_for_capture(&mut self) {
+        let Some(gpu) = self.gpu.as_mut() else {
+            return;
+        };
+        if self.chrome.fullscreen {
+            return;
+        }
+        let w = self.current_format.width;
+        let h = self.current_format.height;
+        if w == 0 || h == 0 {
+            return;
+        }
+        let _ = gpu.window.request_inner_size(winit::dpi::PhysicalSize::new(w, h));
+        tracing::info!(w, h, "requested windowed client size for capture 1:1");
+    }
+
     fn toggle_fullscreen(&mut self) {
         let Some(gpu) = self.gpu.as_mut() else {
             return;
@@ -1872,6 +1911,10 @@ impl App {
             .first()
             .copied()
             .unwrap_or(self.selection.rate);
+        // Dropdown must mirror the live MF format (avoids 720p preset vs 1080 capture).
+        self.selection.width = self.current_format.width;
+        self.selection.height = self.current_format.height;
+        self.selection.rate = rate;
         self.overlay.format_label = format!(
             "{}×{} {:?} @ {}",
             self.current_format.width,

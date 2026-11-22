@@ -24,6 +24,7 @@ pub use pipeline::VideoPipeline;
 pub use interpolate::{
     InterpBlockReason, InterpFrame, InterpMode, InterpolateEngine, InterpStatus,
 };
+pub use present::{compute_present_fit, PresentFilter, PresentFit};
 pub use upscale::{
     is_native_or_downscale, target_size, UpscaleBlockReason, UpscaleEngine, UpscaleMode,
     UpscaleStatus,
