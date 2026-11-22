@@ -12,6 +12,9 @@ mod probe;
 mod readback;
 
 #[cfg(feature = "dlss")]
+mod fg_ffi;
+
+#[cfg(feature = "dlss")]
 mod nr_ffi;
 
 #[cfg(not(feature = "dlss"))]
@@ -46,7 +49,9 @@ mod nr_ffi {
     }
 }
 
-pub use fg::{DlssGAvailability, DlssGEngine, DlssGMultiplier, DlssGStatus};
+pub use fg::{
+    DlssGAvailability, DlssGEngine, DlssGMultiplier, DlssGStatus, FgPresentFrame,
+};
 pub use probe::{nvidia_vendor, DlssAvailability, DlssEngine, DlssStatus};
 pub use readback::{enhance_rgba8_with_nr, read_texture_rgba8, write_rgba8_texture};
 

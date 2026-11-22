@@ -10,7 +10,8 @@ use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
 use crate::dlss::{
-    enhance_rgba8_with_nr, DlssAvailability, DlssEngine, DlssStatus,
+    enhance_rgba8_with_nr, write_rgba8_texture, DlssAvailability, DlssEngine, DlssStatus,
+    FgPresentFrame,
 };
 use crate::pipeline::VideoPipeline;
 use crate::present::{compute_letterbox, LetterboxUniforms};
@@ -700,6 +701,36 @@ impl UpscaleEngine {
         }
         self.present_dst(device, queue, encoder, out_w, out_h, surface_view, view_w, view_h, clear);
         true
+    }
+
+    /// Present one DLSS-G generated CPU frame through the upscale letterbox path.
+    pub fn present_fg_frame(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        frame: &FgPresentFrame,
+        surface_view: &wgpu::TextureView,
+        view_w: u32,
+        view_h: u32,
+        clear: wgpu::Color,
+    ) -> bool {
+        let (w, h) = (frame.width, frame.height);
+        if w == 0 || h == 0 || frame.rgba.len() < (w as usize) * (h as usize) * 4 {
+            return false;
+        }
+        self.ensure_slots(device, w, h, w, h);
+        let Some(dst) = self.rgba_dst.as_ref() else {
+            return false;
+        };
+        write_rgba8_texture(queue, &dst.texture, w, h, &frame.rgba);
+        self.present_dst(device, queue, encoder, w, h, surface_view, view_w, view_h, clear);
+        true
+    }
+
+    /// Pop a pending DLSS-G generated frame, if any.
+    pub fn pop_fg_present_frame(&mut self) -> Option<FgPresentFrame> {
+        self.dlss.fg_mut().pop_present_frame()
     }
 
     /// DLSS 5 Neural Rendering (NGX feature 18) via CPU staging D3D12 bridge.

@@ -595,7 +595,17 @@ impl App {
             .unwrap_or(60.0)
             .clamp(24.0, 240.0);
         let limit = self.ui_prefs.display_fps_limit;
-        let auto = if self.effects_ui.interp_mode != "off" {
+        let fg_mult = match self.effects_ui.dlssg_multiplier.as_str() {
+            "x2" => 2.0,
+            "x3" => 3.0,
+            "x4" => 4.0,
+            "x5" => 5.0,
+            "x6" => 6.0,
+            _ => 1.0,
+        };
+        let auto = if self.effects_ui.dlssg_ok && fg_mult > 1.0 {
+            (capture_hz * fg_mult).min(240.0)
+        } else if self.effects_ui.interp_mode != "off" {
             (capture_hz * 2.0).min(240.0)
         } else {
             capture_hz
@@ -1871,8 +1881,26 @@ impl App {
             });
 
         // Pipeline: upload → color → deinterlace → interpolate → upscale → present.
+        // DLSS-G: between captures, drain EvaluateFeature frames from the FG present queue.
         let mut presented = false;
-        if !no_signal {
+        if !no_signal && !new_capture {
+            if let Some(fg_frame) = gpu.upscale.pop_fg_present_frame() {
+                presented = gpu.upscale.present_fg_frame(
+                    &gpu.device,
+                    &gpu.queue,
+                    &mut encoder,
+                    &fg_frame,
+                    &view,
+                    gpu.config.width,
+                    gpu.config.height,
+                    clear,
+                );
+                if presented {
+                    self.gen_frames_in_window = self.gen_frames_in_window.saturating_add(1);
+                }
+            }
+        }
+        if !no_signal && !presented {
             let (cw, ch) = gpu.pipeline.content_size;
             let source_interlaced = self.current_format.interlaced;
             gpu.deinterlace.set_source_interlaced(source_interlaced);

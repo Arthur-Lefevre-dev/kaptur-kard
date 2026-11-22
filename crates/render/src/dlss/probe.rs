@@ -194,7 +194,10 @@ impl DlssEngine {
                 }
                 self.frames_since_reset = self.frames_since_reset.saturating_add(1);
                 self.last_error.clear();
-                let _ = self.fg.try_begin_frame(); // refuse until present hook
+                // NeuralScreen order: NR first, then DLSS-G EvaluateFeature → present queue.
+                if self.fg.try_begin_frame() {
+                    self.fg.ingest_real_rgba8(rgba, width, height);
+                }
                 Ok(true)
             }
             Err(e) => {

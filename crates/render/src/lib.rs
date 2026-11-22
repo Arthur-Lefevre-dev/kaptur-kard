@@ -17,7 +17,7 @@ pub use color::{
 pub use deinterlace::{DeinterlaceEngine, DeinterlaceMode};
 pub use dlss::{
     preferred_backends, DlssAvailability, DlssEngine, DlssGAvailability, DlssGMultiplier,
-    DlssGStatus, DlssStatus, DLSS_MARKETING_NOTE, STREAMLINE_DOC_VERSION,
+    DlssGStatus, DlssStatus, FgPresentFrame, DLSS_MARKETING_NOTE, STREAMLINE_DOC_VERSION,
 };
 pub use gpu::GpuContext;
 pub use pipeline::VideoPipeline;

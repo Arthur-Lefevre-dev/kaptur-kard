@@ -11,9 +11,12 @@ MF capture → wgpu upload
   → color / Bob / optical interpolate (GPU)
   → Mode C: DLSS 5 NR (NGX feature 18, nvngx_dlssnr.dll)
        optional Boost: half-res NR + composite onto native frame
-  → optional DLSS-G FG (nvngx_dlssg.dll, ×2–×6) — probe + UI today;
-       EvaluateFeature + dedicated present queue = pending DXGI hook
-  → present
+  → optional DLSS-G FG (nvngx_dlssg.dll, ×2–×6):
+       NGX Feature_FrameGeneration EvaluateFeature
+       flat depth + NVOFA estimated MVs
+       dedicated HIGH-priority DXGI present queue (hidden swapchain)
+       generated frames paced into CaptureView presents
+  → present (wgpu surface; FG copies also Present on the dedicated queue)
 ```
 
 ## BYO runtimes (required)
@@ -22,8 +25,10 @@ MF capture → wgpu upload
 |------|------|
 | `nvngx_dlssnr.dll` | DLSS 5 Neural Rendering (feature 18) |
 | `nvngx_dlssg.dll` | DLSS Frame Generation (optional) |
+| `dlss5nr_bridge.dll` | MIT NR host (build script) |
+| `dlss5g_bridge.dll` | MIT FG host + present queue (build script) |
 
-Obtain legally (NVIDIA SDK redistributable / game that ships the public FG DLL). Place under:
+Obtain proprietary DLLs legally (NVIDIA SDK redistributable / game that ships the public FG DLL). Place under:
 
 ```
 %APPDATA%\CaptureView\dlss5-nr\
@@ -32,7 +37,7 @@ Obtain legally (NVIDIA SDK redistributable / game that ships the public FG DLL).
   caller\nvngx.dll_comfy.dll
 ```
 
-Or set `CAPTUREVIEW_DLSSNR_DIR` to that folder. Also need `dlss5nr_bridge.dll` from `native/dlss5-nr/build_native.ps1`.
+Or set `CAPTUREVIEW_DLSSNR_DIR` / `CAPTUREVIEW_DLSSG_DIR` to that folder. Bridges come from `native/dlss5-nr/build_native.ps1` (`bin\`).
 
 `_nvngx.dll` is loaded from the NVIDIA driver install.
 
@@ -62,6 +67,6 @@ Without `--features dlss`, Mode C / FG UI still appear but report “feature dis
 
 ## Legal
 
-- MIT bridge under `native/dlss5-nr/` (ComfyUI-DLSS5-NR lineage)  
+- MIT bridges under `native/dlss5-nr/` (NR from ComfyUI-DLSS5-NR lineage; FG written for CaptureView from public NGX headers)  
 - No NeuralScreen source copied  
 - No vendored `nvngx_*.dll`  

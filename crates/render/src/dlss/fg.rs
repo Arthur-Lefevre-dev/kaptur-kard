@@ -1,20 +1,19 @@
-//! DLSS-G (Frame Generation) probe for NVIDIA desktop FG.
+//! DLSS-G (Frame Generation) — EvaluateFeature + dedicated DXGI present queue.
 //!
 //! Architecture adapted from publicly documented NeuralScreen behaviour
 //! (TECHNICAL.md): after NR, optional DLSS-G with flat depth + estimated MVs,
 //! multiplier ×2–×6, refuse politely when the runtime/GPU rejects.
 //!
 //! We do **not** copy NeuralScreen PolyForm source or vendor `nvngx_dlssg.dll`.
-//! Full EvaluateFeature + dedicated present queue needs DXGI swapchain ownership
-//! beyond wgpu — until that lands, Mode FG reports PendingPresentHook when the
-//! BYO DLL is present on an NVIDIA GPU.
+//! Native bridge: `dlss5g_bridge.dll` (MIT) owns a HIGH-priority DXGI present
+//! queue + NGX Feature_FrameGeneration EvaluateFeature path.
 
-#[cfg(feature = "dlss")]
-use std::path::{Path, PathBuf};
+use std::collections::VecDeque;
 
-#[cfg(feature = "dlss")]
-use super::probe::nvidia_vendor;
 use wgpu::Backend;
+
+#[cfg(feature = "dlss")]
+use super::fg_ffi::{FgOpenStatus, FgRuntime};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DlssGAvailability {
@@ -22,7 +21,8 @@ pub enum DlssGAvailability {
     NotNvidia,
     WrongBackend,
     SdkMissing,
-    /// DLL found; EvaluateFeature / present-queue hook not wired yet.
+    InitFailed,
+    /// Kept for locale compatibility; no longer returned by the live probe.
     PendingPresentHook,
     Ready,
 }
@@ -43,6 +43,7 @@ impl DlssGAvailability {
             Self::NotNvidia => "effect_reason_dlssg_gpu",
             Self::WrongBackend => "effect_reason_dlssg_backend",
             Self::SdkMissing => "effect_reason_dlssg_sdk",
+            Self::InitFailed => "effect_reason_dlssg_init",
             Self::PendingPresentHook => "effect_reason_dlssg_pending",
             Self::Ready => "",
         }
@@ -99,20 +100,77 @@ pub struct DlssGStatus {
     pub availability: DlssGAvailability,
     pub multiplier: DlssGMultiplier,
     pub dll_hint: String,
+    pub present_queue: bool,
+}
+
+/// One RGBA8 frame waiting to be shown (generated or real).
+#[derive(Clone, Debug)]
+pub struct FgPresentFrame {
+    pub rgba: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+    pub generated: bool,
 }
 
 pub struct DlssGEngine {
     availability: DlssGAvailability,
     multiplier: DlssGMultiplier,
+    #[cfg(feature = "dlss")]
+    runtime: Option<FgRuntime>,
+    prev_rgb: Option<(u32, u32, Vec<f32>)>,
+    pending: VecDeque<FgPresentFrame>,
+    present_queue_ok: bool,
+    frames_since_reset: u32,
+    last_error: String,
 }
 
 impl DlssGEngine {
     pub fn new(vendor_id: u32, name: &str, backend: Backend) -> Self {
-        let availability = classify(vendor_id, name, backend);
-        tracing::info!(?availability, "DLSS-G (nvngx_dlssg.dll) status");
-        Self {
-            availability,
-            multiplier: DlssGMultiplier::Off,
+        #[cfg(not(feature = "dlss"))]
+        {
+            let _ = (vendor_id, name, backend);
+            tracing::info!(availability = ?DlssGAvailability::FeatureDisabled, "DLSS-G disabled");
+            return Self {
+                availability: DlssGAvailability::FeatureDisabled,
+                multiplier: DlssGMultiplier::Off,
+                prev_rgb: None,
+                pending: VecDeque::new(),
+                present_queue_ok: false,
+                frames_since_reset: 0,
+                last_error: String::new(),
+            };
+        }
+        #[cfg(feature = "dlss")]
+        {
+            let (open, runtime) = FgRuntime::try_open(vendor_id, name, backend);
+            let availability = match open {
+                FgOpenStatus::NotNvidia => DlssGAvailability::NotNvidia,
+                FgOpenStatus::WrongBackend => DlssGAvailability::WrongBackend,
+                FgOpenStatus::SdkMissing => DlssGAvailability::SdkMissing,
+                FgOpenStatus::InitFailed => DlssGAvailability::InitFailed,
+                FgOpenStatus::Ready => DlssGAvailability::Ready,
+            };
+            let present_queue_ok = runtime
+                .as_ref()
+                .map(|r| r.present_queue_ready())
+                .unwrap_or(false);
+            let gpu = runtime.as_ref().map(|r| r.gpu_name()).unwrap_or("");
+            tracing::info!(
+                ?availability,
+                present_queue_ok,
+                gpu,
+                "DLSS-G (nvngx_dlssg.dll) status"
+            );
+            Self {
+                availability,
+                multiplier: DlssGMultiplier::Off,
+                runtime,
+                prev_rgb: None,
+                pending: VecDeque::new(),
+                present_queue_ok,
+                frames_since_reset: 0,
+                last_error: String::new(),
+            }
         }
     }
 
@@ -126,12 +184,16 @@ impl DlssGEngine {
 
     pub fn set_multiplier(&mut self, m: DlssGMultiplier) {
         if m != DlssGMultiplier::Off && !self.availability.can_evaluate() {
-            // Keep requested value for UI, but evaluate path stays off.
             tracing::debug!(
                 ?m,
                 ?self.availability,
                 "DLSS-G multiplier set while not Ready — will refuse at evaluate"
             );
+        }
+        if m == DlssGMultiplier::Off {
+            self.pending.clear();
+            self.prev_rgb = None;
+            self.frames_since_reset = 0;
         }
         self.multiplier = m;
     }
@@ -141,10 +203,23 @@ impl DlssGEngine {
             availability: self.availability,
             multiplier: self.multiplier,
             dll_hint: "Place nvngx_dlssg.dll beside nvngx_dlssnr.dll (BYO, docs/DLSS.md)".into(),
+            present_queue: self.present_queue_ok,
         }
     }
 
-    /// Returns false when FG cannot run (AMD / missing DLL / pending hook).
+    pub fn last_error(&self) -> &str {
+        &self.last_error
+    }
+
+    pub fn pending_count(&self) -> usize {
+        self.pending.len()
+    }
+
+    pub fn pop_present_frame(&mut self) -> Option<FgPresentFrame> {
+        self.pending.pop_front()
+    }
+
+    /// Returns true when FG should drive extra presents (queue non-empty or evaluate ready).
     pub fn try_begin_frame(&self) -> bool {
         if self.multiplier == DlssGMultiplier::Off {
             return false;
@@ -152,67 +227,100 @@ impl DlssGEngine {
         if !self.availability.can_evaluate() {
             return false;
         }
-        false // present-queue hook not wired — never claim FG frames yet
+        true
     }
-}
 
-fn classify(vendor_id: u32, name: &str, backend: Backend) -> DlssGAvailability {
-    #[cfg(not(feature = "dlss"))]
-    {
-        let _ = (vendor_id, name, backend);
-        return DlssGAvailability::FeatureDisabled;
-    }
-    #[cfg(feature = "dlss")]
-    {
-        if !nvidia_vendor(vendor_id, name) {
-            return DlssGAvailability::NotNvidia;
+    /// After NR (or pass-through), ingest the real RGBA8 frame: generate intermediates
+    /// into the present queue, then enqueue the real frame last.
+    pub fn ingest_real_rgba8(&mut self, rgba: &[u8], width: u32, height: u32) {
+        if self.multiplier == DlssGMultiplier::Off || !self.availability.can_evaluate() {
+            return;
         }
-        match backend {
-            Backend::Dx12 | Backend::Vulkan => {}
-            _ => return DlssGAvailability::WrongBackend,
+        let gen_n = self.multiplier.generated_frames();
+        if gen_n == 0 {
+            return;
         }
-        if find_dlssg_dll().is_none() {
-            return DlssGAvailability::SdkMissing;
-        }
-        // DLL present on NVIDIA + DX12/VK — EvaluateFeature needs DXGI present ownership.
-        DlssGAvailability::PendingPresentHook
-    }
-}
 
-#[cfg(feature = "dlss")]
-fn find_dlssg_dll() -> Option<PathBuf> {
-    let dirs = runtime_dirs();
-    for dir in dirs {
-        let p = dir.join("nvngx_dlssg.dll");
-        if p.is_file() {
-            return Some(p);
-        }
-    }
-    None
-}
+        // Drop stale generated frames when a new real frame arrives.
+        self.pending.clear();
 
-#[cfg(feature = "dlss")]
-fn runtime_dirs() -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    for key in ["CAPTUREVIEW_DLSSNR_DIR", "CAPTUREVIEW_DLSSG_DIR"] {
-        if let Ok(v) = std::env::var(key) {
-            let p = PathBuf::from(v.trim());
-            if p.is_dir() {
-                out.push(p);
+        let px = (width as usize).saturating_mul(height as usize);
+        if rgba.len() < px.saturating_mul(4) {
+            return;
+        }
+
+        let mut curr_rgb = vec![0.0f32; px * 3];
+        for i in 0..px {
+            curr_rgb[i * 3] = rgba[i * 4] as f32 / 255.0;
+            curr_rgb[i * 3 + 1] = rgba[i * 4 + 1] as f32 / 255.0;
+            curr_rgb[i * 3 + 2] = rgba[i * 4 + 2] as f32 / 255.0;
+        }
+
+        #[cfg(feature = "dlss")]
+        {
+            let reset = self.frames_since_reset == 0
+                || self
+                    .prev_rgb
+                    .as_ref()
+                    .map(|(w, h, _)| *w != width || *h != height)
+                    .unwrap_or(true);
+
+            if let Some(rt) = self.runtime.as_mut() {
+                if let Some((_, _, prev)) = self.prev_rgb.as_ref() {
+                    let mut out = vec![0.0f32; px * 3 * gen_n as usize];
+                    match rt.process_pair(
+                        prev,
+                        &curr_rgb,
+                        &mut out,
+                        width,
+                        height,
+                        gen_n,
+                        reset,
+                    ) {
+                        Ok(n) => {
+                            self.present_queue_ok = rt.present_queue_ready();
+                            for g in 0..n as usize {
+                                let slice = &out[g * px * 3..(g + 1) * px * 3];
+                                self.pending.push_back(FgPresentFrame {
+                                    rgba: rgb_f32_to_rgba8(slice, width, height),
+                                    width,
+                                    height,
+                                    generated: true,
+                                });
+                            }
+                            self.last_error.clear();
+                        }
+                        Err(e) => {
+                            self.last_error = e;
+                            tracing::warn!(error = %self.last_error, "DLSS-G EvaluateFeature failed");
+                        }
+                    }
+                }
             }
         }
+
+        // Real frame is presented by the normal NR/upscale path on this capture tick.
+        // Only generated frames sit in the queue for between-capture presents.
+        self.prev_rgb = Some((width, height, curr_rgb));
+        self.frames_since_reset = self.frames_since_reset.saturating_add(1);
     }
-    if let Ok(appdata) = std::env::var("APPDATA") {
-        out.push(PathBuf::from(appdata).join("CaptureView").join("dlss5-nr"));
+
+    pub fn request_history_reset(&mut self) {
+        self.frames_since_reset = 0;
+        self.prev_rgb = None;
+        self.pending.clear();
     }
-    let native = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join("native")
-        .join("dlss5-nr")
-        .join("runtime");
-    if native.is_dir() {
-        out.push(native);
+}
+
+#[cfg(feature = "dlss")]
+fn rgb_f32_to_rgba8(rgb: &[f32], width: u32, height: u32) -> Vec<u8> {
+    let px = (width as usize).saturating_mul(height as usize);
+    let mut out = vec![0u8; px * 4];
+    for i in 0..px {
+        out[i * 4] = (rgb[i * 3].clamp(0.0, 1.0) * 255.0) as u8;
+        out[i * 4 + 1] = (rgb[i * 3 + 1].clamp(0.0, 1.0) * 255.0) as u8;
+        out[i * 4 + 2] = (rgb[i * 3 + 2].clamp(0.0, 1.0) * 255.0) as u8;
+        out[i * 4 + 3] = 255;
     }
     out
 }
@@ -240,5 +348,16 @@ mod tests {
             }
         );
         assert!(!e.try_begin_frame());
+        e_refuses_ingest(&e);
+    }
+
+    fn e_refuses_ingest(e: &DlssGEngine) {
+        // ingest is &mut — use a fresh AMD engine
+        let mut e2 = DlssGEngine::new(0x1002, "AMD Radeon", Backend::Dx12);
+        e2.set_multiplier(DlssGMultiplier::X2);
+        let rgba = vec![0u8; 16];
+        e2.ingest_real_rgba8(&rgba, 2, 2);
+        assert_eq!(e2.pending_count(), 0);
+        let _ = e;
     }
 }

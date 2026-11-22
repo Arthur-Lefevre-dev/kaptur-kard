@@ -96,7 +96,7 @@ foreach ($inc in $includeDirs) { $common += ('/I' + $inc) }
 $libPathArgs = $libDirs | ForEach-Object { '/LIBPATH:' + $_ }
 
 $callerDll = Join-Path $CallerOut 'nvngx.dll_comfy.dll'
-Run-Cl ($common + @('/Od', (Join-Path $Native 'caller_shim.cpp'), '/link', ('/OUT:' + $callerDll)) + $libPathArgs) '[1/2] Caller shim'
+Run-Cl ($common + @('/Od', (Join-Path $Native 'caller_shim.cpp'), '/link', ('/OUT:' + $callerDll)) + $libPathArgs) '[1/3] Caller shim'
 
 $bridgeDll = Join-Path $Bin 'dlss5nr_bridge.dll'
 Run-Cl ($common + @(
@@ -106,7 +106,18 @@ Run-Cl ($common + @(
     '/link',
     ('/OUT:' + $bridgeDll),
     'd3d12.lib', 'd3d11.lib', 'dxgi.lib', 'ole32.lib'
-) + $libPathArgs) '[2/2] DLSS5 NR bridge'
+) + $libPathArgs) '[2/3] DLSS5 NR bridge'
+
+# FG bridge links its own copy of nvof_flow (separate DLL address space).
+$fgDll = Join-Path $Bin 'dlss5g_bridge.dll'
+Run-Cl ($common + @(
+    '/O2',
+    (Join-Path $Native 'dlss5g_bridge.cpp'),
+    (Join-Path $Native 'nvof_flow.cpp'),
+    '/link',
+    ('/OUT:' + $fgDll),
+    'd3d12.lib', 'd3d11.lib', 'dxgi.lib', 'ole32.lib', 'user32.lib'
+) + $libPathArgs) '[3/3] DLSS-G EvaluateFeature + present-queue bridge'
 
 Get-ChildItem -Path $Native -Filter '*.obj' -File -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
 Get-ChildItem -Path $Native -Filter '*.exp' -File -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
@@ -115,15 +126,18 @@ Get-ChildItem -Path $Native -Filter '*.lib' -File -ErrorAction SilentlyContinue 
 # Placeholder so Arthur sees where to drop the proprietary runtime.
 $readme = Join-Path $RuntimeOut 'PLACE_nvngx_dlssnr_HERE.txt'
 @"
-Place your legally obtained nvngx_dlssnr.dll in this folder (same directory as PLACE_*.txt).
+Place your legally obtained nvngx_dlssnr.dll (and optional nvngx_dlssg.dll) in this folder.
 
 Then either:
   set CAPTUREVIEW_DLSSNR_DIR=$RuntimeOut
 or copy this whole runtime\ tree to %APPDATA%\CaptureView\dlss5-nr\
 
-Official GPU support: RTX 50-series + driver 616.56+. See docs/DLSS.md.
+Also need dlss5nr_bridge.dll / dlss5g_bridge.dll from this build script (copied beside runtime or from bin\).
+
+Official GPU support: RTX 50-series NR + Ada+ FG typical; driver 616.56+. See docs/DLSS.md.
 "@ | Set-Content -Path $readme -Encoding UTF8
 
-Write-Host "Bridge: $bridgeDll" -ForegroundColor Green
-Write-Host "Shim:   $callerDll" -ForegroundColor Green
+Write-Host "NR bridge: $bridgeDll" -ForegroundColor Green
+Write-Host "FG bridge: $fgDll" -ForegroundColor Green
+Write-Host "Shim:      $callerDll" -ForegroundColor Green
 exit 0
