@@ -976,50 +976,71 @@ fn draw_effects_tab(ui: &mut egui::Ui, input: &DrawInput<'_>, actions: &mut UiAc
     };
 
     ui.label(i18n.t("label_upscale_mode"));
-    ui.add_enabled_ui(!blocked, |ui| {
-        ui.horizontal(|ui| {
-            for (id, key) in [
-                ("off", "effect_off"),
-                ("fsr1", "effect_fsr"),
-                ("nis", "effect_nis"),
-                ("dlss", "effect_dlss"),
-            ] {
-                let selected = fx.mode == id;
+    // Mode C (DLSS 5) is always listed — even on AMD — but greyed when the
+    // RTX + BYO runtime path is not ready so Arthur still sees the option.
+    ui.horizontal(|ui| {
+        for (id, key) in [
+            ("off", "effect_off"),
+            ("fsr1", "effect_fsr"),
+            ("nis", "effect_nis"),
+        ] {
+            let selected = fx.mode == id;
+            ui.add_enabled_ui(!blocked, |ui| {
                 if ui.selectable_label(selected, i18n.t(key)).clicked() {
                     actions.upscale_mode = Some(id);
                 }
-            }
-        });
+            });
+        }
+        {
+            let selected = fx.mode == "dlss";
+            let dlss_enabled = !blocked && fx.dlss_ok;
+            ui.add_enabled_ui(dlss_enabled, |ui| {
+                if ui.selectable_label(selected, i18n.t("effect_dlss")).clicked() {
+                    actions.upscale_mode = Some("dlss");
+                }
+            });
+        }
     });
     if blocked || fx.auto_disabled {
         ui.small(format!("{}: {}", i18n.t("label_unavailable"), reason));
-    } else if fx.native_res && fx.mode != "off" {
+    } else if fx.native_res && fx.mode != "off" && fx.mode != "dlss" {
         ui.small(i18n.t("tip_native_sharpen"));
     }
-    if fx.mode == "dlss" {
-        ui.label(RichText::new(i18n.t("tip_dlss")).small().italics());
-        if fx.dlss_ok {
-            ui.small(format!(
-                "{}: {}",
-                i18n.t("label_dlss_status"),
-                i18n.t("effect_reason_dlss_active")
-            ));
-            let mut boost = fx.dlss_boost;
-            if ui
-                .checkbox(&mut boost, i18n.t("label_dlss_boost"))
-                .changed()
-            {
-                actions.dlss_boost_changed = Some(boost);
-            }
-            ui.label(RichText::new(i18n.t("tip_dlss_boost")).small().italics());
+    // Always explain Mode C status (greyed AMD/missing DLL included).
+    {
+        let key = if fx.dlss_ok {
+            "effect_reason_dlss_active"
+        } else if fx.dlss_reason_key.is_empty() {
+            "effect_reason_dlss_needs_rtx"
         } else {
-            let key = if fx.dlss_reason_key.is_empty() {
-                "effect_reason_dlss_fallback"
-            } else {
-                fx.dlss_reason_key.as_str()
-            };
-            ui.small(format!("{}: {}", i18n.t("label_dlss_status"), i18n.t(key)));
+            fx.dlss_reason_key.as_str()
+        };
+        let style = if fx.dlss_ok {
+            RichText::new(format!("{}: {}", i18n.t("label_dlss_status"), i18n.t(key))).small()
+        } else {
+            RichText::new(format!("{}: {}", i18n.t("label_dlss_status"), i18n.t(key)))
+                .small()
+                .weak()
+        };
+        ui.label(style);
+    }
+    if fx.mode == "dlss" && fx.dlss_ok {
+        ui.label(RichText::new(i18n.t("tip_dlss")).small().italics());
+        let mut boost = fx.dlss_boost;
+        if ui
+            .checkbox(&mut boost, i18n.t("label_dlss_boost"))
+            .changed()
+        {
+            actions.dlss_boost_changed = Some(boost);
         }
+        ui.label(RichText::new(i18n.t("tip_dlss_boost")).small().italics());
+    } else if !fx.dlss_ok {
+        ui.label(
+            RichText::new(i18n.t("tip_dlss_greyed"))
+                .small()
+                .italics()
+                .weak(),
+        );
     }
     ui.label(RichText::new(i18n.t("tip_upscale")).small().italics());
     ui.add_space(8.0);
@@ -1088,30 +1109,44 @@ fn draw_effects_tab(ui: &mut egui::Ui, input: &DrawInput<'_>, actions: &mut UiAc
     ui.separator();
     ui.label(RichText::new(i18n.t("label_dlssg")).strong());
     ui.label(RichText::new(i18n.t("tip_dlssg")).small().italics());
+    // Always show FG multipliers; grey ×2+ when RTX + BYO dlssg DLL is missing.
     ui.horizontal(|ui| {
+        let selected_off = fx.dlssg_multiplier == "off";
+        if ui
+            .selectable_label(selected_off, i18n.t("effect_dlssg_off"))
+            .clicked()
+        {
+            actions.dlssg_multiplier = Some("off");
+        }
         for (id, key) in [
-            ("off", "effect_dlssg_off"),
             ("x2", "effect_dlssg_x2"),
             ("x3", "effect_dlssg_x3"),
             ("x4", "effect_dlssg_x4"),
         ] {
             let selected = fx.dlssg_multiplier == id;
-            if ui.selectable_label(selected, i18n.t(key)).clicked() {
-                actions.dlssg_multiplier = Some(id);
-            }
+            ui.add_enabled_ui(fx.dlssg_ok, |ui| {
+                if ui.selectable_label(selected, i18n.t(key)).clicked() {
+                    actions.dlssg_multiplier = Some(id);
+                }
+            });
         }
     });
     {
-        let key = if fx.dlssg_reason_key.is_empty() {
-            if fx.dlssg_ok {
-                "effect_reason_dlssg_active"
-            } else {
-                "effect_reason_dlssg_pending"
-            }
+        let key = if fx.dlssg_ok {
+            "effect_reason_dlssg_active"
+        } else if fx.dlssg_reason_key.is_empty() {
+            "effect_reason_dlssg_needs_rtx"
         } else {
             fx.dlssg_reason_key.as_str()
         };
-        ui.small(format!("{}: {}", i18n.t("label_dlssg_status"), i18n.t(key)));
+        let style = if fx.dlssg_ok {
+            RichText::new(format!("{}: {}", i18n.t("label_dlssg_status"), i18n.t(key))).small()
+        } else {
+            RichText::new(format!("{}: {}", i18n.t("label_dlssg_status"), i18n.t(key)))
+                .small()
+                .weak()
+        };
+        ui.label(style);
     }
 
     ui.add_space(10.0);

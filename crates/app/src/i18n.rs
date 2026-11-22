@@ -93,6 +93,8 @@ mod tests {
         assert_eq!(i18n.t("vsync_off"), "Désactivé");
         assert_eq!(i18n.t("btn_pin"), "Épingler");
         assert!(i18n.t("hint_f2_metrics").contains("F2"));
+        assert!(i18n.t("tip_dlss_greyed").contains("Grisé"));
+        assert!(i18n.t("effect_reason_dlss_gpu").contains("BYO"));
     }
 
     #[test]
