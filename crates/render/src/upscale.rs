@@ -145,6 +145,15 @@ pub struct UpscaleEngine {
     rgba_src: Option<TexSlot>,
     mid: Option<TexSlot>,
     rgba_dst: Option<TexSlot>,
+    /// Bumped when any upscale texture is recreated — invalidates cached bind groups.
+    tex_gen: u64,
+    cached_easu_bg: Option<(u64, wgpu::BindGroup)>,
+    /// mid → dst RCAS (upscale path).
+    cached_rcas_mid_bg: Option<(u64, wgpu::BindGroup)>,
+    /// rgba_src → dst RCAS (sharpen-only / Mode A @ native res — Arthur's path).
+    cached_rcas_src_bg: Option<(u64, wgpu::BindGroup)>,
+    cached_nis_bg: Option<(u64, wgpu::BindGroup)>,
+    cached_present_bg: Option<(u64, wgpu::BindGroup)>,
     /// Rate-limit "RCAS/NIS ran" tracing to ~1 Hz while Mode A/B is active.
     last_sharpen_log: Instant,
 }
@@ -467,6 +476,12 @@ impl UpscaleEngine {
             rgba_src: None,
             mid: None,
             rgba_dst: None,
+            tex_gen: 0,
+            cached_easu_bg: None,
+            cached_rcas_mid_bg: None,
+            cached_rcas_src_bg: None,
+            cached_nis_bg: None,
+            cached_present_bg: None,
             last_sharpen_log: Instant::now() - std::time::Duration::from_secs(2),
         }
     }
@@ -544,9 +559,7 @@ impl UpscaleEngine {
             return false;
         };
 
-        ensure_tex(device, &mut self.rgba_src, cw, ch, "upscale-src", false);
-        ensure_tex(device, &mut self.mid, out_w, out_h, "upscale-mid", true);
-        ensure_tex(device, &mut self.rgba_dst, out_w, out_h, "upscale-dst", true);
+        self.ensure_slots(device, cw, ch, out_w, out_h);
 
         // Identity letterbox into rgba_src (full UV content).
         video.write_identity_params(queue);
@@ -580,10 +593,10 @@ impl UpscaleEngine {
         let sample = self.rgba_src.as_ref().unwrap().view.clone();
         match self.mode {
             UpscaleMode::Fsr1 => {
-                self.dispatch_fsr(device, queue, encoder, &sample, cw, ch, out_w, out_h);
+                self.dispatch_fsr(device, queue, encoder, &sample, true, cw, ch, out_w, out_h);
             }
             UpscaleMode::Nis => {
-                self.dispatch_nis(device, queue, encoder, &sample, cw, ch, out_w, out_h);
+                self.dispatch_nis(device, queue, encoder, &sample, true, cw, ch, out_w, out_h);
             }
             UpscaleMode::Off => return false,
         }
@@ -613,23 +626,25 @@ impl UpscaleEngine {
             return false;
         }
         let (out_w, out_h) = target_size(src_w, src_h, view_w, view_h);
-        ensure_tex(device, &mut self.rgba_src, src_w, src_h, "upscale-src", false);
-        ensure_tex(device, &mut self.mid, out_w, out_h, "upscale-mid", true);
-        ensure_tex(device, &mut self.rgba_dst, out_w, out_h, "upscale-dst", true);
+        self.ensure_slots(device, src_w, src_h, out_w, out_h);
 
         let blit_ok = self.dispatch_blit(device, queue, encoder, src_view, src_w, src_h);
-        let sample = if blit_ok {
-            self.rgba_src.as_ref().unwrap().view.clone()
+        let (sample, stable_src) = if blit_ok {
+            (self.rgba_src.as_ref().unwrap().view.clone(), true)
         } else {
-            src_view.clone()
+            (src_view.clone(), false)
         };
 
         match self.mode {
             UpscaleMode::Fsr1 => {
-                self.dispatch_fsr(device, queue, encoder, &sample, src_w, src_h, out_w, out_h);
+                self.dispatch_fsr(
+                    device, queue, encoder, &sample, stable_src, src_w, src_h, out_w, out_h,
+                );
             }
             UpscaleMode::Nis => {
-                self.dispatch_nis(device, queue, encoder, &sample, src_w, src_h, out_w, out_h);
+                self.dispatch_nis(
+                    device, queue, encoder, &sample, stable_src, src_w, src_h, out_w, out_h,
+                );
             }
             UpscaleMode::Off => return false,
         }
@@ -690,9 +705,24 @@ impl UpscaleEngine {
         true
     }
 
+    fn ensure_slots(&mut self, device: &wgpu::Device, in_w: u32, in_h: u32, out_w: u32, out_h: u32) {
+        let mut changed = false;
+        changed |= ensure_tex(device, &mut self.rgba_src, in_w, in_h, "upscale-src", false);
+        changed |= ensure_tex(device, &mut self.mid, out_w, out_h, "upscale-mid", true);
+        changed |= ensure_tex(device, &mut self.rgba_dst, out_w, out_h, "upscale-dst", true);
+        if changed {
+            self.tex_gen = self.tex_gen.wrapping_add(1);
+            self.cached_easu_bg = None;
+            self.cached_rcas_mid_bg = None;
+            self.cached_rcas_src_bg = None;
+            self.cached_nis_bg = None;
+            self.cached_present_bg = None;
+        }
+    }
+
     /// Present the sharpened `rgba_dst` (never the pre-RCAS/NIS source).
     fn present_dst(
-        &self,
+        &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
@@ -703,9 +733,9 @@ impl UpscaleEngine {
         view_h: u32,
         clear: wgpu::Color,
     ) {
-        let Some(dst) = self.rgba_dst.as_ref() else {
+        if self.rgba_dst.is_none() {
             return;
-        };
+        }
         let LetterboxUniforms { scale_offset } = compute_letterbox(out_w, out_h, view_w, view_h);
         queue.write_buffer(
             &self.present_buf,
@@ -715,24 +745,35 @@ impl UpscaleEngine {
                 pad: [0; 4],
             }),
         );
-        let present_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("upscale-present-bg"),
-            layout: &self.present_bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&dst.view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self.present_sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: self.present_buf.as_entire_binding(),
-                },
-            ],
-        });
+        let gen = self.tex_gen;
+        let need_new = self
+            .cached_present_bg
+            .as_ref()
+            .map(|(g, _)| *g != gen)
+            .unwrap_or(true);
+        if need_new {
+            let dst_view = &self.rgba_dst.as_ref().unwrap().view;
+            let present_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("upscale-present-bg"),
+                layout: &self.present_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(dst_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.present_sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: self.present_buf.as_entire_binding(),
+                    },
+                ],
+            });
+            self.cached_present_bg = Some((gen, present_bg));
+        }
+        let present_bg = &self.cached_present_bg.as_ref().unwrap().1;
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("upscale-present"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -748,7 +789,7 @@ impl UpscaleEngine {
             occlusion_query_set: None,
         });
         pass.set_pipeline(&self.present_pipeline);
-        pass.set_bind_group(0, &present_bg, &[]);
+        pass.set_bind_group(0, present_bg, &[]);
         pass.draw(0..3, 0..1);
     }
 
@@ -783,6 +824,8 @@ impl UpscaleEngine {
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         src_view: &wgpu::TextureView,
+        // True when `src_view` is our stable `rgba_src` (safe to cache BGs).
+        stable_src: bool,
         in_w: u32,
         in_h: u32,
         out_w: u32,
@@ -793,6 +836,7 @@ impl UpscaleEngine {
             return;
         }
         let sharpen_only = in_w == out_w && in_h == out_h;
+        let gen = self.tex_gen;
         if !sharpen_only {
             if self.easu_pipeline.is_none() {
                 tracing::warn!("FSR upscale needs EASU but pipeline missing");
@@ -800,30 +844,71 @@ impl UpscaleEngine {
             }
             let con = easu_constants(in_w, in_h, out_w, out_h);
             queue.write_buffer(&self.easu_buf, 0, bytemuck::bytes_of(&con));
-            let mid_view = &self.mid.as_ref().unwrap().view;
-            let easu_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("easu-bg"),
-                layout: &self.easu_bgl,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(src_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&self.sampler),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::TextureView(mid_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: self.easu_buf.as_entire_binding(),
-                    },
-                ],
-            });
-            {
+            if stable_src {
+                let need_easu = self
+                    .cached_easu_bg
+                    .as_ref()
+                    .map(|(g, _)| *g != gen)
+                    .unwrap_or(true);
+                if need_easu {
+                    let src_for_easu = &self.rgba_src.as_ref().unwrap().view;
+                    let mid_view = &self.mid.as_ref().unwrap().view;
+                    let easu_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("easu-bg"),
+                        layout: &self.easu_bgl,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: wgpu::BindingResource::TextureView(src_for_easu),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::Sampler(&self.sampler),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: wgpu::BindingResource::TextureView(mid_view),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 3,
+                                resource: self.easu_buf.as_entire_binding(),
+                            },
+                        ],
+                    });
+                    self.cached_easu_bg = Some((gen, easu_bg));
+                }
+                let easu_bg = &self.cached_easu_bg.as_ref().unwrap().1;
+                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("easu"),
+                    timestamp_writes: None,
+                });
+                cpass.set_pipeline(self.easu_pipeline.as_ref().unwrap());
+                cpass.set_bind_group(0, easu_bg, &[]);
+                cpass.dispatch_workgroups((out_w + 7) / 8, (out_h + 7) / 8, 1);
+            } else {
+                let mid_view = &self.mid.as_ref().unwrap().view;
+                let easu_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("easu-bg"),
+                    layout: &self.easu_bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(src_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::Sampler(&self.sampler),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::TextureView(mid_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: self.easu_buf.as_entire_binding(),
+                        },
+                    ],
+                });
                 let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("easu"),
                     timestamp_writes: None,
@@ -848,38 +933,113 @@ impl UpscaleEngine {
         };
         queue.write_buffer(&self.rcas_buf, 0, bytemuck::bytes_of(&rcas_con));
 
-        let rcas_src = if sharpen_only {
-            src_view.clone()
+        if sharpen_only {
+            // Prefer cached rgba_src → dst (Mode A @ native). Fall back to ephemeral
+            // only when sampling an external view (blit failed).
+            if stable_src {
+                let need_rcas = self
+                    .cached_rcas_src_bg
+                    .as_ref()
+                    .map(|(g, _)| *g != gen)
+                    .unwrap_or(true);
+                if need_rcas {
+                    let src = &self.rgba_src.as_ref().unwrap().view;
+                    let dst_view = &self.rgba_dst.as_ref().unwrap().view;
+                    let rcas_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("rcas-src-bg"),
+                        layout: &self.rcas_bgl,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: wgpu::BindingResource::TextureView(src),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::TextureView(dst_view),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: self.rcas_buf.as_entire_binding(),
+                            },
+                        ],
+                    });
+                    self.cached_rcas_src_bg = Some((gen, rcas_bg));
+                }
+                let rcas_bg = &self.cached_rcas_src_bg.as_ref().unwrap().1;
+                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("rcas"),
+                    timestamp_writes: None,
+                });
+                cpass.set_pipeline(self.rcas_pipeline.as_ref().unwrap());
+                cpass.set_bind_group(0, rcas_bg, &[]);
+                cpass.dispatch_workgroups((out_w + 7) / 8, (out_h + 7) / 8, 1);
+            } else {
+                let dst_view = &self.rgba_dst.as_ref().unwrap().view;
+                let rcas_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("rcas-bg"),
+                    layout: &self.rcas_bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(src_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(dst_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: self.rcas_buf.as_entire_binding(),
+                        },
+                    ],
+                });
+                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("rcas"),
+                    timestamp_writes: None,
+                });
+                cpass.set_pipeline(self.rcas_pipeline.as_ref().unwrap());
+                cpass.set_bind_group(0, &rcas_bg, &[]);
+                cpass.dispatch_workgroups((out_w + 7) / 8, (out_h + 7) / 8, 1);
+            }
         } else {
-            self.mid.as_ref().unwrap().view.clone()
-        };
-        let dst_view = self.rgba_dst.as_ref().unwrap().view.clone();
-        let rcas_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("rcas-bg"),
-            layout: &self.rcas_bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&rcas_src),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&dst_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: self.rcas_buf.as_entire_binding(),
-                },
-            ],
-        });
-        {
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("rcas"),
-                timestamp_writes: None,
-            });
-            cpass.set_pipeline(self.rcas_pipeline.as_ref().unwrap());
-            cpass.set_bind_group(0, &rcas_bg, &[]);
-            cpass.dispatch_workgroups((out_w + 7) / 8, (out_h + 7) / 8, 1);
+            let need_rcas = self
+                .cached_rcas_mid_bg
+                .as_ref()
+                .map(|(g, _)| *g != gen)
+                .unwrap_or(true);
+            if need_rcas {
+                let mid_view = &self.mid.as_ref().unwrap().view;
+                let dst_view = &self.rgba_dst.as_ref().unwrap().view;
+                let rcas_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("rcas-mid-bg"),
+                    layout: &self.rcas_bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(mid_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(dst_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: self.rcas_buf.as_entire_binding(),
+                        },
+                    ],
+                });
+                self.cached_rcas_mid_bg = Some((gen, rcas_bg));
+            }
+            {
+                let rcas_bg = &self.cached_rcas_mid_bg.as_ref().unwrap().1;
+                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("rcas"),
+                    timestamp_writes: None,
+                });
+                cpass.set_pipeline(self.rcas_pipeline.as_ref().unwrap());
+                cpass.set_bind_group(0, rcas_bg, &[]);
+                cpass.dispatch_workgroups((out_w + 7) / 8, (out_h + 7) / 8, 1);
+            }
         }
         // Present always samples rgba_dst (RCAS output) — never the pre-sharpen src.
         if self.last_sharpen_log.elapsed().as_secs_f32() >= 1.0 {
@@ -905,6 +1065,7 @@ impl UpscaleEngine {
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         src_view: &wgpu::TextureView,
+        stable_src: bool,
         in_w: u32,
         in_h: u32,
         out_w: u32,
@@ -927,30 +1088,72 @@ impl UpscaleEngine {
             dst_size: [out_w as f32, out_h as f32, 0.0, 0.0],
         };
         queue.write_buffer(&self.nis_buf, 0, bytemuck::bytes_of(&params));
-        let dst_view = self.rgba_dst.as_ref().unwrap().view.clone();
-        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("nis-bg"),
-            layout: &self.nis_bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(src_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&dst_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: self.nis_buf.as_entire_binding(),
-                },
-            ],
-        });
-        {
+        let gen = self.tex_gen;
+        if stable_src {
+            let need_nis = self
+                .cached_nis_bg
+                .as_ref()
+                .map(|(g, _)| *g != gen)
+                .unwrap_or(true);
+            if need_nis {
+                let src_for_nis = &self.rgba_src.as_ref().unwrap().view;
+                let dst_view = &self.rgba_dst.as_ref().unwrap().view;
+                let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("nis-bg"),
+                    layout: &self.nis_bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(src_for_nis),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::Sampler(&self.sampler),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::TextureView(dst_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: self.nis_buf.as_entire_binding(),
+                        },
+                    ],
+                });
+                self.cached_nis_bg = Some((gen, bg));
+            }
+            let bg = &self.cached_nis_bg.as_ref().unwrap().1;
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("nis"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(self.nis_pipeline.as_ref().unwrap());
+            cpass.set_bind_group(0, bg, &[]);
+            cpass.dispatch_workgroups((out_w + 7) / 8, (out_h + 7) / 8, 1);
+        } else {
+            let dst_view = &self.rgba_dst.as_ref().unwrap().view;
+            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("nis-bg"),
+                layout: &self.nis_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(src_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(dst_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: self.nis_buf.as_entire_binding(),
+                    },
+                ],
+            });
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("nis"),
                 timestamp_writes: None,
@@ -976,6 +1179,7 @@ impl UpscaleEngine {
 
 }
 
+/// Returns true when the texture was (re)created.
 fn ensure_tex(
     device: &wgpu::Device,
     slot: &mut Option<TexSlot>,
@@ -983,10 +1187,10 @@ fn ensure_tex(
     h: u32,
     label: &str,
     storage: bool,
-) {
+) -> bool {
     if let Some(existing) = slot.as_ref() {
         if existing.size == (w, h) {
-            return;
+            return false;
         }
     }
     // Convert path needs RENDER_ATTACHMENT; blit (encode_from_rgba) needs STORAGE.
@@ -1016,6 +1220,7 @@ fn ensure_tex(
         view,
         size: (w, h),
     });
+    true
 }
 
 pub fn target_size(content_w: u32, content_h: u32, view_w: u32, view_h: u32) -> (u32, u32) {

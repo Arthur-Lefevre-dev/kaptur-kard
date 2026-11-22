@@ -72,6 +72,19 @@ impl SharedMetrics {
         self.frame_times_ns[idx].store(frame_time_ns, Ordering::Relaxed);
     }
 
+    /// Counters only — no ring copy / percentile sort (safe every frame).
+    pub fn snapshot_light(&self) -> MetricsLightSnapshot {
+        let last_latency_ns = self.last_latency_ns.load(Ordering::Relaxed);
+        MetricsLightSnapshot {
+            frames_presented: self.frames_presented.load(Ordering::Relaxed),
+            frames_dropped: self.frames_dropped.load(Ordering::Relaxed),
+            frames_captured: self.frames_captured.load(Ordering::Relaxed),
+            last_latency_ns,
+            last_latency_ms: last_latency_ns as f32 / 1_000_000.0,
+            last_frame_time_ns: self.last_frame_time_ns.load(Ordering::Relaxed),
+        }
+    }
+
     pub fn snapshot(&self) -> MetricsSnapshot {
         let mut frame_times = [0u64; FRAME_TIME_RING];
         let written = self.frame_time_idx.load(Ordering::Relaxed);
@@ -108,6 +121,16 @@ impl SharedMetrics {
             frame_times_ns: times_slice.to_vec(),
         }
     }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct MetricsLightSnapshot {
+    pub frames_presented: u64,
+    pub frames_dropped: u64,
+    pub frames_captured: u64,
+    pub last_latency_ns: u64,
+    pub last_latency_ms: f32,
+    pub last_frame_time_ns: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -148,5 +171,41 @@ mod tests {
         assert!((s.last_latency_ms - 10.0).abs() < 0.01);
         assert_eq!(s.frame_times_ns.len(), 10);
         assert!(s.one_percent_low_fps > 50.0);
+    }
+
+    #[test]
+    fn snapshot_light_skips_ring_copy() {
+        let m = SharedMetrics::new();
+        m.record_present(2_000_000, 16_666_667);
+        m.record_drop(4);
+        let light = m.snapshot_light();
+        assert_eq!(light.frames_dropped, 4);
+        assert!((light.last_latency_ms - 2.0).abs() < 0.01);
+        // Full snapshot remains available for UI throttle path.
+        assert!(m.snapshot().one_percent_low_fps > 50.0);
+    }
+
+    #[test]
+    fn snapshot_light_cheaper_than_full() {
+        let m = SharedMetrics::new();
+        for i in 0..FRAME_TIME_RING {
+            m.record_present(1_000_000, 16_666_667 + i as u64);
+        }
+        let n = 5_000u32;
+        let t0 = std::time::Instant::now();
+        for _ in 0..n {
+            let _ = m.snapshot_light();
+        }
+        let light_ns = t0.elapsed().as_nanos() / n as u128;
+        let t1 = std::time::Instant::now();
+        for _ in 0..n {
+            let _ = m.snapshot();
+        }
+        let full_ns = t1.elapsed().as_nanos() / n as u128;
+        // Full path sorts/copies the ring — should be clearly heavier.
+        assert!(
+            full_ns > light_ns,
+            "expected full snapshot slower than light (light={light_ns}ns full={full_ns}ns)"
+        );
     }
 }

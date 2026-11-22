@@ -3,7 +3,10 @@
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::thread;
 use std::time::{Duration, Instant};
+
+use crossbeam_channel::{Receiver, TryRecvError};
 
 use audio::{
     list_inputs, list_outputs, suggest_input_for_video, AudioDeviceInfo, AudioEngine,
@@ -37,6 +40,15 @@ use crate::prefs::{
 use crate::ui::{
     self, AudioUiState, ColorUiState, EffectsUiState, OverlayState, UiChrome, UiSelection,
 };
+
+/// Result of a background Media Foundation presence / enum poll.
+enum HotplugResult {
+    Unchanged,
+    Changed {
+        before_count: usize,
+        devices: Vec<DeviceInfo>,
+    },
+}
 
 enum ActiveSource {
     Mock(MockVideoSource),
@@ -127,7 +139,10 @@ struct GpuState {
 }
 
 /// Presence-only check interval. Full MF probe runs only when the id set changes.
-const HOTPLUG_INTERVAL: Duration = Duration::from_secs(5);
+/// Presence poll cadence. Actual MF enum runs on a worker — never blocks the UI thread.
+const HOTPLUG_INTERVAL: Duration = Duration::from_secs(8);
+/// Skip starting a new presence poll when a present is imminent (protects 1% low).
+const HOTPLUG_PRESENT_SLACK: Duration = Duration::from_millis(10);
 
 pub struct App {
     gpu: Option<GpuState>,
@@ -163,6 +178,13 @@ pub struct App {
     lag_test_started: Option<Instant>,
     lag_flash_until: Option<Instant>,
     last_hotplug_at: Instant,
+    /// Non-blocking hot-plug result. MF enum never runs on the UI thread.
+    hotplug_rx: Option<Receiver<HotplugResult>>,
+    hotplug_inflight: bool,
+    /// Throttle expensive metrics percentile / graph copy (UI only).
+    last_metrics_ui_at: Instant,
+    cached_one_percent_low: f32,
+    cached_frame_times_ms: Vec<f32>,
     /// True while stop/start runs — keep showing the last GPU frame (audio stays up).
     capture_restarting: bool,
     prefs_dirty: bool,
@@ -386,6 +408,13 @@ impl Default for App {
             lag_test_started: None,
             lag_flash_until: None,
             last_hotplug_at: Instant::now(),
+            hotplug_rx: None,
+            hotplug_inflight: false,
+            last_metrics_ui_at: Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .unwrap_or_else(Instant::now),
+            cached_one_percent_low: 0.0,
+            cached_frame_times_ms: Vec::new(),
             capture_restarting: false,
             prefs_dirty: false,
             prefs_dirty_at: Instant::now(),
@@ -513,15 +542,18 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        self.poll_hotplug();
-        self.flush_prefs_if_due();
-        self.push_discord_activity(false);
-
         // Always honor the display FPS cap — never let has_pending alone bypass it
         // (Arthur saw 240 FPS écran with limit 120 when pending woke every tick).
         let period = Duration::from_secs_f64(1.0 / self.target_display_hz());
         let elapsed = self.last_redraw_at.elapsed();
-        let due = elapsed >= period;
+        let until_due = period.saturating_sub(elapsed);
+        let due = until_due.is_zero();
+
+        // Apply finished presence polls; only start a new one when not near a present.
+        self.poll_hotplug_async(until_due > HOTPLUG_PRESENT_SLACK);
+        self.flush_prefs_if_due();
+        self.push_discord_activity(false);
+
         if due {
             if let Some(gpu) = self.gpu.as_ref() {
                 gpu.window.request_redraw();
@@ -532,8 +564,7 @@ impl ApplicationHandler for App {
             return;
         }
         // Wake when the next present is legal under the FPS cap.
-        let wait = period
-            .saturating_sub(elapsed)
+        let wait = until_due
             .max(Duration::from_micros(200))
             .min(Duration::from_millis(33));
         event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + wait));
@@ -710,37 +741,86 @@ impl App {
         );
     }
 
-    /// Presence poll: cheap id scan; full MF format probe only when devices appear/disappear.
-    /// Re-opening the active NZXT every 2s was Arthur's periodic frametime spike.
-    fn poll_hotplug(&mut self) {
+    /// Non-blocking hot-plug: MF presence (+ optional full probe) on a worker.
+    /// Blocking `list_device_presence()` / `run_on_mta` on the UI thread caused
+    /// periodic ~30 fps 1% lows (Arthur: lag spikes every few seconds).
+    fn poll_hotplug_async(&mut self, may_start: bool) {
+        if let Some(rx) = self.hotplug_rx.as_ref() {
+            match rx.try_recv() {
+                Ok(result) => {
+                    self.hotplug_rx = None;
+                    self.hotplug_inflight = false;
+                    if let HotplugResult::Changed {
+                        before_count,
+                        devices,
+                    } = result
+                    {
+                        self.apply_hotplug_devices(before_count, devices);
+                    }
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    self.hotplug_rx = None;
+                    self.hotplug_inflight = false;
+                }
+            }
+        }
+
+        if !may_start || self.hotplug_inflight {
+            return;
+        }
         if self.last_hotplug_at.elapsed() < HOTPLUG_INTERVAL {
             return;
         }
         self.last_hotplug_at = Instant::now();
+        let before_ids: std::collections::HashSet<String> = self
+            .devices
+            .iter()
+            .filter(|d| d.backend != "mock")
+            .map(|d| d.id.as_str().to_string())
+            .collect();
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        self.hotplug_rx = Some(rx);
+        self.hotplug_inflight = true;
+        let _ = thread::Builder::new().name("hotplug-mf".into()).spawn(move || {
+            let t0 = Instant::now();
+            let presence = capture::list_device_presence().unwrap_or_default();
+            let after_ids: std::collections::HashSet<String> =
+                presence.iter().map(|(id, _)| id.clone()).collect();
+            if after_ids == before_ids {
+                tracing::debug!(
+                    ms = t0.elapsed().as_secs_f32() * 1000.0,
+                    devices = after_ids.len(),
+                    "hotplug presence OK (worker, UI not blocked)"
+                );
+                let _ = tx.send(HotplugResult::Unchanged);
+                return;
+            }
+            tracing::info!(
+                before = before_ids.len(),
+                after = after_ids.len(),
+                "device set changed — full MF re-probe (worker)"
+            );
+            let real = capture::list_devices().unwrap_or_default();
+            tracing::info!(
+                ms = t0.elapsed().as_secs_f32() * 1000.0,
+                devices = real.len(),
+                "hotplug full probe done (worker)"
+            );
+            let _ = tx.send(HotplugResult::Changed {
+                before_count: before_ids.len(),
+                devices: real,
+            });
+        });
+    }
 
-        let Ok(presence) = capture::list_device_presence() else {
-            return;
-        };
-        let ids_after: std::collections::HashSet<String> =
-            presence.iter().map(|(id, _)| id.clone()).collect();
+    fn apply_hotplug_devices(&mut self, before_count: usize, real: Vec<DeviceInfo>) {
         let ids_before: std::collections::HashSet<String> = self
             .devices
             .iter()
             .filter(|d| d.backend != "mock")
             .map(|d| d.id.as_str().to_string())
             .collect();
-        if ids_after == ids_before {
-            return;
-        }
-
-        tracing::info!(
-            before = ids_before.len(),
-            after = ids_after.len(),
-            "device set changed — full MF re-probe"
-        );
-        let Ok(real) = capture::list_devices() else {
-            return;
-        };
         let mut next = real;
         next.push(MockVideoSource::device_info());
 
@@ -756,6 +836,12 @@ impl App {
 
         let ids_after: std::collections::HashSet<String> =
             next.iter().map(|d| d.id.as_str().to_string()).collect();
+
+        tracing::info!(
+            before = before_count,
+            after = ids_after.len().saturating_sub(1),
+            "applying hot-plug device list"
+        );
 
         self.devices = next;
 
@@ -1552,15 +1638,24 @@ impl App {
             }
         }
 
-        let snap = self.metrics.snapshot();
-        self.overlay.pipeline_delay_ms = snap.last_latency_ms;
-        self.overlay.one_percent_low_fps = snap.one_percent_low_fps;
-        self.overlay.dropped_frames = snap.frames_dropped;
-        self.overlay.frame_times_ms = snap
-            .frame_times_ns
-            .iter()
-            .map(|ns| *ns as f32 / 1_000_000.0)
-            .collect();
+        // Cheap counters every frame; percentile + graph copy at ~4 Hz (avoids sort/alloc hitch).
+        let snap_light = self.metrics.snapshot_light();
+        self.overlay.pipeline_delay_ms = snap_light.last_latency_ms;
+        self.overlay.dropped_frames = snap_light.frames_dropped;
+        if self.last_metrics_ui_at.elapsed() >= Duration::from_millis(250) {
+            self.last_metrics_ui_at = Instant::now();
+            let snap = self.metrics.snapshot();
+            self.cached_one_percent_low = snap.one_percent_low_fps;
+            self.cached_frame_times_ms = snap
+                .frame_times_ns
+                .iter()
+                .map(|ns| *ns as f32 / 1_000_000.0)
+                .collect();
+            self.overlay.one_percent_low_fps = self.cached_one_percent_low;
+            self.overlay.frame_times_ms.clone_from(&self.cached_frame_times_ms);
+        } else {
+            self.overlay.one_percent_low_fps = self.cached_one_percent_low;
+        }
 
         self.overlay.frame_w = self.current_format.width;
         self.overlay.frame_h = self.current_format.height;
