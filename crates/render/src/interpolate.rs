@@ -10,8 +10,10 @@ use crate::pipeline::VideoPipeline;
 use crate::present::{compute_letterbox, LetterboxUniforms};
 
 const OVER_BUDGET_LIMIT: u32 = 45;
-const FRAME_BUDGET_MS: f32 = 22.0;
-const SEARCH_RADIUS: f32 = 3.0;
+/// Display present dt is not GPU cost — only trip on real stalls (Arthur: CPU spin).
+const FRAME_BUDGET_MS: f32 = 40.0;
+/// Block-match radius; 2 is cheaper than 3 at 1080p with little quality loss.
+const SEARCH_RADIUS: f32 = 2.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InterpMode {
@@ -448,6 +450,16 @@ impl InterpolateEngine {
             };
             return None;
         }
+        // Present-only tick (no new capture): reuse last curr/mid — do not re-convert
+        // or re-run flow (was ~2× CPU work at 120 Hz display; Arthur saw ~95% CPU).
+        if !new_capture {
+            self.block = InterpBlockReason::None;
+            return if self.curr.is_some() {
+                Some(InterpFrame::Curr)
+            } else {
+                None
+            };
+        }
         let (cw, ch) = video.content_size;
         if cw == 0 || ch == 0 || video.bind_group_ref().is_none() {
             return None;
@@ -567,6 +579,15 @@ impl InterpolateEngine {
     ) -> Option<InterpFrame> {
         if !self.active() || width == 0 || height == 0 {
             return None;
+        }
+        // Present-only tick: reuse buffers (see prepare).
+        if !new_capture {
+            self.block = InterpBlockReason::None;
+            return if self.curr.is_some() {
+                Some(InterpFrame::Curr)
+            } else {
+                None
+            };
         }
         let _ = queue;
         ensure_rgba(device, &mut self.curr, width, height, "interp-curr", false);

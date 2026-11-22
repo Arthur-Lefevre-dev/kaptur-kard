@@ -87,7 +87,7 @@ mod tests {
         assert_eq!(i18n.t("label_device_busy"), "Carte de capture indisponible");
         assert_eq!(i18n.t("wizard_step1_title"), "Source vidéo entrante");
         assert!(i18n.t("btn_source_auto").contains("Automatique"));
-        assert_eq!(i18n.t("label_frame_gen_fps"), "FPS frame gen");
+        assert_eq!(i18n.t("label_frame_gen_fps"), "FPS après interpolation");
         assert_eq!(i18n.t("label_display_fps_limit"), "Limite FPS écran");
         assert_eq!(i18n.t("label_vsync"), "VSync");
         assert_eq!(i18n.t("vsync_off"), "Désactivé");

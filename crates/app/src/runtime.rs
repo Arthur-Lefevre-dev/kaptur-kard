@@ -20,7 +20,7 @@ use render::pipeline::VideoPipeline;
 use render::upload::upload_frame;
 use render::{
     is_native_or_downscale, resolve_color_convert, ColorMatrixMode, ColorRangeMode,
-    DeinterlaceEngine, DeinterlaceMode, InterpBlockReason, InterpFrame, InterpMode,
+    DeinterlaceEngine, DeinterlaceMode, InterpBlockReason, InterpMode,
     InterpolateEngine, UpscaleBlockReason, UpscaleEngine, UpscaleMode,
 };
 use winit::application::ApplicationHandler;
@@ -1703,9 +1703,9 @@ impl App {
             };
 
             if let Some(frame_kind) = interp_frame {
-                if matches!(frame_kind, InterpFrame::Mid) {
-                    self.gen_frames_in_window = self.gen_frames_in_window.saturating_add(1);
-                }
+                // Count every frame leaving interpolate (real Curr + synthetic Mid).
+                // Old Mid-only counter read ~capture fps and looked "broken" vs FPS écran ~2×.
+                self.gen_frames_in_window = self.gen_frames_in_window.saturating_add(1);
                 if let Some(rgba) = gpu.interpolate.frame_view(frame_kind) {
                     presented = gpu.upscale.encode_from_rgba(
                         &gpu.device,
