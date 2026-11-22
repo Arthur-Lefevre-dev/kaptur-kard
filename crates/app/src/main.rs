@@ -10,6 +10,7 @@
 
 mod brand;
 mod discord_presence;
+mod display_caps;
 mod i18n;
 mod logging;
 mod prefs;

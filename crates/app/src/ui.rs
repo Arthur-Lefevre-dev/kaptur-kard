@@ -72,6 +72,20 @@ pub struct OverlayState {
     pub display_fps_limit: u32,
     /// VSync preference: auto | on | off.
     pub vsync_mode: String,
+    /// User prefers HDR output when the OS display is in HDR.
+    pub hdr_output: bool,
+    /// OS Advanced Color supported on an active path.
+    pub hdr_supported: bool,
+    /// OS Advanced Color currently enabled.
+    pub hdr_enabled: bool,
+    /// Swapchain is using the HDR (RGBA16F / scRGB) path.
+    pub hdr_active: bool,
+    /// DXGI / surface reports allow-tearing (VRR-capable).
+    pub vrr_capable: bool,
+    /// Active wgpu present mode label (Immediate / Mailbox / Fifo / …).
+    pub present_mode: String,
+    /// Active surface format label.
+    pub surface_format: String,
     pub discord_presence: bool,
     pub discord_app_id: String,
     /// True when the Discord IPC worker is running (ID present).
@@ -115,6 +129,13 @@ impl Default for OverlayState {
             frame_gen_fps: 0.0,
             display_fps_limit: 0,
             vsync_mode: "auto".into(),
+            hdr_output: true,
+            hdr_supported: false,
+            hdr_enabled: false,
+            hdr_active: false,
+            vrr_capable: false,
+            present_mode: String::new(),
+            surface_format: String::new(),
             discord_presence: true,
             discord_app_id: String::new(),
             discord_active: false,
@@ -247,6 +268,8 @@ pub struct UiActions {
     pub display_fps_limit: Option<u32>,
     /// None = unchanged; Some("auto"|"on"|"off").
     pub vsync_mode: Option<&'static str>,
+    /// None = unchanged; Some(prefer HDR output).
+    pub hdr_output_changed: Option<bool>,
     pub discord_presence_changed: Option<bool>,
     pub discord_app_id_changed: Option<String>,
     pub log_level_changed: Option<&'static str>,
@@ -280,6 +303,8 @@ pub struct EffectsUiState {
     pub deinterlace_active: bool,
     /// auto | on | off
     pub vsync_mode: String,
+    /// Prefer HDR swapchain when OS HDR is on.
+    pub hdr_output: bool,
     /// Mode C — DLSS 5 NR ready.
     pub dlss_ok: bool,
     /// i18n key explaining why Mode C is limited.
@@ -313,6 +338,7 @@ impl Default for EffectsUiState {
             source_interlaced: false,
             deinterlace_active: false,
             vsync_mode: "auto".into(),
+            hdr_output: true,
             dlss_ok: false,
             dlss_reason_key: String::new(),
             dlss_fallback_nis: false,
@@ -1235,6 +1261,29 @@ fn draw_effects_tab(ui: &mut egui::Ui, input: &DrawInput<'_>, actions: &mut UiAc
     });
 
     ui.add_space(10.0);
+    ui.label(RichText::new(i18n.t("label_hdr")).strong());
+    ui.label(RichText::new(i18n.t("tip_hdr")).small().italics());
+    ui.horizontal(|ui| {
+        let on = fx.hdr_output;
+        if ui
+            .selectable_label(on, i18n.t("hdr_on"))
+            .clicked()
+            && !on
+        {
+            actions.hdr_output_changed = Some(true);
+        }
+        if ui
+            .selectable_label(!on, i18n.t("hdr_off"))
+            .clicked()
+            && on
+        {
+            actions.hdr_output_changed = Some(false);
+        }
+    });
+    ui.small(hdr_status_line(i18n, input.overlay));
+    ui.small(vrr_status_line(i18n, input.overlay));
+
+    ui.add_space(10.0);
     ui.separator();
     ui.label(RichText::new(i18n.t("label_deinterlace")).strong());
     ui.horizontal(|ui| {
@@ -1385,6 +1434,37 @@ fn vsync_mode_label(i18n: &I18n, mode: &str) -> String {
     }
 }
 
+fn hdr_status_line(i18n: &I18n, o: &OverlayState) -> String {
+    if o.hdr_active {
+        format!(
+            "{} · {}",
+            i18n.t("hdr_status_active"),
+            o.surface_format
+        )
+    } else if o.hdr_output && o.hdr_enabled {
+        i18n.t("hdr_status_fallback")
+    } else if o.hdr_output && o.hdr_supported && !o.hdr_enabled {
+        i18n.t("hdr_status_os_off")
+    } else if !o.hdr_supported {
+        i18n.t("hdr_status_unsupported")
+    } else {
+        i18n.t("hdr_status_off")
+    }
+}
+
+fn vrr_status_line(i18n: &I18n, o: &OverlayState) -> String {
+    let mode = if o.present_mode.is_empty() {
+        "—"
+    } else {
+        o.present_mode.as_str()
+    };
+    if o.vrr_capable {
+        format!("{} ({})", i18n.t("vrr_status_capable"), mode)
+    } else {
+        format!("{} ({})", i18n.t("vrr_status_unavailable"), mode)
+    }
+}
+
 fn display_fps_limit_label(i18n: &I18n, limit: u32) -> String {
     match limit {
         0 => i18n.t("fps_limit_auto"),
@@ -1474,6 +1554,8 @@ fn draw_metrics_body(ui: &mut egui::Ui, i18n: &I18n, o: &OverlayState, detailed:
         i18n.t("label_vsync"),
         vsync_mode_label(i18n, &o.vsync_mode)
     ));
+    ui.label(vrr_status_line(i18n, o));
+    ui.label(hdr_status_line(i18n, o));
     if !detailed {
         return;
     }

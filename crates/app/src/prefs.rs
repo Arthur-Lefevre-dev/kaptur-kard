@@ -59,6 +59,9 @@ pub struct UiPrefs {
     /// VSync: "auto" (profile default), "on", or "off".
     #[serde(default = "default_vsync")]
     pub vsync_mode: String,
+    /// Prefer Windows HDR (scRGB / RGBA16F) when the display has Advanced Color on.
+    #[serde(default = "default_true")]
+    pub hdr_output: bool,
     /// Show **KapturKard** on Discord Rich Presence.
     #[serde(default = "default_true")]
     pub discord_presence: bool,
@@ -153,6 +156,7 @@ impl Default for UiPrefs {
             deinterlace_mode: "auto".into(),
             display_fps_limit: 0,
             vsync_mode: default_vsync(),
+            hdr_output: true,
             discord_presence: true,
             discord_app_id: String::new(),
             log_level: default_log_level(),
