@@ -743,7 +743,8 @@ impl UpscaleEngine {
             &mid.view
         };
 
-        // Sharpness UI 0..1 → FSR stops (0 = max sharp, higher = softer). Invert.
+        // UI 0=soft … 1=sharp → AMD RCAS stops (0=sharpest). Map into ~0..2 stops.
+        // con = exp2(-stops); lobe *= con (lobe ≤ 0) so larger con = stronger sharpen.
         let stops = (1.0 - self.sharpness) * 2.0;
         let rcas_con = RcasGpu {
             con: [(-stops).exp2(), 0.0, 0.0, 0.0],
@@ -1023,5 +1024,17 @@ mod tests {
         assert_eq!(UpscaleMode::from_str_lossy("fsr1"), UpscaleMode::Fsr1);
         assert_eq!(UpscaleMode::from_str_lossy("nis"), UpscaleMode::Nis);
         assert_eq!(UpscaleMode::from_str_lossy("nope"), UpscaleMode::Off);
+    }
+
+    #[test]
+    fn rcas_con_stronger_when_ui_sharpness_higher() {
+        // UI 1 = sharpest → stops 0 → con 1; UI 0 = soft → smaller con.
+        let con = |s: f32| {
+            let stops = (1.0 - s) * 2.0;
+            (-stops).exp2()
+        };
+        assert!((con(1.0) - 1.0).abs() < 1e-5);
+        assert!(con(1.0) > con(0.5));
+        assert!(con(0.5) > con(0.0));
     }
 }

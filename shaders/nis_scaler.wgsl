@@ -72,9 +72,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let gx = luma(cx1) - luma(cx0);
     let gy = luma(cy1) - luma(cy0);
     let edge = clamp(length(vec2<f32>(gx, gy)) * 4.0, 0.0, 1.0);
-    let sharp = params.scale.z; // 0..1
+    let sharp = params.scale.z; // 0..1 UI (1 = max sharp)
     let detect = params.scale.w;
-    let usm = (scaled - c0) * (sharp * (0.35 + 0.65 * edge) * detect);
+    // Unsharp mask: add highpass (c0 - blurred). The old (scaled - c0) *sign flipped* and blurred.
+    let usm = (c0 - scaled) * (sharp * (0.45 + 0.55 * edge) * detect);
     var outc = clamp(scaled + usm, vec3<f32>(0.0), vec3<f32>(1.0));
 
     textureStore(dst_tex, vec2<i32>(i32(gid.x), i32(gid.y)), vec4<f32>(outc, 1.0));
