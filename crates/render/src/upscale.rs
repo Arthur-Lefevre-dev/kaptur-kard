@@ -94,6 +94,12 @@ struct PresentGpu {
     pad: [u32; 4],
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct BlitGpu {
+    size: [f32; 4],
+}
+
 struct TexSlot {
     #[allow(dead_code)]
     texture: wgpu::Texture,
@@ -117,12 +123,15 @@ pub struct UpscaleEngine {
     easu_pipeline: Option<wgpu::ComputePipeline>,
     rcas_pipeline: Option<wgpu::ComputePipeline>,
     nis_pipeline: Option<wgpu::ComputePipeline>,
+    blit_pipeline: Option<wgpu::ComputePipeline>,
     easu_bgl: wgpu::BindGroupLayout,
     rcas_bgl: wgpu::BindGroupLayout,
     nis_bgl: wgpu::BindGroupLayout,
+    blit_bgl: wgpu::BindGroupLayout,
     easu_buf: wgpu::Buffer,
     rcas_buf: wgpu::Buffer,
     nis_buf: wgpu::Buffer,
+    blit_buf: wgpu::Buffer,
 
     convert_pipeline: wgpu::RenderPipeline,
     convert_bgl: wgpu::BindGroupLayout,
@@ -175,10 +184,11 @@ impl UpscaleEngine {
                 uniform_entry(3, wgpu::ShaderStages::COMPUTE),
             ],
         });
+        // RCAS uses textureLoad — non-filterable binding (filterable broke some Vulkan paths).
         let rcas_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("rcas-bgl"),
             entries: &[
-                tex_sample_entry(0),
+                tex_load_entry(0),
                 storage_tex_entry(1),
                 uniform_entry(2, wgpu::ShaderStages::COMPUTE),
             ],
@@ -190,6 +200,14 @@ impl UpscaleEngine {
                 sampler_entry(1),
                 storage_tex_entry(2),
                 uniform_entry(3, wgpu::ShaderStages::COMPUTE),
+            ],
+        });
+        let blit_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("blit-bgl"),
+            entries: &[
+                tex_load_entry(0),
+                storage_tex_entry(1),
+                uniform_entry(2, wgpu::ShaderStages::COMPUTE),
             ],
         });
 
@@ -211,6 +229,12 @@ impl UpscaleEngine {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let blit_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("blit-ub"),
+            size: std::mem::size_of::<BlitGpu>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let present_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("upscale-present-ub"),
             contents: bytemuck::bytes_of(&PresentGpu {
@@ -220,7 +244,7 @@ impl UpscaleEngine {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        let (easu_pipeline, rcas_pipeline, nis_pipeline) = if compute_ok {
+        let (easu_pipeline, rcas_pipeline, nis_pipeline, blit_pipeline) = if compute_ok {
             let easu_mod = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("fsr1-easu"),
                 source: wgpu::ShaderSource::Wgsl(
@@ -239,6 +263,12 @@ impl UpscaleEngine {
                     include_str!("../../../shaders/nis_scaler.wgsl").into(),
                 ),
             });
+            let blit_mod = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("blit-rgba"),
+                source: wgpu::ShaderSource::Wgsl(
+                    include_str!("../../../shaders/blit_rgba.wgsl").into(),
+                ),
+            });
             let easu_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("easu-pl"),
                 bind_group_layouts: &[&easu_bgl],
@@ -252,6 +282,11 @@ impl UpscaleEngine {
             let nis_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("nis-pl"),
                 bind_group_layouts: &[&nis_bgl],
+                push_constant_ranges: &[],
+            });
+            let blit_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("blit-pl"),
+                bind_group_layouts: &[&blit_bgl],
                 push_constant_ranges: &[],
             });
             (
@@ -279,6 +314,14 @@ impl UpscaleEngine {
                     compilation_options: Default::default(),
                     cache: None,
                 })),
+                Some(device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("blit-pipe"),
+                    layout: Some(&blit_pl),
+                    module: &blit_mod,
+                    entry_point: Some("main"),
+                    compilation_options: Default::default(),
+                    cache: None,
+                })),
             )
         } else {
             tracing::warn!(
@@ -286,7 +329,7 @@ impl UpscaleEngine {
                 backend = %backend_name,
                 "compute shaders unavailable; FSR/NIS disabled"
             );
-            (None, None, None)
+            (None, None, None, None)
         };
 
         // Convert pass: reuse fullscreen.wgsl into RGBA8 (identity letterbox via params).
@@ -402,12 +445,15 @@ impl UpscaleEngine {
             easu_pipeline,
             rcas_pipeline,
             nis_pipeline,
+            blit_pipeline,
             easu_bgl,
             rcas_bgl,
             nis_bgl,
+            blit_bgl,
             easu_buf,
             rcas_buf,
             nis_buf,
+            blit_buf,
             convert_pipeline,
             convert_bgl,
             present_pipeline,
@@ -560,6 +606,9 @@ impl UpscaleEngine {
     }
 
     /// Upscale an already color-converted RGBA view (e.g. after interpolation).
+    ///
+    /// Blits into a stable filterable `rgba_src` first so EASU/NIS can sample
+    /// interpolate Mid (storage) safely in fullscreen.
     pub fn encode_from_rgba(
         &mut self,
         device: &wgpu::Device,
@@ -577,25 +626,86 @@ impl UpscaleEngine {
             return false;
         }
         let (out_w, out_h) = target_size(src_w, src_h, view_w, view_h);
+        ensure_tex(device, &mut self.rgba_src, src_w, src_h, "upscale-src", false);
         ensure_tex(device, &mut self.mid, out_w, out_h, "upscale-mid", true);
         ensure_tex(device, &mut self.rgba_dst, out_w, out_h, "upscale-dst", true);
+
+        let blit_ok = self.dispatch_blit(device, queue, encoder, src_view, src_w, src_h);
+        let sample_view = if blit_ok {
+            &self.rgba_src.as_ref().unwrap().view
+        } else {
+            src_view
+        };
         let mid = self.mid.as_ref().unwrap();
         let dst = self.rgba_dst.as_ref().unwrap();
 
         match self.mode {
             UpscaleMode::Fsr1 => {
                 self.dispatch_fsr(
-                    device, queue, encoder, src_view, mid, dst, src_w, src_h, out_w, out_h,
+                    device, queue, encoder, sample_view, mid, dst, src_w, src_h, out_w, out_h,
                 );
             }
             UpscaleMode::Nis => {
                 self.dispatch_nis(
-                    device, queue, encoder, src_view, dst, src_w, src_h, out_w, out_h,
+                    device, queue, encoder, sample_view, dst, src_w, src_h, out_w, out_h,
                 );
             }
             UpscaleMode::Off => return false,
         }
         self.present_dst(device, queue, encoder, dst, out_w, out_h, surface_view, view_w, view_h, clear);
+        true
+    }
+
+    /// Copy `src_view` into `rgba_src` via textureLoad (works for storage Mid).
+    fn dispatch_blit(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        src_view: &wgpu::TextureView,
+        w: u32,
+        h: u32,
+    ) -> bool {
+        let Some(blit) = self.blit_pipeline.as_ref() else {
+            return false;
+        };
+        let Some(dst) = self.rgba_src.as_ref() else {
+            return false;
+        };
+        queue.write_buffer(
+            &self.blit_buf,
+            0,
+            bytemuck::bytes_of(&BlitGpu {
+                size: [w as f32, h as f32, 0.0, 0.0],
+            }),
+        );
+        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("blit-bg"),
+            layout: &self.blit_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(src_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&dst.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.blit_buf.as_entire_binding(),
+                },
+            ],
+        });
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("blit-rgba"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(blit);
+            cpass.set_bind_group(0, &bg, &[]);
+            cpass.dispatch_workgroups((w + 7) / 8, (h + 7) / 8, 1);
+        }
         true
     }
 
@@ -854,11 +964,12 @@ fn ensure_tex(
             return;
         }
     }
+    // Convert path needs RENDER_ATTACHMENT; blit (encode_from_rgba) needs STORAGE.
     let mut usage = wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC;
     if storage {
         usage |= wgpu::TextureUsages::STORAGE_BINDING;
     } else {
-        usage |= wgpu::TextureUsages::RENDER_ATTACHMENT;
+        usage |= wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::STORAGE_BINDING;
     }
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some(label),
@@ -927,6 +1038,20 @@ fn tex_sample_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
             multisampled: false,
             view_dimension: wgpu::TextureViewDimension::D2,
             sample_type: wgpu::TextureSampleType::Float { filterable: true },
+        },
+        count: None,
+    }
+}
+
+/// Non-filterable binding for textureLoad (RCAS / blit).
+fn tex_load_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Texture {
+            multisampled: false,
+            view_dimension: wgpu::TextureViewDimension::D2,
+            sample_type: wgpu::TextureSampleType::Float { filterable: false },
         },
         count: None,
     }
@@ -1036,5 +1161,15 @@ mod tests {
         assert!((con(1.0) - 1.0).abs() < 1e-5);
         assert!(con(1.0) > con(0.5));
         assert!(con(0.5) > con(0.0));
+    }
+
+    #[test]
+    fn fullscreen_monitor_size_drives_upscale_target() {
+        // Borderless fullscreen must feed monitor pixels into target_size so
+        // FSR/NIS enlarge (or sharpen) against the real display, not the old window.
+        let (w, h) = target_size(1920, 1080, 2560, 1440);
+        assert!(w >= 2560 || h >= 1440 || (w > 1920 && h > 1080));
+        let (w4, h4) = target_size(1920, 1080, 3840, 2160);
+        assert!(w4 > 1920 && h4 > 1080);
     }
 }

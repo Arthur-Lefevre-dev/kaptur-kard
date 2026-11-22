@@ -1373,15 +1373,40 @@ impl App {
     }
 
     fn toggle_fullscreen(&mut self) {
-        let Some(gpu) = self.gpu.as_ref() else {
+        let Some(gpu) = self.gpu.as_mut() else {
             return;
         };
         self.chrome.fullscreen = !self.chrome.fullscreen;
-        gpu.window.set_fullscreen(if self.chrome.fullscreen {
-            Some(winit::window::Fullscreen::Borderless(None))
+        if self.chrome.fullscreen {
+            // Prefer the monitor the window is on so FSR/NIS see the real pixel size
+            // on the first fullscreen frame (don't wait for a late Resized event).
+            let monitor = gpu
+                .window
+                .current_monitor()
+                .or_else(|| gpu.window.primary_monitor());
+            if let Some(monitor) = monitor.clone() {
+                let size = monitor.size();
+                gpu.window
+                    .set_fullscreen(Some(winit::window::Fullscreen::Borderless(Some(
+                        monitor,
+                    ))));
+                if size.width > 0 && size.height > 0 {
+                    gpu.config.width = size.width;
+                    gpu.config.height = size.height;
+                    gpu.surface.configure(&gpu.device, &gpu.config);
+                    tracing::info!(
+                        width = size.width,
+                        height = size.height,
+                        "fullscreen surface configured for upscale"
+                    );
+                }
+            } else {
+                gpu.window
+                    .set_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
+            }
         } else {
-            None
-        });
+            gpu.window.set_fullscreen(None);
+        }
     }
 
     fn reset_to_auto(&mut self) {
