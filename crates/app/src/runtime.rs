@@ -1200,6 +1200,13 @@ impl App {
             self.push_discord_activity(true);
             self.persist_ui_prefs();
         }
+        if let Some(level) = actions.log_level_changed {
+            let level = crate::logging::normalize_level(level).to_string();
+            self.ui_prefs.log_level = level.clone();
+            self.overlay.log_level = level.clone();
+            let _ = crate::logging::set_level(&level);
+            self.persist_ui_prefs();
+        }
         if let Some(mode) = actions.deinterlace_mode {
             self.effects_ui.deinterlace_mode = mode.to_string();
             self.ui_prefs.deinterlace_mode = mode.to_string();
@@ -1330,6 +1337,10 @@ impl App {
     }
 
     fn copy_support_report(&mut self) {
+        let log_path = crate::logging::log_file_path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "(none)".into());
+        let log_tail = crate::logging::log_tail();
         let report = format!(
             "CaptureView support report\n\
              locale={:?}\n\
@@ -1338,7 +1349,9 @@ impl App {
              audio_in={} audio_out={}\n\
              fps={:.1} capture_fps={:.1} frame_gen_fps={:.1} display_limit={} vsync={} pipeline_delay_ms={:.1}\n\
              dropped={} 1%low={:.1} gpu={}\n\
-             -- log --\n{}\n",
+             log_level={} log_file={}\n\
+             -- support events --\n{}\n\
+             -- log tail --\n{}\n",
             self.i18n.lang(),
             self.overlay.label,
             self.current_format.width,
@@ -1356,7 +1369,10 @@ impl App {
             self.overlay.dropped_frames,
             self.overlay.one_percent_low_fps,
             self.overlay.gpu_name,
-            self.support_log.join("\n")
+            self.ui_prefs.log_level,
+            log_path,
+            self.support_log.join("\n"),
+            log_tail
         );
         match arboard::Clipboard::new().and_then(|mut c| c.set_text(report)) {
             Ok(()) => self.show_toast(self.i18n.t("msg_copied")),
@@ -1504,6 +1520,10 @@ impl App {
         self.overlay.discord_presence = self.ui_prefs.discord_presence;
         self.overlay.discord_app_id = self.ui_prefs.discord_app_id.clone();
         self.overlay.discord_active = self.discord.is_active();
+        self.overlay.log_level = crate::logging::normalize_level(&self.ui_prefs.log_level).to_string();
+        self.overlay.log_path = crate::logging::log_file_path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
 
         // Refresh process CPU/RAM ~2 Hz (UI thread only).
         if self.process_sample_at.elapsed() >= Duration::from_millis(500) {

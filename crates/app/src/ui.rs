@@ -76,6 +76,10 @@ pub struct OverlayState {
     pub discord_app_id: String,
     /// True when the Discord IPC worker is running (ID present).
     pub discord_active: bool,
+    /// tracing level: error|warn|info|debug|trace
+    pub log_level: String,
+    /// Active log file path (for Infos / support).
+    pub log_path: String,
     pub label: String,
     pub frame_w: u32,
     pub frame_h: u32,
@@ -114,6 +118,8 @@ impl Default for OverlayState {
             discord_presence: true,
             discord_app_id: String::new(),
             discord_active: false,
+            log_level: "info".into(),
+            log_path: String::new(),
             label: String::new(),
             frame_w: 0,
             frame_h: 0,
@@ -236,6 +242,7 @@ pub struct UiActions {
     pub vsync_mode: Option<&'static str>,
     pub discord_presence_changed: Option<bool>,
     pub discord_app_id_changed: Option<String>,
+    pub log_level_changed: Option<&'static str>,
     pub color_range_changed: Option<&'static str>,
     pub color_matrix_changed: Option<&'static str>,
     pub color_range_toggle: bool,
@@ -1123,7 +1130,7 @@ fn draw_info_tab(ui: &mut egui::Ui, input: &DrawInput<'_>, actions: &mut UiActio
         let resp = ui.add(
             egui::TextEdit::singleline(&mut id)
                 .desired_width(220.0)
-                .hint_text("123456789012345678"),
+                .hint_text(crate::discord_presence::DEFAULT_APP_ID),
         );
         if resp.changed() {
             actions.discord_app_id_changed = Some(id);
@@ -1133,6 +1140,28 @@ fn draw_info_tab(ui: &mut egui::Ui, input: &DrawInput<'_>, actions: &mut UiActio
         ui.small(i18n.t("discord_status_on"));
     } else if o.discord_presence {
         ui.small(i18n.t("discord_status_need_id"));
+    }
+    ui.add_space(8.0);
+    ui.separator();
+    ui.label(RichText::new(i18n.t("label_logging")).strong());
+    ui.label(RichText::new(i18n.t("tip_logging")).small().italics());
+    ui.horizontal(|ui| {
+        ui.label(i18n.t("label_log_level"));
+        egui::ComboBox::from_id_salt("log_level")
+            .selected_text(o.log_level.clone())
+            .show_ui(ui, |ui| {
+                for level in ["error", "warn", "info", "debug", "trace"] {
+                    if ui
+                        .selectable_label(o.log_level == level, level)
+                        .clicked()
+                    {
+                        actions.log_level_changed = Some(level);
+                    }
+                }
+            });
+    });
+    if !o.log_path.is_empty() {
+        ui.small(format!("{}: {}", i18n.t("label_log_path"), o.log_path));
     }
     ui.add_space(8.0);
     ui.separator();

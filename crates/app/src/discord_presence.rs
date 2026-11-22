@@ -13,6 +13,10 @@ use discord_rich_presence::{DiscordIpc, DiscordIpcClient};
 const ACTIVITY_NAME: &str = "KapturKard";
 const REFRESH: Duration = Duration::from_secs(15);
 
+/// Built-in Discord Developer Portal Application ID for KapturKard.
+/// Infos / env can still override via [`resolve_app_id`].
+pub const DEFAULT_APP_ID: &str = "1574108306010677570";
+
 enum Cmd {
     Update { details: String, state: String },
     Shutdown,
@@ -30,7 +34,7 @@ impl DiscordPresence {
         if !enabled || app_id.is_empty() {
             if enabled && app_id.is_empty() {
                 tracing::info!(
-                    "discord presence idle: set Application ID in Infos (or env KAPTURKARD_DISCORD_APP_ID)"
+                    "discord presence idle: no Application ID (built-in default missing?)"
                 );
             }
             return Self { tx: None };
@@ -79,16 +83,34 @@ impl Drop for DiscordPresence {
     }
 }
 
-/// Resolve Application ID: non-empty prefs → else `KAPTURKARD_DISCORD_APP_ID` env.
+/// Resolve Application ID: prefs → `KAPTURKARD_DISCORD_APP_ID` env → built-in default.
 pub fn resolve_app_id(prefs_id: &str) -> String {
     let trimmed = prefs_id.trim();
     if !trimmed.is_empty() {
         return trimmed.to_string();
     }
-    std::env::var("KAPTURKARD_DISCORD_APP_ID")
+    let from_env = std::env::var("KAPTURKARD_DISCORD_APP_ID")
         .unwrap_or_default()
         .trim()
-        .to_string()
+        .to_string();
+    if !from_env.is_empty() {
+        return from_env;
+    }
+    DEFAULT_APP_ID.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_prefers_non_empty_prefs() {
+        assert_eq!(resolve_app_id(" 999 "), "999");
+        assert!(!DEFAULT_APP_ID.is_empty());
+        // Empty prefs: env or built-in — never empty.
+        assert!(!resolve_app_id("").is_empty());
+        assert!(!resolve_app_id("   ").is_empty());
+    }
 }
 
 fn worker(app_id: String, rx: Receiver<Cmd>) {

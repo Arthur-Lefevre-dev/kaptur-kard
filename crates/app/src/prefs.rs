@@ -53,9 +53,12 @@ pub struct UiPrefs {
     /// Show **KapturKard** on Discord Rich Presence.
     #[serde(default = "default_true")]
     pub discord_presence: bool,
-    /// Discord Developer Portal Application ID (public). Empty → env KAPTURKARD_DISCORD_APP_ID.
+    /// Discord Developer Portal Application ID (public). Empty → env / built-in default.
     #[serde(default)]
     pub discord_app_id: String,
+    /// tracing filter level: error | warn | info | debug | trace (RUST_LOG overrides when set).
+    #[serde(default = "default_log_level")]
+    pub log_level: String,
     #[serde(default)]
     pub metrics_pinned: bool,
     #[serde(default)]
@@ -107,6 +110,10 @@ fn default_true() -> bool {
     true
 }
 
+fn default_log_level() -> String {
+    "info".into()
+}
+
 fn default_color_range() -> String {
     "auto".into()
 }
@@ -129,6 +136,7 @@ impl Default for UiPrefs {
             vsync_mode: default_vsync(),
             discord_presence: true,
             discord_app_id: String::new(),
+            log_level: default_log_level(),
             metrics_pinned: false,
             settings_pinned: false,
             last_device_id: String::new(),
@@ -172,21 +180,37 @@ impl UiPrefs {
     }
 }
 
-fn captureview_dir() -> Option<PathBuf> {
-    let base = std::env::var_os("APPDATA")?;
+/// `%APPDATA%\CaptureView` (prefs + logs). Falls back to None off Windows / missing env.
+pub fn app_data_dir() -> Option<PathBuf> {
+    let base = std::env::var_os("APPDATA").or_else(|| {
+        // Non-Windows: keep a predictable local folder for tests / Linux.
+        std::env::var_os("XDG_CONFIG_HOME").or_else(|| {
+            let home = std::env::var_os("HOME")?;
+            let mut p = PathBuf::from(home);
+            p.push(".config");
+            Some(p.into_os_string())
+        })
+    })?;
     let mut p = PathBuf::from(base);
     p.push("CaptureView");
     Some(p)
 }
 
+/// `%APPDATA%\CaptureView\logs`
+pub fn logs_dir() -> Option<PathBuf> {
+    let mut p = app_data_dir()?;
+    p.push("logs");
+    Some(p)
+}
+
 fn audio_path() -> Option<PathBuf> {
-    let mut p = captureview_dir()?;
+    let mut p = app_data_dir()?;
     p.push("audio.toml");
     Some(p)
 }
 
 fn ui_path() -> Option<PathBuf> {
-    let mut p = captureview_dir()?;
+    let mut p = app_data_dir()?;
     p.push("ui.toml");
     Some(p)
 }

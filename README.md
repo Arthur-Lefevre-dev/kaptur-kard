@@ -36,6 +36,17 @@ cargo build --release -p captureview
 cargo test --workspace
 ```
 
+## Logs
+
+CaptureView writes **tracing** logs to stderr and to a daily rotating file:
+
+`%APPDATA%\CaptureView\logs\captureview.YYYY-MM-DD.log`
+
+- Default level: **info** (Infos tab can change it; persisted in `ui.toml`).
+- Override with `RUST_LOG` (e.g. `RUST_LOG=debug`).
+- **Copy report for support** includes the log path and a tail of the file.
+- Older files are pruned (keeps ~14 days).
+
 ### Linux
 
 ```bash
