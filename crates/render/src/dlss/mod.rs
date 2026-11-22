@@ -1,12 +1,13 @@
-//! DLSS 5 Neural Rendering (NGX feature 18 / `nvngx_dlssnr.dll`).
+//! NVIDIA RTX path: DLSS 5 Neural Rendering + optional DLSS-G Frame Generation.
 //!
-//! Mode C enhances video frames via a MIT-licensed D3D12 bridge adapted from
-//! ComfyUI-DLSS5-NR / obs-dlss5-nr (CPU staging path). The proprietary
-//! `nvngx_dlssnr.dll` is **not** vendored — see `docs/DLSS.md`.
+//! Architecture (public NeuralScreen TECHNICAL.md ideas, **not** their PolyForm
+//! source): capture → (optional Boost) NR feature 18 → optional DLSS-G FG.
+//! AMD hosts keep FSR1/NIS + optical interpolate; Mode C / FG refuse cleanly.
 //!
-//! Default builds compile a stub. Enable `--features dlss` to load the native
-//! bridge and evaluate NR when runtime + RTX GPU allow it.
+//! Proprietary `nvngx_dlssnr.dll` / `nvngx_dlssg.dll` are **BYO** — never vendored.
+//! See `docs/DLSS.md`.
 
+mod fg;
 mod probe;
 mod readback;
 
@@ -45,12 +46,24 @@ mod nr_ffi {
     }
 }
 
+pub use fg::{DlssGAvailability, DlssGEngine, DlssGMultiplier, DlssGStatus};
 pub use probe::{nvidia_vendor, DlssAvailability, DlssEngine, DlssStatus};
 pub use readback::{enhance_rgba8_with_nr, read_texture_rgba8, write_rgba8_texture};
 
-/// Documented Streamline release for classic SR docs (Mode C NR uses NGX feature 18).
+/// Preferred wgpu backends when the `dlss` feature is enabled (DX12 first).
+pub fn preferred_backends() -> wgpu::Backends {
+    #[cfg(feature = "dlss")]
+    {
+        // NeuralScreen / obs-dlss5-nr host NGX on D3D12; prefer DX12 for CaptureView too.
+        wgpu::Backends::DX12 | wgpu::Backends::VULKAN
+    }
+    #[cfg(not(feature = "dlss"))]
+    {
+        wgpu::Backends::PRIMARY
+    }
+}
+
 pub const STREAMLINE_DOC_VERSION: &str = "2.14.16";
 
-/// Public note for UI / docs.
 pub const DLSS_MARKETING_NOTE: &str =
-    "DLSS 5 Neural Rendering = NGX feature 18 (nvngx_dlssnr.dll); officially RTX 50-series.";
+    "DLSS 5 NR = NGX feature 18 (nvngx_dlssnr.dll); optional FG = nvngx_dlssg.dll; BYO DLLs; RTX path kept for future users.";

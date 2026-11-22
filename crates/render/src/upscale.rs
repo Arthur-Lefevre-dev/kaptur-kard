@@ -167,7 +167,7 @@ pub struct UpscaleEngine {
     cached_present_bg: Option<(u64, wgpu::BindGroup)>,
     /// Rate-limit "RCAS/NIS ran" tracing to ~1 Hz while Mode A/B is active.
     last_sharpen_log: Instant,
-    dlss: DlssEngine,
+    pub dlss: DlssEngine,
 }
 
 impl UpscaleEngine {

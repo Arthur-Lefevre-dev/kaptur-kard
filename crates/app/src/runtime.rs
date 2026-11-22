@@ -23,7 +23,7 @@ use render::pipeline::VideoPipeline;
 use render::upload::upload_frame;
 use render::{
     is_native_or_downscale, resolve_color_convert, ColorMatrixMode, ColorRangeMode,
-    DeinterlaceEngine, DeinterlaceMode, InterpBlockReason, InterpMode,
+    DeinterlaceEngine, DeinterlaceMode, DlssGMultiplier, InterpBlockReason, InterpMode,
     InterpolateEngine, UpscaleBlockReason, UpscaleEngine, UpscaleMode,
 };
 use winit::application::ApplicationHandler;
@@ -395,6 +395,8 @@ impl Default for App {
                 deinterlace_mode: ui_prefs.deinterlace_mode.clone(),
                 source_interlaced: format.interlaced,
                 vsync_mode: normalize_vsync_mode(&ui_prefs.vsync_mode),
+                dlss_boost: ui_prefs.dlss_boost,
+                dlssg_multiplier: ui_prefs.dlssg_multiplier.clone(),
                 ..EffectsUiState::default()
             },
             color_ui,
@@ -453,6 +455,10 @@ impl ApplicationHandler for App {
         gpu.upscale
             .set_mode(UpscaleMode::from_str_lossy(&self.effects_ui.mode));
         gpu.upscale.set_sharpness(self.effects_ui.sharpness);
+        gpu.upscale.dlss.set_boost(self.effects_ui.dlss_boost);
+        gpu.upscale.dlss.set_fg_multiplier(DlssGMultiplier::from_str_lossy(
+            &self.effects_ui.dlssg_multiplier,
+        ));
         gpu.interpolate
             .set_mode(InterpMode::from_str_lossy(&self.effects_ui.interp_mode));
         gpu.deinterlace
@@ -1254,6 +1260,24 @@ impl App {
             }
             self.persist_ui_prefs();
         }
+        if let Some(boost) = actions.dlss_boost_changed {
+            self.effects_ui.dlss_boost = boost;
+            self.ui_prefs.dlss_boost = boost;
+            if let Some(gpu) = self.gpu.as_mut() {
+                gpu.upscale.dlss.set_boost(boost);
+            }
+            self.persist_ui_prefs();
+        }
+        if let Some(m) = actions.dlssg_multiplier {
+            self.effects_ui.dlssg_multiplier = m.to_string();
+            self.ui_prefs.dlssg_multiplier = m.to_string();
+            if let Some(gpu) = self.gpu.as_mut() {
+                gpu.upscale
+                    .dlss
+                    .set_fg_multiplier(DlssGMultiplier::from_str_lossy(m));
+            }
+            self.persist_ui_prefs();
+        }
         if let Some(mode) = actions.interp_mode {
             self.effects_ui.interp_mode = mode.to_string();
             self.ui_prefs.interp_mode = mode.to_string();
@@ -1342,6 +1366,8 @@ impl App {
         self.ui_prefs.wizard_step = self.chrome.wizard_step;
         self.ui_prefs.upscale_mode = self.effects_ui.mode.clone();
         self.ui_prefs.sharpness = self.effects_ui.sharpness;
+        self.ui_prefs.dlss_boost = self.effects_ui.dlss_boost;
+        self.ui_prefs.dlssg_multiplier = self.effects_ui.dlssg_multiplier.clone();
         self.ui_prefs.interp_mode = self.effects_ui.interp_mode.clone();
         self.ui_prefs.deinterlace_mode = self.effects_ui.deinterlace_mode.clone();
         self.ui_prefs.vsync_mode = normalize_vsync_mode(&self.effects_ui.vsync_mode);
@@ -1366,6 +1392,8 @@ impl App {
             self.ui_prefs.wizard_step = self.chrome.wizard_step;
             self.ui_prefs.upscale_mode = self.effects_ui.mode.clone();
             self.ui_prefs.sharpness = self.effects_ui.sharpness;
+            self.ui_prefs.dlss_boost = self.effects_ui.dlss_boost;
+            self.ui_prefs.dlssg_multiplier = self.effects_ui.dlssg_multiplier.clone();
             self.ui_prefs.interp_mode = self.effects_ui.interp_mode.clone();
             self.ui_prefs.deinterlace_mode = self.effects_ui.deinterlace_mode.clone();
             self.ui_prefs.vsync_mode = normalize_vsync_mode(&self.effects_ui.vsync_mode);
@@ -1406,6 +1434,10 @@ impl App {
             self.effects_ui.dlss_ok = st.dlss.availability.can_evaluate();
             self.effects_ui.dlss_reason_key = st.dlss.availability.as_reason_key().into();
             self.effects_ui.dlss_fallback_nis = !st.dlss_nr_active && st.mode.as_str() == "dlss";
+            self.effects_ui.dlss_boost = st.dlss.boost;
+            self.effects_ui.dlssg_ok = st.dlss.fg.availability.can_evaluate();
+            self.effects_ui.dlssg_reason_key = st.dlss.fg.availability.as_reason_key().into();
+            self.effects_ui.dlssg_multiplier = st.dlss.fg.multiplier.as_str().into();
             let ist = gpu.interpolate.status();
             self.effects_ui.interp_mode = ist.mode.as_str().into();
             self.effects_ui.interp_compute_ok = ist.compute_ok;
@@ -2110,8 +2142,10 @@ fn approx_black(frame: &VideoFrame) -> bool {
 }
 
 async fn init_gpu(window: Arc<Window>) -> anyhow::Result<GpuState> {
+    // With --features dlss prefer DX12 (NGX NR/FG host); else PRIMARY (DX12/VK/GL).
+    let backends = render::preferred_backends();
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::PRIMARY,
+        backends,
         ..Default::default()
     });
     let surface = instance.create_surface(window.clone())?;
@@ -2130,11 +2164,12 @@ async fn init_gpu(window: Arc<Window>) -> anyhow::Result<GpuState> {
         gpu = %adapter_name,
         backend = ?backend,
         vendor = adapter_info.vendor,
-        "GPU adapter selected (DX12/Vulkan preferred; GL is a fallback path)"
+        ?backends,
+        "GPU adapter selected (DLSS builds prefer DX12; AMD still uses FSR/NIS + optical FG)"
     );
     if matches!(backend, wgpu::Backend::Gl) {
         tracing::warn!(
-            "running on OpenGL — FSR/NIS compute may be limited; prefer DX12 or Vulkan"
+            "running on OpenGL — FSR/NIS compute may be limited; DLSS NR/FG need DX12"
         );
     }
 

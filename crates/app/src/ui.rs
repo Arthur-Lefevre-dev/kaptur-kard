@@ -234,6 +234,8 @@ pub struct UiActions {
     pub lag_test_stop: bool,
     pub upscale_mode: Option<&'static str>,
     pub sharpness_changed: Option<f32>,
+    pub dlss_boost_changed: Option<bool>,
+    pub dlssg_multiplier: Option<&'static str>,
     pub interp_mode: Option<&'static str>,
     pub deinterlace_mode: Option<&'static str>,
     /// None = unchanged; Some(0)=Auto, Some(9999)=unlimited, else Hz cap.
@@ -267,12 +269,17 @@ pub struct EffectsUiState {
     pub deinterlace_active: bool,
     /// auto | on | off
     pub vsync_mode: String,
-    /// Mode C — DLSS available for native evaluate (rare until DXGI hook).
+    /// Mode C — DLSS 5 NR ready.
     pub dlss_ok: bool,
-    /// i18n key explaining why Mode C falls back / is limited.
+    /// i18n key explaining why Mode C is limited.
     pub dlss_reason_key: String,
-    /// Mode C selected but running NIS fallback.
+    /// Mode C selected but NR not running (pass-through).
     pub dlss_fallback_nis: bool,
+    /// Boost (half-res NR + composite).
+    pub dlss_boost: bool,
+    pub dlssg_ok: bool,
+    pub dlssg_reason_key: String,
+    pub dlssg_multiplier: String,
 }
 
 impl Default for EffectsUiState {
@@ -297,6 +304,10 @@ impl Default for EffectsUiState {
             dlss_ok: false,
             dlss_reason_key: String::new(),
             dlss_fallback_nis: false,
+            dlss_boost: true,
+            dlssg_ok: false,
+            dlssg_reason_key: String::new(),
+            dlssg_multiplier: "off".into(),
         }
     }
 }
@@ -988,7 +999,19 @@ fn draw_effects_tab(ui: &mut egui::Ui, input: &DrawInput<'_>, actions: &mut UiAc
     if fx.mode == "dlss" {
         ui.label(RichText::new(i18n.t("tip_dlss")).small().italics());
         if fx.dlss_ok {
-            ui.small(format!("{}: {}", i18n.t("label_dlss_status"), i18n.t("effect_reason_dlss_active")));
+            ui.small(format!(
+                "{}: {}",
+                i18n.t("label_dlss_status"),
+                i18n.t("effect_reason_dlss_active")
+            ));
+            let mut boost = fx.dlss_boost;
+            if ui
+                .checkbox(&mut boost, i18n.t("label_dlss_boost"))
+                .changed()
+            {
+                actions.dlss_boost_changed = Some(boost);
+            }
+            ui.label(RichText::new(i18n.t("tip_dlss_boost")).small().italics());
         } else {
             let key = if fx.dlss_reason_key.is_empty() {
                 "effect_reason_dlss_fallback"
@@ -1060,6 +1083,36 @@ fn draw_effects_tab(ui: &mut egui::Ui, input: &DrawInput<'_>, actions: &mut UiAc
     }
     ui.label(RichText::new(i18n.t("tip_interp")).small().italics());
     ui.label(RichText::new(i18n.t("explain_interp")).small());
+
+    ui.add_space(10.0);
+    ui.separator();
+    ui.label(RichText::new(i18n.t("label_dlssg")).strong());
+    ui.label(RichText::new(i18n.t("tip_dlssg")).small().italics());
+    ui.horizontal(|ui| {
+        for (id, key) in [
+            ("off", "effect_dlssg_off"),
+            ("x2", "effect_dlssg_x2"),
+            ("x3", "effect_dlssg_x3"),
+            ("x4", "effect_dlssg_x4"),
+        ] {
+            let selected = fx.dlssg_multiplier == id;
+            if ui.selectable_label(selected, i18n.t(key)).clicked() {
+                actions.dlssg_multiplier = Some(id);
+            }
+        }
+    });
+    {
+        let key = if fx.dlssg_reason_key.is_empty() {
+            if fx.dlssg_ok {
+                "effect_reason_dlssg_active"
+            } else {
+                "effect_reason_dlssg_pending"
+            }
+        } else {
+            fx.dlssg_reason_key.as_str()
+        };
+        ui.small(format!("{}: {}", i18n.t("label_dlssg_status"), i18n.t(key)));
+    }
 
     ui.add_space(10.0);
     ui.label(RichText::new(i18n.t("label_display_fps_limit")).strong());
