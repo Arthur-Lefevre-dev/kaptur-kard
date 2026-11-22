@@ -79,8 +79,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let gx = luma(cx1) - luma(cx0);
     let gy = luma(cy1) - luma(cy0);
     let edge = clamp(length(vec2<f32>(gx, gy)) * 4.0, 0.0, 1.0);
-    // Softened USM: max sharpness stays useful without ringing at 1.0.
-    let usm = (c0 - scaled) * (sharp * (0.35 + 0.45 * edge) * detect);
+    // Stronger USM so Mode B Netteté 0.7–1 is clearly visible vs Off (Arthur A/B).
+    let usm = (c0 - scaled) * (sharp * (0.65 + 0.85 * edge) * detect);
 
     // Upscale: scaled + USM. Native sharpen: c0 + USM (base stays sharp).
     let base = select(scaled, c0, native);

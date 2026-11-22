@@ -3,6 +3,8 @@
 //! Runs after color conversion, before present. Textures are reused across frames.
 //! Shader ports: see `licenses/AMD-FSR1-MIT.txt` and `licenses/NVIDIA-NIS-MIT.txt`.
 
+use std::time::Instant;
+
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
@@ -143,6 +145,8 @@ pub struct UpscaleEngine {
     rgba_src: Option<TexSlot>,
     mid: Option<TexSlot>,
     rgba_dst: Option<TexSlot>,
+    /// Rate-limit "RCAS/NIS ran" tracing to ~1 Hz while Mode A/B is active.
+    last_sharpen_log: Instant,
 }
 
 impl UpscaleEngine {
@@ -463,6 +467,7 @@ impl UpscaleEngine {
             rgba_src: None,
             mid: None,
             rgba_dst: None,
+            last_sharpen_log: Instant::now() - std::time::Duration::from_secs(2),
         }
     }
 
@@ -543,17 +548,14 @@ impl UpscaleEngine {
         ensure_tex(device, &mut self.mid, out_w, out_h, "upscale-mid", true);
         ensure_tex(device, &mut self.rgba_dst, out_w, out_h, "upscale-dst", true);
 
-        let src = self.rgba_src.as_ref().unwrap();
-        let mid = self.mid.as_ref().unwrap();
-        let dst = self.rgba_dst.as_ref().unwrap();
-
         // Identity letterbox into rgba_src (full UV content).
         video.write_identity_params(queue);
         {
+            let src_view = &self.rgba_src.as_ref().unwrap().view;
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("upscale-convert"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &src.view,
+                    view: src_view,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -564,11 +566,6 @@ impl UpscaleEngine {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            // Bind groups layouts match between convert and video for the shared fullscreen shader,
-            // but convert has its own BGL — rebuild a bind group from video textures each time would
-            // allocate. Instead we render using the video pipeline's draw into convert target:
-            // VideoPipeline.draw uses its own pipeline (surface format). So we must use convert_pipeline
-            // with a bind group that mirrors video's.
             let convert_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("convert-bg"),
                 layout: &self.convert_bgl,
@@ -580,28 +577,18 @@ impl UpscaleEngine {
             let _ = src_bg;
         }
 
+        let sample = self.rgba_src.as_ref().unwrap().view.clone();
         match self.mode {
             UpscaleMode::Fsr1 => {
-                self.dispatch_fsr(
-                    device,
-                    queue,
-                    encoder,
-                    &src.view,
-                    mid,
-                    dst,
-                    cw,
-                    ch,
-                    out_w,
-                    out_h,
-                );
+                self.dispatch_fsr(device, queue, encoder, &sample, cw, ch, out_w, out_h);
             }
             UpscaleMode::Nis => {
-                self.dispatch_nis(device, queue, encoder, &src.view, dst, cw, ch, out_w, out_h);
+                self.dispatch_nis(device, queue, encoder, &sample, cw, ch, out_w, out_h);
             }
             UpscaleMode::Off => return false,
         }
 
-        self.present_dst(device, queue, encoder, dst, out_w, out_h, surface_view, view_w, view_h, clear);
+        self.present_dst(device, queue, encoder, out_w, out_h, surface_view, view_w, view_h, clear);
         true
     }
 
@@ -631,28 +618,22 @@ impl UpscaleEngine {
         ensure_tex(device, &mut self.rgba_dst, out_w, out_h, "upscale-dst", true);
 
         let blit_ok = self.dispatch_blit(device, queue, encoder, src_view, src_w, src_h);
-        let sample_view = if blit_ok {
-            &self.rgba_src.as_ref().unwrap().view
+        let sample = if blit_ok {
+            self.rgba_src.as_ref().unwrap().view.clone()
         } else {
-            src_view
+            src_view.clone()
         };
-        let mid = self.mid.as_ref().unwrap();
-        let dst = self.rgba_dst.as_ref().unwrap();
 
         match self.mode {
             UpscaleMode::Fsr1 => {
-                self.dispatch_fsr(
-                    device, queue, encoder, sample_view, mid, dst, src_w, src_h, out_w, out_h,
-                );
+                self.dispatch_fsr(device, queue, encoder, &sample, src_w, src_h, out_w, out_h);
             }
             UpscaleMode::Nis => {
-                self.dispatch_nis(
-                    device, queue, encoder, sample_view, dst, src_w, src_h, out_w, out_h,
-                );
+                self.dispatch_nis(device, queue, encoder, &sample, src_w, src_h, out_w, out_h);
             }
             UpscaleMode::Off => return false,
         }
-        self.present_dst(device, queue, encoder, dst, out_w, out_h, surface_view, view_w, view_h, clear);
+        self.present_dst(device, queue, encoder, out_w, out_h, surface_view, view_w, view_h, clear);
         true
     }
 
@@ -709,12 +690,12 @@ impl UpscaleEngine {
         true
     }
 
+    /// Present the sharpened `rgba_dst` (never the pre-RCAS/NIS source).
     fn present_dst(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
-        dst: &TexSlot,
         out_w: u32,
         out_h: u32,
         surface_view: &wgpu::TextureView,
@@ -722,6 +703,9 @@ impl UpscaleEngine {
         view_h: u32,
         clear: wgpu::Color,
     ) {
+        let Some(dst) = self.rgba_dst.as_ref() else {
+            return;
+        };
         let LetterboxUniforms { scale_offset } = compute_letterbox(out_w, out_h, view_w, view_h);
         queue.write_buffer(
             &self.present_buf,
@@ -794,31 +778,29 @@ impl UpscaleEngine {
     }
 
     fn dispatch_fsr(
-        &self,
+        &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         src_view: &wgpu::TextureView,
-        mid: &TexSlot,
-        dst: &TexSlot,
         in_w: u32,
         in_h: u32,
         out_w: u32,
         out_h: u32,
     ) {
-        let Some(rcas) = self.rcas_pipeline.as_ref() else {
+        if self.rcas_pipeline.is_none() {
+            tracing::warn!("FSR Mode A selected but RCAS pipeline missing");
             return;
-        };
+        }
         let sharpen_only = in_w == out_w && in_h == out_h;
-        let rcas_src = if sharpen_only {
-            // 1:1: skip EASU, RCAS sharpens the source directly.
-            src_view
-        } else {
-            let Some(easu) = self.easu_pipeline.as_ref() else {
+        if !sharpen_only {
+            if self.easu_pipeline.is_none() {
+                tracing::warn!("FSR upscale needs EASU but pipeline missing");
                 return;
-            };
+            }
             let con = easu_constants(in_w, in_h, out_w, out_h);
             queue.write_buffer(&self.easu_buf, 0, bytemuck::bytes_of(&con));
+            let mid_view = &self.mid.as_ref().unwrap().view;
             let easu_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("easu-bg"),
                 layout: &self.easu_bgl,
@@ -833,7 +815,7 @@ impl UpscaleEngine {
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
-                        resource: wgpu::BindingResource::TextureView(&mid.view),
+                        resource: wgpu::BindingResource::TextureView(mid_view),
                     },
                     wgpu::BindGroupEntry {
                         binding: 3,
@@ -846,32 +828,40 @@ impl UpscaleEngine {
                     label: Some("easu"),
                     timestamp_writes: None,
                 });
-                cpass.set_pipeline(easu);
+                cpass.set_pipeline(self.easu_pipeline.as_ref().unwrap());
                 cpass.set_bind_group(0, &easu_bg, &[]);
                 cpass.dispatch_workgroups((out_w + 7) / 8, (out_h + 7) / 8, 1);
             }
-            &mid.view
-        };
+        }
 
         // UI 0=soft … 1=sharp → AMD RCAS stops (0=sharpest). Map into ~0..2 stops.
-        // con = exp2(-stops); lobe *= con (lobe ≤ 0) so larger con = stronger sharpen.
+        // con.x = exp2(-stops); con.y = CaptureView gain (≥1) for visible A/B.
         let stops = (1.0 - self.sharpness) * 2.0;
+        let con_x = (-stops).exp2();
+        let gain = 1.0 + self.sharpness * self.sharpness * 0.85;
         let rcas_con = RcasGpu {
-            con: [(-stops).exp2(), 0.0, 0.0, 0.0],
+            con: [con_x, gain, 0.0, 0.0],
             size: [out_w as f32, out_h as f32, 0.0, 0.0],
         };
         queue.write_buffer(&self.rcas_buf, 0, bytemuck::bytes_of(&rcas_con));
+
+        let rcas_src = if sharpen_only {
+            src_view.clone()
+        } else {
+            self.mid.as_ref().unwrap().view.clone()
+        };
+        let dst_view = self.rgba_dst.as_ref().unwrap().view.clone();
         let rcas_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("rcas-bg"),
             layout: &self.rcas_bgl,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::TextureView(rcas_src),
+                    resource: wgpu::BindingResource::TextureView(&rcas_src),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&dst.view),
+                    resource: wgpu::BindingResource::TextureView(&dst_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
@@ -884,38 +874,57 @@ impl UpscaleEngine {
                 label: Some("rcas"),
                 timestamp_writes: None,
             });
-            cpass.set_pipeline(rcas);
+            cpass.set_pipeline(self.rcas_pipeline.as_ref().unwrap());
             cpass.set_bind_group(0, &rcas_bg, &[]);
             cpass.dispatch_workgroups((out_w + 7) / 8, (out_h + 7) / 8, 1);
+        }
+        // Present always samples rgba_dst (RCAS output) — never the pre-sharpen src.
+        if self.last_sharpen_log.elapsed().as_secs_f32() >= 1.0 {
+            self.last_sharpen_log = Instant::now();
+            tracing::info!(
+                mode = "fsr1",
+                sharpness = self.sharpness,
+                con = con_x,
+                gain,
+                sharpen_only,
+                in_w,
+                in_h,
+                out_w,
+                out_h,
+                "RCAS dispatched → present dst"
+            );
         }
     }
 
     fn dispatch_nis(
-        &self,
+        &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         src_view: &wgpu::TextureView,
-        dst: &TexSlot,
         in_w: u32,
         in_h: u32,
         out_w: u32,
         out_h: u32,
     ) {
-        let Some(nis) = self.nis_pipeline.as_ref() else {
+        if self.nis_pipeline.is_none() {
+            tracing::warn!("NIS Mode B selected but pipeline missing");
             return;
-        };
+        }
+        // Curve sharpness so 0.7–1 is clearly stronger than Off on soft captures.
+        let sharp = (self.sharpness * self.sharpness * 0.35 + self.sharpness * 0.9).min(1.25);
         let params = NisGpu {
             scale: [
                 in_w as f32 / out_w as f32,
                 in_h as f32 / out_h as f32,
-                self.sharpness,
+                sharp,
                 1.0,
             ],
             src_norm: [1.0 / in_w as f32, 1.0 / in_h as f32, 0.0, 0.0],
             dst_size: [out_w as f32, out_h as f32, 0.0, 0.0],
         };
         queue.write_buffer(&self.nis_buf, 0, bytemuck::bytes_of(&params));
+        let dst_view = self.rgba_dst.as_ref().unwrap().view.clone();
         let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("nis-bg"),
             layout: &self.nis_bgl,
@@ -930,7 +939,7 @@ impl UpscaleEngine {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&dst.view),
+                    resource: wgpu::BindingResource::TextureView(&dst_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
@@ -943,9 +952,22 @@ impl UpscaleEngine {
                 label: Some("nis"),
                 timestamp_writes: None,
             });
-            cpass.set_pipeline(nis);
+            cpass.set_pipeline(self.nis_pipeline.as_ref().unwrap());
             cpass.set_bind_group(0, &bg, &[]);
             cpass.dispatch_workgroups((out_w + 7) / 8, (out_h + 7) / 8, 1);
+        }
+        if self.last_sharpen_log.elapsed().as_secs_f32() >= 1.0 {
+            self.last_sharpen_log = Instant::now();
+            tracing::info!(
+                mode = "nis",
+                sharpness = self.sharpness,
+                sharp_param = sharp,
+                in_w,
+                in_h,
+                out_w,
+                out_h,
+                "NIS dispatched → present dst"
+            );
         }
     }
 
@@ -1161,6 +1183,15 @@ mod tests {
         assert!((con(1.0) - 1.0).abs() < 1e-5);
         assert!(con(1.0) > con(0.5));
         assert!(con(0.5) > con(0.0));
+    }
+
+    #[test]
+    fn rcas_gain_ramps_with_sharpness() {
+        // CaptureView gain makes Netteté 0.7–1 visibly stronger than mid.
+        let gain = |s: f32| 1.0 + s * s * 0.85;
+        assert!((gain(0.0) - 1.0).abs() < 1e-5);
+        assert!(gain(1.0) > gain(0.7));
+        assert!(gain(0.7) > gain(0.4));
     }
 
     #[test]

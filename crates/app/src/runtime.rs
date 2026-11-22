@@ -171,6 +171,7 @@ pub struct App {
     device_settings: HashMap<String, FormatDesc>,
     discord: DiscordPresence,
     last_discord_push: Instant,
+    logo_tex: Option<egui::TextureHandle>,
 }
 
 impl Default for App {
@@ -393,6 +394,7 @@ impl Default for App {
             last_discord_push: Instant::now()
                 .checked_sub(Duration::from_secs(60))
                 .unwrap_or_else(Instant::now),
+            logo_tex: None,
         }
     }
 }
@@ -403,13 +405,15 @@ impl ApplicationHandler for App {
             return;
         }
 
+        let mut attrs = Window::default_attributes()
+            .with_title(self.i18n.t("app_title"))
+            .with_inner_size(LogicalSize::new(1280.0, 720.0));
+        if let Some(icon) = crate::brand::window_icon() {
+            attrs = attrs.with_window_icon(Some(icon));
+        }
         let window = Arc::new(
             event_loop
-                .create_window(
-                    Window::default_attributes()
-                        .with_title(self.i18n.t("app_title"))
-                        .with_inner_size(LogicalSize::new(1280.0, 720.0)),
-                )
+                .create_window(attrs)
                 .expect("create window"),
         );
 
@@ -1669,6 +1673,7 @@ impl App {
             .create_view(&wgpu::TextureViewDescriptor::default());
 
         let raw_input = gpu.egui_state.take_egui_input(&gpu.window);
+        let logo = crate::brand::ensure_logo_texture(&gpu.egui_ctx, &mut self.logo_tex);
         let full_output = gpu.egui_ctx.run(raw_input, |ctx| {
             actions = ui::draw_ui(
                 ctx,
@@ -1684,6 +1689,7 @@ impl App {
                     chrome: &chrome,
                     effects: &effects,
                     color: &color,
+                    logo: logo.clone(),
                 },
             );
         });

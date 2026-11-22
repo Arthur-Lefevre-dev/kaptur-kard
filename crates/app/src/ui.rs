@@ -324,6 +324,7 @@ pub struct DrawInput<'a> {
     pub chrome: &'a UiChrome,
     pub effects: &'a EffectsUiState,
     pub color: &'a ColorUiState,
+    pub logo: Option<egui::TextureHandle>,
 }
 
 pub fn draw_ui(ctx: &Context, input: DrawInput<'_>) -> UiActions {
@@ -365,7 +366,17 @@ pub fn draw_ui(ctx: &Context, input: DrawInput<'_>) -> UiActions {
     });
 
     if input.chrome.wizard_open {
-        draw_wizard(ctx, i18n, input.devices, input.selection, input.outputs, input.audio, input.chrome, &mut actions);
+        draw_wizard(
+            ctx,
+            i18n,
+            input.devices,
+            input.selection,
+            input.outputs,
+            input.audio,
+            input.chrome,
+            &mut actions,
+            input.logo.as_ref(),
+        );
         return actions;
     }
 
@@ -1110,6 +1121,7 @@ fn draw_effects_tab(ui: &mut egui::Ui, input: &DrawInput<'_>, actions: &mut UiAc
 fn draw_info_tab(ui: &mut egui::Ui, input: &DrawInput<'_>, actions: &mut UiActions) {
     let i18n = input.i18n;
     let o = input.overlay;
+    draw_brand_header(ui, input.logo.as_ref(), i18n);
     ui.label(RichText::new(i18n.t("metrics_disclaimer")).small().weak());
     ui.add_space(4.0);
     draw_metrics_body(ui, i18n, o, true);
@@ -1343,6 +1355,22 @@ fn draw_metrics_body(ui: &mut egui::Ui, i18n: &I18n, o: &OverlayState, detailed:
     }
 }
 
+fn draw_brand_header(
+    ui: &mut egui::Ui,
+    logo: Option<&egui::TextureHandle>,
+    i18n: &I18n,
+) {
+    ui.horizontal(|ui| {
+        if let Some(tex) = logo {
+            ui.add(egui::Image::new(tex).fit_to_exact_size(egui::vec2(40.0, 40.0)));
+        }
+        ui.vertical(|ui| {
+            ui.label(RichText::new(i18n.t("app_title")).strong().size(18.0));
+        });
+    });
+    ui.add_space(6.0);
+}
+
 fn draw_wizard(
     ctx: &Context,
     i18n: &I18n,
@@ -1352,6 +1380,7 @@ fn draw_wizard(
     audio: &AudioUiState,
     chrome: &UiChrome,
     actions: &mut UiActions,
+    logo: Option<&egui::TextureHandle>,
 ) {
     let title = if chrome.source_only {
         i18n.t("wizard_source_title")
@@ -1363,6 +1392,7 @@ fn draw_wizard(
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .resizable(false)
         .show(ctx, |ui| {
+            draw_brand_header(ui, logo, i18n);
             let step = if chrome.source_only {
                 0
             } else {
