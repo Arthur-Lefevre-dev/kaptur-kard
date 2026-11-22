@@ -506,30 +506,21 @@ impl ApplicationHandler for App {
         // (Arthur saw 240 FPS écran with limit 120 when pending woke every tick).
         let period = Duration::from_secs_f64(1.0 / self.target_display_hz());
         let elapsed = self.last_redraw_at.elapsed();
-        let has_pending = self
-            .source
-            .as_ref()
-            .map(|s| !s.receiver().is_empty())
-            .unwrap_or(false);
         let due = elapsed >= period;
         if due {
             if let Some(gpu) = self.gpu.as_ref() {
                 gpu.window.request_redraw();
             }
+            // Park until RedrawRequested runs. A 1ms WaitUntil here busy-looped
+            // under NoVsync (Arthur: FPS écran ~101, CPU ~82%, 1% low ~31).
+            event_loop.set_control_flow(ControlFlow::Wait);
+            return;
         }
-        // If a capture frame is waiting, wake exactly when the cap allows so we
-        // present it on the next legal tick instead of drifting into a coalesce.
-        let wait = if has_pending && !due {
-            period
-                .saturating_sub(elapsed)
-                .max(Duration::from_micros(200))
-                .min(Duration::from_millis(33))
-        } else {
-            period
-                .saturating_sub(elapsed)
-                .max(Duration::from_millis(1))
-                .min(Duration::from_millis(33))
-        };
+        // Wake when the next present is legal under the FPS cap.
+        let wait = period
+            .saturating_sub(elapsed)
+            .max(Duration::from_micros(200))
+            .min(Duration::from_millis(33));
         event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + wait));
     }
 }
@@ -1385,6 +1376,11 @@ impl App {
     }
 
     fn redraw(&mut self) {
+        let period = Duration::from_secs_f64(1.0 / self.target_display_hz());
+        // Hard drop surplus RedrawRequested (egui may queue many under NoVsync).
+        if self.last_redraw_at.elapsed() + Duration::from_micros(500) < period {
+            return;
+        }
         self.last_redraw_at = Instant::now();
         // Drain frames before borrowing GPU exclusively for UI state updates.
         let mut latest: Option<VideoFrame> = None;
@@ -1555,6 +1551,8 @@ impl App {
         // Video presents every tick; egui widgets only draw when chrome/overlay is active.
 
         let mut actions = ui::UiActions::default();
+        let display_period =
+            Duration::from_secs_f64(1.0 / self.target_display_hz());
         {
         let Some(gpu) = self.gpu.as_mut() else {
             return;
@@ -1618,6 +1616,9 @@ impl App {
         });
         gpu.egui_state
             .handle_platform_output(&gpu.window, full_output.platform_output);
+        // Steer egui away from immediate repaint storms under NoVsync; about_to_wait
+        // is the source of truth for the next present.
+        gpu.egui_ctx.request_repaint_after(display_period);
 
         let tris = gpu
             .egui_ctx
