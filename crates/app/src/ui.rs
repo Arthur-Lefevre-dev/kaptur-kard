@@ -240,6 +240,8 @@ pub struct UiActions {
     pub dlss_boost_changed: Option<bool>,
     pub dlssg_multiplier: Option<&'static str>,
     pub interp_mode: Option<&'static str>,
+    /// None = unchanged; Some(0..=1) Mid motion blur intensity.
+    pub interp_motion_blur_changed: Option<f32>,
     pub deinterlace_mode: Option<&'static str>,
     /// None = unchanged; Some(0)=Auto, Some(9999)=unlimited, else Hz cap.
     pub display_fps_limit: Option<u32>,
@@ -271,6 +273,8 @@ pub struct EffectsUiState {
     pub interp_compute_ok: bool,
     pub interp_auto_disabled: bool,
     pub interp_delay_ms: f32,
+    /// Mid motion blur intensity when framegen is on (0 = off … 1 = strong).
+    pub interp_motion_blur: f32,
     pub deinterlace_mode: String,
     pub source_interlaced: bool,
     pub deinterlace_active: bool,
@@ -304,6 +308,7 @@ impl Default for EffectsUiState {
             interp_compute_ok: true,
             interp_auto_disabled: false,
             interp_delay_ms: 0.0,
+            interp_motion_blur: 0.0,
             deinterlace_mode: "auto".into(),
             source_interlaced: false,
             deinterlace_active: false,
@@ -1122,6 +1127,29 @@ fn draw_effects_tab(ui: &mut egui::Ui, input: &DrawInput<'_>, actions: &mut UiAc
     }
     ui.label(RichText::new(i18n.t("tip_interp")).small().italics());
     ui.label(RichText::new(i18n.t("explain_interp")).small());
+
+    let interp_on = fx.interp_mode == "x2" || fx.interp_mode == "auto";
+    option_block(
+        ui,
+        i18n,
+        &i18n.t("label_interp_motion_blur"),
+        &i18n.t("explain_interp_motion_blur"),
+        &i18n.t("tip_interp_motion_blur"),
+        Impact::Light,
+        Impact::Light,
+        |ui| {
+            let mut blur = fx.interp_motion_blur;
+            if ui
+                .add_enabled(
+                    !interp_blocked && interp_on,
+                    egui::Slider::new(&mut blur, 0.0..=1.0),
+                )
+                .changed()
+            {
+                actions.interp_motion_blur_changed = Some(blur);
+            }
+        },
+    );
 
     ui.add_space(10.0);
     ui.separator();

@@ -78,6 +78,7 @@ struct FlowGpu {
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct WarpGpu {
+    /// xy = wh, z = blend t (0.5), w = motion blur intensity (0 = off).
     size: [f32; 4],
 }
 
@@ -102,6 +103,8 @@ pub struct InterpolateEngine {
     pub block: InterpBlockReason,
     pub delay_ms: f32,
     pub last_gpu_ms: f32,
+    /// Motion blur on Mid (0 = off … 1 = strong). Applied only while framegen is active.
+    pub motion_blur: f32,
     over_budget_streak: u32,
     auto_disabled: bool,
     /// After presenting Mid, the next present must show Curr (x2 cadence).
@@ -347,6 +350,7 @@ impl InterpolateEngine {
             block,
             delay_ms: 0.0,
             last_gpu_ms: 0.0,
+            motion_blur: 0.0,
             over_budget_streak: 0,
             auto_disabled: false,
             owed_curr: false,
@@ -395,6 +399,11 @@ impl InterpolateEngine {
             self.owed_curr = false;
             self.delay_ms = 0.0;
         }
+    }
+
+    /// Intensity for Mid motion blur (0 = off … 1 = strong). No-op when framegen is off.
+    pub fn set_motion_blur(&mut self, intensity: f32) {
+        self.motion_blur = intensity.clamp(0.0, 1.0);
     }
 
     pub fn set_source_delay_ms(&mut self, ms: f32) {
@@ -806,11 +815,17 @@ impl InterpolateEngine {
             cpass.dispatch_workgroups((w + 7) / 8, (h + 7) / 8, 1);
         }
 
+        // Pass blur only while framegen is active; Mid cadence unchanged.
+        let blur = if self.active() {
+            self.motion_blur.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
         queue.write_buffer(
             &self.warp_buf,
             0,
             bytemuck::bytes_of(&WarpGpu {
-                size: [w as f32, h as f32, 0.5, 0.0],
+                size: [w as f32, h as f32, 0.5, blur],
             }),
         );
         let warp_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
