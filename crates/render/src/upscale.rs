@@ -508,6 +508,16 @@ impl UpscaleEngine {
         }
         self.mode = mode;
         self.over_budget_streak = 0;
+        if mode == UpscaleMode::Off {
+            self.release_scratch();
+        }
+    }
+
+    /// Drop intermediate RGBA textures while Mode A/B is off (frees VRAM/RSS).
+    pub fn release_scratch(&mut self) {
+        self.rgba_src = None;
+        self.mid = None;
+        self.rgba_dst = None;
     }
 
     pub fn set_sharpness(&mut self, s: f32) {

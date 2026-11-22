@@ -202,6 +202,16 @@ impl DeinterlaceEngine {
 
     pub fn set_mode(&mut self, mode: DeinterlaceMode) {
         self.mode = mode;
+        if matches!(mode, DeinterlaceMode::Off) {
+            self.release_scratch();
+        }
+    }
+
+    /// Drop Bob intermediate textures while deinterlace is off.
+    pub fn release_scratch(&mut self) {
+        self.src = None;
+        self.dst = None;
+        self.sample = None;
     }
 
     pub fn set_source_interlaced(&mut self, interlaced: bool) {
