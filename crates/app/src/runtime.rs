@@ -368,6 +368,7 @@ impl Default for App {
                 interp_mode: ui_prefs.interp_mode.clone(),
                 deinterlace_mode: ui_prefs.deinterlace_mode.clone(),
                 source_interlaced: format.interlaced,
+                vsync_mode: normalize_vsync_mode(&ui_prefs.vsync_mode),
                 ..EffectsUiState::default()
             },
             color_ui,
@@ -564,30 +565,36 @@ impl App {
         hz.clamp(24.0, 360.0)
     }
 
-    /// Auto/Game: AutoNoVsync + latency 1. We already software-pace in `about_to_wait`;
-    /// pairing that with Fifo (AutoVsync) phase-beats the refresh → ~20 ms frames →
-    /// 1% low ≈ 48 on a 60 Hz capture (Arthur). Quality/Economy keep AutoVsync.
+    /// Apply swapchain present mode from the VSync pref (auto/on/off).
+    /// Auto: Auto/Game → NoVsync (avoids Fifo phase-beat with software pacing);
+    /// Quality/Economy → VSync. Explicit on/off overrides the profile.
     fn apply_present_mode_for_profile(&mut self) {
         let Some(gpu) = self.gpu.as_mut() else {
             return;
         };
-        let low_latency = matches!(
+        let mode = normalize_vsync_mode(&self.ui_prefs.vsync_mode);
+        let profile_low_latency = matches!(
             self.selection.mode,
             CaptureMode::Game | CaptureMode::Auto
         );
-        let want = if low_latency {
-            wgpu::PresentMode::AutoNoVsync
-        } else {
-            wgpu::PresentMode::AutoVsync
+        let use_vsync = match mode.as_str() {
+            "on" => true,
+            "off" => false,
+            _ => !profile_low_latency,
         };
-        let latency = if low_latency { 1 } else { 2 };
+        let want = if use_vsync {
+            wgpu::PresentMode::AutoVsync
+        } else {
+            wgpu::PresentMode::AutoNoVsync
+        };
+        let latency = if use_vsync { 2 } else { 1 };
         if gpu.config.present_mode == want && gpu.config.desired_maximum_frame_latency == latency {
             return;
         }
         gpu.config.present_mode = want;
         gpu.config.desired_maximum_frame_latency = latency;
         gpu.surface.configure(&gpu.device, &gpu.config);
-        tracing::info!(?want, latency, "present mode updated for profile");
+        tracing::info!(?want, latency, vsync = %mode, "present mode updated");
     }
 
     fn capture_err_status(&self, e: &CaptureError) -> String {
@@ -1049,6 +1056,9 @@ impl App {
             self.effects_ui.sharpness = 0.4;
             self.effects_ui.interp_mode = "off".into();
             self.effects_ui.deinterlace_mode = "auto".into();
+            self.effects_ui.vsync_mode = "auto".into();
+            self.ui_prefs.vsync_mode = "auto".into();
+            self.overlay.vsync_mode = "auto".into();
             self.color_ui.range_mode = "auto".into();
             self.color_ui.matrix_mode = "auto".into();
             if let Some(gpu) = self.gpu.as_mut() {
@@ -1057,6 +1067,7 @@ impl App {
                 gpu.interpolate.set_mode(InterpMode::Off);
                 gpu.deinterlace.set_mode(DeinterlaceMode::Auto);
             }
+            self.apply_present_mode_for_profile();
             let id = self.devices[self.selection.device_idx].id.as_str().to_string();
             self.ui_prefs.set_color_for_device(&id, "auto", "auto");
             self.apply_color_convert();
@@ -1165,6 +1176,14 @@ impl App {
             self.overlay.display_fps_limit = limit;
             self.persist_ui_prefs();
         }
+        if let Some(mode) = actions.vsync_mode {
+            let mode = normalize_vsync_mode(mode);
+            self.ui_prefs.vsync_mode = mode.clone();
+            self.effects_ui.vsync_mode = mode.clone();
+            self.overlay.vsync_mode = mode;
+            self.apply_present_mode_for_profile();
+            self.persist_ui_prefs();
+        }
         if let Some(mode) = actions.deinterlace_mode {
             self.effects_ui.deinterlace_mode = mode.to_string();
             self.ui_prefs.deinterlace_mode = mode.to_string();
@@ -1212,6 +1231,7 @@ impl App {
         self.ui_prefs.sharpness = self.effects_ui.sharpness;
         self.ui_prefs.interp_mode = self.effects_ui.interp_mode.clone();
         self.ui_prefs.deinterlace_mode = self.effects_ui.deinterlace_mode.clone();
+        self.ui_prefs.vsync_mode = normalize_vsync_mode(&self.effects_ui.vsync_mode);
         // Debounce disk writes — sync save on every slider tick froze the picture.
         self.prefs_dirty = true;
         self.prefs_dirty_at = Instant::now();
@@ -1235,6 +1255,7 @@ impl App {
             self.ui_prefs.sharpness = self.effects_ui.sharpness;
             self.ui_prefs.interp_mode = self.effects_ui.interp_mode.clone();
             self.ui_prefs.deinterlace_mode = self.effects_ui.deinterlace_mode.clone();
+            self.ui_prefs.vsync_mode = normalize_vsync_mode(&self.effects_ui.vsync_mode);
         }
         save_ui_prefs(&self.ui_prefs);
         self.prefs_dirty = false;
@@ -1278,8 +1299,10 @@ impl App {
             self.effects_ui.deinterlace_mode = gpu.deinterlace.mode.as_str().into();
             self.effects_ui.source_interlaced = gpu.deinterlace.source_interlaced;
             self.effects_ui.deinterlace_active = gpu.deinterlace.should_run();
+            self.effects_ui.vsync_mode = normalize_vsync_mode(&self.ui_prefs.vsync_mode);
         } else {
             self.effects_ui.native_res = native;
+            self.effects_ui.vsync_mode = normalize_vsync_mode(&self.ui_prefs.vsync_mode);
         }
     }
 
@@ -1297,7 +1320,7 @@ impl App {
              device={}\n\
              format={}x{} {:?} @ {:?}\n\
              audio_in={} audio_out={}\n\
-             fps={:.1} capture_fps={:.1} frame_gen_fps={:.1} display_limit={} pipeline_delay_ms={:.1}\n\
+             fps={:.1} capture_fps={:.1} frame_gen_fps={:.1} display_limit={} vsync={} pipeline_delay_ms={:.1}\n\
              dropped={} 1%low={:.1} gpu={}\n\
              -- log --\n{}\n",
             self.i18n.lang(),
@@ -1312,6 +1335,7 @@ impl App {
             self.overlay.capture_fps,
             self.overlay.frame_gen_fps,
             self.ui_prefs.display_fps_limit,
+            self.ui_prefs.vsync_mode,
             self.overlay.pipeline_delay_ms,
             self.overlay.dropped_frames,
             self.overlay.one_percent_low_fps,
@@ -1430,6 +1454,7 @@ impl App {
             self.fps_window_start = Instant::now();
         }
         self.overlay.display_fps_limit = self.ui_prefs.display_fps_limit;
+        self.overlay.vsync_mode = normalize_vsync_mode(&self.ui_prefs.vsync_mode);
 
         // Refresh process CPU/RAM ~2 Hz (UI thread only).
         if self.process_sample_at.elapsed() >= Duration::from_millis(500) {
@@ -1840,6 +1865,14 @@ impl App {
             self.persist_ui_prefs();
         }
         self.apply_ui_actions(actions);
+    }
+}
+
+fn normalize_vsync_mode(mode: &str) -> String {
+    match mode {
+        "on" | "On" | "ON" => "on".into(),
+        "off" | "Off" | "OFF" => "off".into(),
+        _ => "auto".into(),
     }
 }
 

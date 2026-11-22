@@ -70,6 +70,8 @@ pub struct OverlayState {
     pub frame_gen_fps: f32,
     /// User display FPS cap (0 = Auto, 9999 = unlimited).
     pub display_fps_limit: u32,
+    /// VSync preference: auto | on | off.
+    pub vsync_mode: String,
     pub label: String,
     pub frame_w: u32,
     pub frame_h: u32,
@@ -104,6 +106,7 @@ impl Default for OverlayState {
             capture_fps: 0.0,
             frame_gen_fps: 0.0,
             display_fps_limit: 0,
+            vsync_mode: "auto".into(),
             label: String::new(),
             frame_w: 0,
             frame_h: 0,
@@ -222,6 +225,8 @@ pub struct UiActions {
     pub deinterlace_mode: Option<&'static str>,
     /// None = unchanged; Some(0)=Auto, Some(9999)=unlimited, else Hz cap.
     pub display_fps_limit: Option<u32>,
+    /// None = unchanged; Some("auto"|"on"|"off").
+    pub vsync_mode: Option<&'static str>,
     pub color_range_changed: Option<&'static str>,
     pub color_matrix_changed: Option<&'static str>,
     pub color_range_toggle: bool,
@@ -244,6 +249,8 @@ pub struct EffectsUiState {
     pub deinterlace_mode: String,
     pub source_interlaced: bool,
     pub deinterlace_active: bool,
+    /// auto | on | off
+    pub vsync_mode: String,
 }
 
 impl Default for EffectsUiState {
@@ -264,6 +271,7 @@ impl Default for EffectsUiState {
             deinterlace_mode: "auto".into(),
             source_interlaced: false,
             deinterlace_active: false,
+            vsync_mode: "auto".into(),
         }
     }
 }
@@ -1027,6 +1035,22 @@ fn draw_effects_tab(ui: &mut egui::Ui, input: &DrawInput<'_>, actions: &mut UiAc
     });
 
     ui.add_space(10.0);
+    ui.label(RichText::new(i18n.t("label_vsync")).strong());
+    ui.label(RichText::new(i18n.t("tip_vsync")).small().italics());
+    ui.horizontal(|ui| {
+        for (id, key) in [
+            ("auto", "vsync_auto"),
+            ("on", "vsync_on"),
+            ("off", "vsync_off"),
+        ] {
+            let selected = fx.vsync_mode == id;
+            if ui.selectable_label(selected, i18n.t(key)).clicked() {
+                actions.vsync_mode = Some(id);
+            }
+        }
+    });
+
+    ui.add_space(10.0);
     ui.separator();
     ui.label(RichText::new(i18n.t("label_deinterlace")).strong());
     ui.horizontal(|ui| {
@@ -1099,6 +1123,14 @@ fn draw_info_tab(ui: &mut egui::Ui, input: &DrawInput<'_>, actions: &mut UiActio
     }
     if ui.button(i18n.t("btn_retry")).clicked() {
         actions.retry = true;
+    }
+}
+
+fn vsync_mode_label(i18n: &I18n, mode: &str) -> String {
+    match mode {
+        "on" => i18n.t("vsync_on"),
+        "off" => i18n.t("vsync_off"),
+        _ => i18n.t("vsync_auto"),
     }
 }
 
@@ -1185,6 +1217,11 @@ fn draw_metrics_body(ui: &mut egui::Ui, i18n: &I18n, o: &OverlayState, detailed:
         o.pipeline_delay_ms,
         i18n.t("label_display_fps_limit"),
         display_fps_limit_label(i18n, o.display_fps_limit)
+    ));
+    ui.label(format!(
+        "{}: {}",
+        i18n.t("label_vsync"),
+        vsync_mode_label(i18n, &o.vsync_mode)
     ));
     if !detailed {
         return;

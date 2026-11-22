@@ -47,6 +47,9 @@ pub struct UiPrefs {
     /// Cap on display presents. 0 = Auto (capture, or 2× with frame gen). 9999 = unlimited.
     #[serde(default)]
     pub display_fps_limit: u32,
+    /// VSync: "auto" (profile default), "on", or "off".
+    #[serde(default = "default_vsync")]
+    pub vsync_mode: String,
     #[serde(default)]
     pub metrics_pinned: bool,
     #[serde(default)]
@@ -90,6 +93,10 @@ fn default_deinterlace() -> String {
     "auto".into()
 }
 
+fn default_vsync() -> String {
+    "auto".into()
+}
+
 fn default_color_range() -> String {
     "auto".into()
 }
@@ -109,6 +116,7 @@ impl Default for UiPrefs {
             interp_mode: "off".into(),
             deinterlace_mode: "auto".into(),
             display_fps_limit: 0,
+            vsync_mode: default_vsync(),
             metrics_pinned: false,
             settings_pinned: false,
             last_device_id: String::new(),
