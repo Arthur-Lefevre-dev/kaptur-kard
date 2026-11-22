@@ -34,6 +34,17 @@ fn chroma_rank(fmt: PixelFormat) -> u8 {
     }
 }
 
+/// Prefer lower USB / bus bandwidth at high fps (Arthur stutter: YUY2 1080p60 ≈56 fps + drops).
+fn stream_rank(fmt: PixelFormat) -> u8 {
+    match fmt {
+        PixelFormat::Nv12 => 4,
+        PixelFormat::Yuy2 => 3,
+        PixelFormat::Mjpeg => 2,
+        PixelFormat::Bgra8 | PixelFormat::Rgb24 => 1,
+        PixelFormat::Unknown(_) => 0,
+    }
+}
+
 fn is_uncompressed(fmt: PixelFormat) -> bool {
     matches!(
         fmt,
@@ -63,20 +74,20 @@ pub fn select_auto(caps: &[FormatDesc]) -> Option<FormatDesc> {
         return None;
     }
 
-    // Ideal: 1080p @ ~60 with uncompressed subtype.
+    // Ideal: 1080p @ ~60 uncompressed — prefer NV12 over YUY2 for bus bandwidth.
     let ideal = caps
         .iter()
         .filter(|c| c.width == 1920 && c.height == 1080 && near_fps(c, 60.0))
         .max_by(|a, b| {
             is_uncompressed(a.pixel_format)
                 .cmp(&is_uncompressed(b.pixel_format))
-                .then_with(|| chroma_rank(a.pixel_format).cmp(&chroma_rank(b.pixel_format)))
+                .then_with(|| stream_rank(a.pixel_format).cmp(&stream_rank(b.pixel_format)))
         });
     if let Some(desc) = ideal {
         return Some(with_best_rate(desc.clone()));
     }
 
-    // Next: any 1080p with highest fps / chroma.
+    // Next: any 1080p with highest fps / stream-friendly chroma.
     let any_1080 = caps
         .iter()
         .filter(|c| c.width == 1920 && c.height == 1080)
@@ -84,7 +95,7 @@ pub fn select_auto(caps: &[FormatDesc]) -> Option<FormatDesc> {
             max_fps(a)
                 .partial_cmp(&max_fps(b))
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| chroma_rank(a.pixel_format).cmp(&chroma_rank(b.pixel_format)))
+                .then_with(|| stream_rank(a.pixel_format).cmp(&stream_rank(b.pixel_format)))
         });
     if let Some(desc) = any_1080 {
         return Some(with_best_rate(desc.clone()));
@@ -93,7 +104,7 @@ pub fn select_auto(caps: &[FormatDesc]) -> Option<FormatDesc> {
     select_game(caps)
 }
 
-/// Max fps, then resolution; prefer uncompressed.
+/// Max fps, then resolution; prefer NV12 over packed YUY2 for sustained 60.
 pub fn select_game(caps: &[FormatDesc]) -> Option<FormatDesc> {
     caps.iter()
         .max_by(|a, b| {
@@ -101,7 +112,7 @@ pub fn select_game(caps: &[FormatDesc]) -> Option<FormatDesc> {
                 .partial_cmp(&max_fps(b))
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| area(a).cmp(&area(b)))
-                .then_with(|| chroma_rank(a.pixel_format).cmp(&chroma_rank(b.pixel_format)))
+                .then_with(|| stream_rank(a.pixel_format).cmp(&stream_rank(b.pixel_format)))
         })
         .cloned()
         .map(with_best_rate)
@@ -226,6 +237,13 @@ mod tests {
                 interlaced: false,
             },
             FormatDesc {
+                pixel_format: PixelFormat::Nv12,
+                width: 1920,
+                height: 1080,
+                frame_rates: vec![Rational::new(60, 1)],
+                interlaced: false,
+            },
+            FormatDesc {
                 pixel_format: PixelFormat::Mjpeg,
                 width: 1920,
                 height: 1080,
@@ -275,7 +293,8 @@ mod tests {
         let selected = select_auto(&caps()).expect("caps");
         assert_eq!(selected.width, 1920);
         assert_eq!(selected.height, 1080);
-        assert_eq!(selected.pixel_format, PixelFormat::Yuy2);
+        // NV12 over YUY2 at 1080p60 — lower USB bandwidth, fewer drops.
+        assert_eq!(selected.pixel_format, PixelFormat::Nv12);
         assert!((selected.frame_rates[0].as_f64() - 60.0).abs() < 0.01);
     }
 
@@ -283,6 +302,7 @@ mod tests {
     fn game_prefers_high_fps() {
         let selected = select_game(&caps()).expect("caps");
         assert!((max_fps(&selected) - 60.0).abs() < 0.01);
+        assert_eq!(selected.pixel_format, PixelFormat::Nv12);
     }
 
     #[test]

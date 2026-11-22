@@ -25,7 +25,7 @@ use render::{
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::WindowEvent;
-use winit::event_loop::ActiveEventLoop;
+use winit::event_loop::{ActiveEventLoop, ControlFlow};
 use winit::window::{Window, WindowId};
 
 use crate::i18n::I18n;
@@ -410,6 +410,7 @@ impl ApplicationHandler for App {
         self.effects_ui.interp_compute_ok = gpu.interpolate.compute_ok;
         self.gpu = Some(gpu);
         self.apply_color_convert();
+        self.apply_present_mode_for_profile();
 
         if let Err(e) = self.open_and_start(self.selection.device_idx, self.current_format.clone()) {
             tracing::error!(error = %e, "failed to start capture; falling back to mock");
@@ -475,11 +476,52 @@ impl ApplicationHandler for App {
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.poll_hotplug();
-        if let Some(gpu) = self.gpu.as_ref() {
-            gpu.window.request_redraw();
+
+        // Pace redraws to capture rate when UI is idle. Spinning at ~200+ Hz on a high-Hz
+        // display (AutoVsync/NoVsync) caused Arthur's hitch spikes and channel drops.
+        let ui_busy = self.chrome.toolbar_visible
+            || self.chrome.settings_open
+            || self.chrome.wizard_open
+            || self.overlay.metrics_mode != MetricsMode::Off
+            || !self.overlay.toast.is_empty()
+            || !self.overlay.status.is_empty()
+            || self.overlay.lag_flash
+            || self.overlay.no_signal
+            || self.overlay.device_busy;
+        let has_pending = self
+            .source
+            .as_ref()
+            .map(|s| !s.receiver().is_empty())
+            .unwrap_or(false);
+        let capture_hz = self
+            .current_format
+            .frame_rates
+            .first()
+            .map(|r| r.as_f64())
+            .unwrap_or(60.0)
+            .clamp(24.0, 144.0);
+        let period = Duration::from_secs_f64(1.0 / capture_hz);
+        let present_due = self
+            .last_present_at
+            .map(|t| t.elapsed() >= period)
+            .unwrap_or(true);
+
+        if ui_busy || has_pending || present_due {
+            if let Some(gpu) = self.gpu.as_ref() {
+                gpu.window.request_redraw();
+            }
         }
+
+        let wait = if ui_busy {
+            Duration::from_millis(8)
+        } else if has_pending {
+            Duration::from_millis(1)
+        } else {
+            period.min(Duration::from_millis(20))
+        };
+        event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + wait));
     }
 }
 
@@ -489,6 +531,27 @@ impl App {
             let _ = source.stop();
         }
         self.running = false;
+    }
+
+    /// Game profile: AutoNoVsync + lower swap latency. Other profiles: AutoVsync.
+    fn apply_present_mode_for_profile(&mut self) {
+        let Some(gpu) = self.gpu.as_mut() else {
+            return;
+        };
+        let game = self.selection.mode == CaptureMode::Game;
+        let want = if game {
+            wgpu::PresentMode::AutoNoVsync
+        } else {
+            wgpu::PresentMode::AutoVsync
+        };
+        let latency = if game { 1 } else { 2 };
+        if gpu.config.present_mode == want && gpu.config.desired_maximum_frame_latency == latency {
+            return;
+        }
+        gpu.config.present_mode = want;
+        gpu.config.desired_maximum_frame_latency = latency;
+        gpu.surface.configure(&gpu.device, &gpu.config);
+        tracing::info!(?want, latency, "present mode updated for profile");
     }
 
     fn capture_err_status(&self, e: &CaptureError) -> String {
@@ -844,11 +907,13 @@ impl App {
         if let Some(mode) = actions.mode_changed {
             let previous_mode = self.selection.mode;
             self.selection.mode = mode;
+            self.apply_present_mode_for_profile();
             let caps = &self.devices[self.selection.device_idx].formats;
             if let Some(fmt) = modes::select_format(mode, caps) {
                 let msg = self.i18n.t("err_mode");
                 if !self.restart_with_fallback(fmt, &msg) {
                     self.selection.mode = previous_mode;
+                    self.apply_present_mode_for_profile();
                 }
             }
         }

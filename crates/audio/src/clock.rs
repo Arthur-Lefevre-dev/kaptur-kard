@@ -32,7 +32,8 @@ impl Default for DriftCorrector {
         Self {
             target_fill: 0.5,
             deadband: 0.15,
-            max_adjust: 4,
+            // Keep small — large skip/pad bursts can hitch shared CPU with the UI thread.
+            max_adjust: 2,
         }
     }
 }

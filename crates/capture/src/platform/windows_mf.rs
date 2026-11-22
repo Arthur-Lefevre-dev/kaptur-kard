@@ -21,6 +21,9 @@ use windows::Win32::Media::MediaFoundation::{
     MF_SOURCE_READER_FIRST_VIDEO_STREAM, MF_VERSION,
 };
 use windows::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, COINIT_MULTITHREADED};
+use windows::Win32::System::Threading::{
+    GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
+};
 
 use crate::device::{DeviceId, DeviceInfo, FormatDesc};
 use crate::format::{looks_interlaced, PixelFormat, Rational};
@@ -77,6 +80,13 @@ fn ensure_mf() -> Result<(), CaptureError> {
 fn co_init_mta() {
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+    }
+}
+
+/// Keep MF ReadSample responsive vs UI / compositor contention.
+fn elevate_capture_thread_priority() {
+    unsafe {
+        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
     }
 }
 
@@ -532,10 +542,11 @@ fn configure_media_type(
 
     // Prefer the selected subtype, then fall back to uncompressed YUY2 / NV12 / MJPEG
     // at the same resolution — helps when the HW path for NV12 is broken.
+    // Prefer requested, then NV12 (lighter bus) before packed YUY2.
     let candidates = [
         selected.pixel_format,
-        PixelFormat::Yuy2,
         PixelFormat::Nv12,
+        PixelFormat::Yuy2,
         PixelFormat::Mjpeg,
         PixelFormat::Bgra8,
     ];
@@ -693,6 +704,7 @@ impl VideoSource for MfVideoSource {
                 .name("mf-capture".into())
                 .spawn(move || {
                     co_init_mta();
+                    elevate_capture_thread_priority();
 
                     let open_and_configure = |software: bool| {
                         let (source, reader) = open_reader_from_symlink(&symlink, software)?;

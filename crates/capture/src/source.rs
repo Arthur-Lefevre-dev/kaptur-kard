@@ -110,6 +110,11 @@ impl FrameReceiver {
     pub fn dropped_count(&self) -> u64 {
         self.drops.load(Ordering::Relaxed)
     }
+
+    /// True when the capture bus has no pending frames (non-blocking).
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
