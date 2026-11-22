@@ -65,6 +65,7 @@ impl AvfVideoSource {
             display_name: "AVFoundation (not yet implemented)".into(),
             backend: "avf",
             formats: Vec::new(),
+            enum_note: Some("scaffolding".into()),
         }
     }
 }

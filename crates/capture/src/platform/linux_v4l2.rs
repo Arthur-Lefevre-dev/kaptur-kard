@@ -59,6 +59,7 @@ pub fn enumerate_devices() -> Result<Vec<DeviceInfo>, CaptureError> {
             display_name: format!("{} ({path})", caps.card),
             backend: "v4l2",
             formats,
+            enum_note: None,
         });
     }
     Ok(out)

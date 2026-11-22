@@ -77,6 +77,7 @@ impl DshowVideoSource {
             display_name: "DirectShow (not yet implemented)".into(),
             backend: "dshow",
             formats: Vec::new(),
+            enum_note: Some("scaffolding".into()),
         }
     }
 }

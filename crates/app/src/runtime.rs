@@ -151,37 +151,68 @@ pub struct App {
 impl Default for App {
     fn default() -> Self {
         let mock_info = MockVideoSource::device_info();
-        let mut devices = vec![mock_info.clone()];
-        match capture::list_devices() {
-            Ok(mut real) => {
+        // Real devices first (already sorted: cards → others → virtual); Mock last.
+        let mut devices = match capture::list_devices() {
+            Ok(real) => {
+                for d in &real {
+                    tracing::info!(
+                        name = %d.display_name,
+                        id = %d.id.as_str(),
+                        backend = d.backend,
+                        formats = d.formats.len(),
+                        score = capture::device_capture_score_for(&d.display_name, d.id.as_str()),
+                        virtual = capture::is_virtual_camera(&d.display_name, d.id.as_str()),
+                        "enumerated video device"
+                    );
+                }
                 tracing::info!(count = real.len(), "platform devices enumerated");
-                devices.append(&mut real);
+                real
             }
-            Err(e) => tracing::warn!(error = %e, "device enumeration failed; mock only"),
-        }
+            Err(e) => {
+                tracing::warn!(error = %e, "device enumeration failed; mock only");
+                Vec::new()
+            }
+        };
+        devices.push(mock_info.clone());
 
         let ui_prefs_early = load_ui_prefs();
+        let preferred = capture::pick_preferred_device_index(&devices).unwrap_or(0);
         let device_idx = if !ui_prefs_early.last_device_id.is_empty() {
-            devices
+            match devices
                 .iter()
                 .position(|d| d.id.as_str() == ui_prefs_early.last_device_id)
-                .unwrap_or_else(|| {
-                    devices
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, d)| d.backend != "mock" && !d.formats.is_empty())
-                        .max_by_key(|(_, d)| capture::device_capture_score(&d.display_name))
-                        .map(|(i, _)| i)
-                        .unwrap_or(0)
-                })
+            {
+                Some(idx) => {
+                    let remembered = &devices[idx];
+                    let preferred_dev = devices.get(preferred);
+                    // If prefs stuck on a virtual cam while a real capture card exists, prefer the card.
+                    let remembered_virtual = capture::is_virtual_camera(
+                        &remembered.display_name,
+                        remembered.id.as_str(),
+                    );
+                    let preferred_is_card = preferred_dev
+                        .map(|d| {
+                            d.backend != "mock"
+                                && !capture::is_virtual_camera(&d.display_name, d.id.as_str())
+                                && capture::device_capture_score_for(&d.display_name, d.id.as_str())
+                                    > 0
+                        })
+                        .unwrap_or(false);
+                    if remembered_virtual && preferred_is_card {
+                        tracing::info!(
+                            remembered = %remembered.display_name,
+                            preferred = %preferred_dev.map(|d| d.display_name.as_str()).unwrap_or("?"),
+                            "overriding virtual-camera prefs with capture card"
+                        );
+                        preferred
+                    } else {
+                        idx
+                    }
+                }
+                None => preferred,
+            }
         } else {
-            devices
-                .iter()
-                .enumerate()
-                .filter(|(_, d)| d.backend != "mock" && !d.formats.is_empty())
-                .max_by_key(|(_, d)| capture::device_capture_score(&d.display_name))
-                .map(|(i, _)| i)
-                .unwrap_or(0)
+            preferred
         };
 
         let caps = &devices[device_idx].formats;
@@ -465,8 +496,16 @@ impl App {
         let Ok(real) = capture::list_devices() else {
             return;
         };
-        let mut next = vec![MockVideoSource::device_info()];
-        next.extend(real);
+        for d in &real {
+            tracing::info!(
+                name = %d.display_name,
+                id = %d.id.as_str(),
+                formats = d.formats.len(),
+                "hot-plug refresh device"
+            );
+        }
+        let mut next = real;
+        next.push(MockVideoSource::device_info());
 
         let current_id = self
             .devices
@@ -490,9 +529,16 @@ impl App {
             if let Some(id) = current_id.as_ref() {
                 if !ids_after.contains(id) {
                     tracing::warn!(%id, "capture device removed");
-                    self.selection.device_idx = 0;
-                    let fmt = self.devices[0].formats[0].clone();
-                    let _ = self.open_and_start(0, fmt);
+                    let fallback = self
+                        .devices
+                        .iter()
+                        .position(|d| d.backend == "mock")
+                        .or_else(|| capture::pick_preferred_device_index(&self.devices))
+                        .unwrap_or(0);
+                    self.selection.device_idx = fallback;
+                    if let Some(fmt) = self.devices.get(fallback).and_then(|d| d.formats.first()) {
+                        let _ = self.open_and_start(fallback, fmt.clone());
+                    }
                     self.show_toast(self.i18n.t("msg_device_gone"));
                     return;
                 }
@@ -641,20 +687,31 @@ impl App {
         if let Some(idx) = actions.device_changed {
             self.selection.device_idx = idx;
             let caps = &self.devices[idx].formats;
-            let format = modes::select_format(self.selection.mode, caps)
-                .or_else(|| caps.first().cloned())
-                .unwrap_or_else(|| self.current_format.clone());
-            self.selection.width = format.width;
-            self.selection.height = format.height;
-            self.selection.rate = format
-                .frame_rates
-                .first()
-                .copied()
-                .unwrap_or(Rational::new(60, 1));
-            let msg = self.i18n.t("err_device_start");
-            let _ = self.restart_with_fallback(format, &msg);
-            self.suggest_audio_for_current_video();
-            self.restart_audio();
+            if caps.is_empty() && self.devices[idx].backend != "mock" {
+                self.overlay.status = self.i18n.t("err_device_no_modes");
+                self.push_support(format!(
+                    "device has no probed modes: {} ({})",
+                    self.devices[idx].display_name,
+                    self.devices[idx].id.as_str()
+                ));
+                // Still switch selection so the user can see the empty mode lists.
+                self.show_toast(self.i18n.t("err_device_no_modes"));
+            } else {
+                let format = modes::select_format(self.selection.mode, caps)
+                    .or_else(|| caps.first().cloned())
+                    .unwrap_or_else(|| self.current_format.clone());
+                self.selection.width = format.width;
+                self.selection.height = format.height;
+                self.selection.rate = format
+                    .frame_rates
+                    .first()
+                    .copied()
+                    .unwrap_or(Rational::new(60, 1));
+                let msg = self.i18n.t("err_device_start");
+                let _ = self.restart_with_fallback(format, &msg);
+                self.suggest_audio_for_current_video();
+                self.restart_audio();
+            }
         }
 
         if let Some((w, h)) = actions.resolution_changed {

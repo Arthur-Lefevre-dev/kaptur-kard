@@ -513,15 +513,17 @@ fn draw_image_tab(ui: &mut egui::Ui, input: &DrawInput<'_>, actions: &mut UiActi
         |ui| {
             let label = devices
                 .get(selection.device_idx)
-                .map(|d| d.display_name.as_str())
-                .unwrap_or("—");
+                .map(capture::device_list_label)
+                .unwrap_or_else(|| "—".into());
             egui::ComboBox::from_id_salt("set_device")
                 .selected_text(label)
-                .width(280.0)
+                .width(320.0)
                 .show_ui(ui, |ui| {
+                    ui.set_min_width(320.0);
                     for (i, d) in devices.iter().enumerate() {
+                        let row = capture::device_list_label(d);
                         if ui
-                            .selectable_label(i == selection.device_idx, &d.display_name)
+                            .selectable_label(i == selection.device_idx, row)
                             .clicked()
                         {
                             actions.device_changed = Some(i);
@@ -1044,14 +1046,17 @@ fn draw_wizard(
                     ui.label(i18n.t("wizard_step1_body"));
                     let label = devices
                         .get(selection.device_idx)
-                        .map(|d| d.display_name.as_str())
-                        .unwrap_or("—");
+                        .map(capture::device_list_label)
+                        .unwrap_or_else(|| "—".into());
                     egui::ComboBox::from_id_salt("wiz_dev")
                         .selected_text(label)
+                        .width(320.0)
                         .show_ui(ui, |ui| {
+                            ui.set_min_width(320.0);
                             for (i, d) in devices.iter().enumerate() {
+                                let row = capture::device_list_label(d);
                                 if ui
-                                    .selectable_label(i == selection.device_idx, &d.display_name)
+                                    .selectable_label(i == selection.device_idx, row)
                                     .clicked()
                                 {
                                     actions.device_changed = Some(i);

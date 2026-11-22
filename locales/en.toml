@@ -133,6 +133,7 @@ wizard_step3_title = "You're set"
 wizard_step3_body = "The picture fills the window. Move the mouse to see Picture, Sound, Effects, Info."
 
 err_device_start = "Couldn't start that source. We restored the previous setting."
+err_device_no_modes = "That source is listed, but Windows didn't report any usable video modes."
 err_resolution = "That picture quality couldn't be applied."
 err_rate = "That smoothness setting couldn't be applied."
 err_mode = "That profile couldn't be applied."

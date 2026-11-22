@@ -21,7 +21,10 @@ pub struct DeviceInfo {
     /// Human-readable backend tag, e.g. "mf", "v4l2", "mock".
     pub backend: &'static str,
     /// Capabilities discovered at enum time (never assumed).
+    /// Empty means the device is still listed but modes could not be probed.
     pub formats: Vec<FormatDesc>,
+    /// Optional short note from enumeration (e.g. open failed while probing modes).
+    pub enum_note: Option<String>,
 }
 
 #[derive(Clone, Debug)]

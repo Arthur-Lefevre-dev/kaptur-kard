@@ -20,7 +20,10 @@ pub mod platform;
 
 pub use device::{DeviceId, DeviceInfo, FormatDesc};
 pub use format::{looks_interlaced, CaptureMode, PixelFormat, Rational};
-pub use labels::{device_capture_score, display_hz, hz_label, resolution_label};
+pub use labels::{
+    device_capture_score, device_capture_score_for, device_list_label, device_sort_key,
+    display_hz, hz_label, is_virtual_camera, pick_preferred_device_index, resolution_label,
+};
 pub use pool::{BufferPool, PooledBytes};
 pub use source::{
     CaptureError, FrameReceiver, FrameSender, TryRecvError, VideoFrame, VideoSource,

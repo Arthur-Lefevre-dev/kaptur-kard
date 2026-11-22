@@ -133,6 +133,7 @@ wizard_step3_title = "C'est prêt"
 wizard_step3_body = "L'image s'affiche en grand. Bougez la souris pour voir les boutons Image, Son, Effets, Infos."
 
 err_device_start = "Impossible de démarrer cette source. Nous avons restauré le réglage précédent."
+err_device_no_modes = "Cette source est listée, mais Windows n'a renvoyé aucun mode vidéo utilisable."
 err_resolution = "Cette qualité d'image n'a pas pu être appliquée."
 err_rate = "Cette fluidité n'a pas pu être appliquée."
 err_mode = "Ce profil n'a pas pu être appliquée."

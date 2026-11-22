@@ -22,7 +22,7 @@ use windows::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, COINIT_MULTITHR
 
 use crate::device::{DeviceId, DeviceInfo, FormatDesc};
 use crate::format::{looks_interlaced, PixelFormat, Rational};
-use crate::labels::device_capture_score;
+use crate::labels::{device_capture_score_for, device_sort_key, is_virtual_camera};
 use crate::pool::BufferPool;
 use crate::source::{
     frame_channel, CaptureError, FrameReceiver, FrameSender, VideoFrame, VideoSource,
@@ -164,10 +164,13 @@ fn interlace_flag_of(mt: &IMFMediaType) -> bool {
 }
 
 fn merge_format(formats: &mut Vec<FormatDesc>, desc: FormatDesc) {
+    // Keep progressive and interlaced variants separate (same size can advertise both).
     if let Some(existing) = formats.iter_mut().find(|f| {
-        f.pixel_format == desc.pixel_format && f.width == desc.width && f.height == desc.height
+        f.pixel_format == desc.pixel_format
+            && f.width == desc.width
+            && f.height == desc.height
+            && f.interlaced == desc.interlaced
     }) {
-        existing.interlaced |= desc.interlaced;
         for r in desc.frame_rates {
             if !existing
                 .frame_rates
@@ -210,8 +213,15 @@ fn enumerate_native_types(reader: &IMFSourceReader) -> Result<Vec<FormatDesc>, C
         if matches!(pixel_format, PixelFormat::Unknown(_)) {
             continue;
         }
-        let interlaced =
-            interlace_flag_of(&mt) || looks_interlaced(width, height, rate);
+        // Some capture drivers mark progressive 1080p50/60 as interlaced.
+        // Prefer the rate/size heuristic when the mode clearly looks progressive.
+        let flag = interlace_flag_of(&mt);
+        let heuristic = looks_interlaced(width, height, rate);
+        let interlaced = if flag && !heuristic && rate.as_f64() >= 48.0 && height >= 720 {
+            false
+        } else {
+            flag || heuristic
+        };
         merge_format(
             &mut formats,
             FormatDesc {
@@ -290,6 +300,7 @@ pub fn enumerate_devices() -> Result<Vec<DeviceInfo>, CaptureError> {
             }
 
             let slice = std::slice::from_raw_parts(activates, count as usize);
+            info!(count, "MFEnumDeviceSources returned video capture activates");
             for activate_opt in slice {
                 let Some(activate) = activate_opt else {
                     continue;
@@ -301,37 +312,72 @@ pub fn enumerate_devices() -> Result<Vec<DeviceInfo>, CaptureError> {
                     &MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK,
                 )
                 .unwrap_or_default();
-                if symlink.is_empty() {
-                    continue;
-                }
+                // Never drop a named activate solely for a missing symlink — keep it listed.
+                let id = if symlink.is_empty() {
+                    format!("mf:name:{}", name.replace(['\\', '/', ':'], "_"))
+                } else {
+                    format!("mf:{symlink}")
+                };
 
-                let formats = match open_reader_from_symlink(&symlink) {
-                    Ok((source, reader)) => {
-                        let formats = enumerate_native_types(&reader).unwrap_or_default();
-                        let _ = source.Shutdown();
-                        formats
-                    }
-                    Err(e) => {
-                        warn!(%name, error = %e, "skipping device (open failed)");
-                        Vec::new()
+                let (formats, enum_note) = if symlink.is_empty() {
+                    warn!(%name, "MF device has empty symbolic link; listing without modes");
+                    (Vec::new(), Some("no symbolic link".into()))
+                } else {
+                    match open_reader_from_symlink(&symlink) {
+                        Ok((source, reader)) => {
+                            let formats = enumerate_native_types(&reader).unwrap_or_default();
+                            let _ = source.Shutdown();
+                            let note = if formats.is_empty() {
+                                Some("no usable modes probed".into())
+                            } else {
+                                None
+                            };
+                            (formats, note)
+                        }
+                        Err(e) => {
+                            // Keep the device visible; start will surface a clear error.
+                            warn!(
+                                %name,
+                                %id,
+                                error = %e,
+                                "MF open/probe failed — still listing device"
+                            );
+                            (Vec::new(), Some(format!("probe failed: {e}")))
+                        }
                     }
                 };
 
+                let score = device_capture_score_for(&name, &id);
+                let virtual_cam = is_virtual_camera(&name, &id);
+                info!(
+                    %name,
+                    %id,
+                    formats = formats.len(),
+                    score,
+                    virtual_cam,
+                    note = enum_note.as_deref().unwrap_or(""),
+                    "MF video capture device"
+                );
+
                 devices.push(DeviceInfo {
-                    id: DeviceId::new(format!("mf:{symlink}")),
+                    id: DeviceId::new(id),
                     display_name: name,
                     backend: "mf",
                     formats,
+                    enum_note,
                 });
             }
 
             CoTaskMemFree(Some(activates as *const _));
         }
 
+        // Capture cards first, virtual cameras last (stable by name within a tier).
         devices.sort_by(|a, b| {
-            device_capture_score(&b.display_name)
-                .cmp(&device_capture_score(&a.display_name))
-                .then_with(|| a.display_name.cmp(&b.display_name))
+            let ka = device_sort_key(a);
+            let kb = device_sort_key(b);
+            kb.0.cmp(&ka.0)
+                .then_with(|| kb.1.cmp(&ka.1))
+                .then_with(|| ka.2.cmp(&kb.2))
         });
 
         Ok(devices)
