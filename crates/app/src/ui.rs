@@ -180,6 +180,8 @@ pub struct UiChrome {
     /// Pinned windows stay put and are not auto-hidden with the toolbar.
     pub metrics_pinned: bool,
     pub settings_pinned: bool,
+    /// 0 = hidden, 1 = fully visible. Soft launch tips overlay opacity.
+    pub launch_tips_alpha: f32,
 }
 
 impl Default for UiChrome {
@@ -195,6 +197,7 @@ impl Default for UiChrome {
             fullscreen: false,
             metrics_pinned: false,
             settings_pinned: false,
+            launch_tips_alpha: 0.0,
         }
     }
 }
@@ -245,9 +248,13 @@ pub struct UiActions {
     pub discord_presence_changed: Option<bool>,
     pub discord_app_id_changed: Option<String>,
     pub log_level_changed: Option<&'static str>,
+    /// UI language pref: "en" | "fr".
+    pub language_changed: Option<&'static str>,
     pub color_range_changed: Option<&'static str>,
     pub color_matrix_changed: Option<&'static str>,
     pub color_range_toggle: bool,
+    /// User dismissed the brief launch shortcuts overlay.
+    pub dismiss_launch_tips: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -376,8 +383,10 @@ pub fn draw_ui(ctx: &Context, input: DrawInput<'_>) -> UiActions {
             actions.mute_toggled = Some(!input.audio.muted);
         }
         if i.key_pressed(Key::Escape) {
-            // Settings first, then leave fullscreen (Esc must exit plein écran).
-            if input.chrome.settings_open {
+            // Launch tips → settings → leave fullscreen.
+            if input.chrome.launch_tips_alpha > 0.01 {
+                actions.dismiss_launch_tips = true;
+            } else if input.chrome.settings_open {
                 actions.close_settings = true;
             } else if input.chrome.fullscreen {
                 actions.toggle_fullscreen = true;
@@ -406,6 +415,16 @@ pub fn draw_ui(ctx: &Context, input: DrawInput<'_>) -> UiActions {
 
     if input.chrome.toolbar_visible {
         draw_toolbar(ctx, i18n, input.chrome, &mut actions);
+    }
+
+    if input.chrome.launch_tips_alpha > 0.01 {
+        draw_launch_tips(
+            ctx,
+            i18n,
+            input.chrome.launch_tips_alpha,
+            input.logo.as_ref(),
+            &mut actions,
+        );
     }
 
     // Status toasts / signal hints (non-blocking).
@@ -1237,6 +1256,22 @@ fn draw_info_tab(ui: &mut egui::Ui, input: &DrawInput<'_>, actions: &mut UiActio
     draw_metrics_body(ui, i18n, o, true);
     ui.add_space(8.0);
     ui.separator();
+    ui.label(RichText::new(i18n.t("label_language")).strong());
+    ui.label(RichText::new(i18n.t("tip_language")).small().italics());
+    ui.horizontal(|ui| {
+        let current = i18n.lang().as_str();
+        for (id, label_key) in [("en", "lang_en"), ("fr", "lang_fr")] {
+            if ui
+                .selectable_label(current == id, i18n.t(label_key))
+                .clicked()
+                && current != id
+            {
+                actions.language_changed = Some(id);
+            }
+        }
+    });
+    ui.add_space(8.0);
+    ui.separator();
     ui.label(RichText::new(i18n.t("label_discord")).strong());
     ui.label(RichText::new(i18n.t("tip_discord")).small().italics());
     let mut enabled = o.discord_presence;
@@ -1479,6 +1514,141 @@ fn draw_brand_header(
         });
     });
     ui.add_space(6.0);
+}
+
+/// Soft, centered shortcuts card shown once after launch (auto-fades; Esc/click dismiss).
+fn draw_launch_tips(
+    ctx: &Context,
+    i18n: &I18n,
+    alpha: f32,
+    logo: Option<&egui::TextureHandle>,
+    actions: &mut UiActions,
+) {
+    let a = alpha.clamp(0.0, 1.0);
+    // Smooth fade without a busy loop (display FPS still caps presents).
+    ctx.request_repaint_after(std::time::Duration::from_millis(16));
+    // Any click dismisses (button / card / empty space).
+    if ctx.input(|i| i.pointer.any_click()) {
+        actions.dismiss_launch_tips = true;
+    }
+
+    let fill = Color32::from_rgba_unmultiplied(12, 14, 18, (200.0 * a) as u8);
+    let text = Color32::from_rgba_unmultiplied(235, 238, 245, (255.0 * a) as u8);
+    let muted = Color32::from_rgba_unmultiplied(180, 186, 198, (220.0 * a) as u8);
+
+    let rows = [
+        ("launch_tips_key_f1", "launch_tips_desc_f1"),
+        ("launch_tips_key_f2", "launch_tips_desc_f2"),
+        ("launch_tips_key_f11", "launch_tips_desc_f11"),
+        ("launch_tips_key_esc", "launch_tips_desc_esc"),
+        ("launch_tips_key_pin", "launch_tips_desc_pin"),
+        ("launch_tips_key_mouse", "launch_tips_desc_mouse"),
+    ];
+
+    egui::Area::new(egui::Id::new("launch_tips"))
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .order(egui::Order::Foreground)
+        .show(ctx, |ui| {
+            let frame = egui::Frame::NONE
+                .fill(fill)
+                .corner_radius(egui::CornerRadius::same(10))
+                .inner_margin(egui::Margin::symmetric(20, 16))
+                .stroke(egui::Stroke::new(
+                    1.0_f32,
+                    Color32::from_rgba_unmultiplied(80, 90, 110, (140.0 * a) as u8),
+                ));
+            frame.show(ui, |ui| {
+                ui.set_min_width(360.0);
+                ui.horizontal(|ui| {
+                    if let Some(tex) = logo {
+                        ui.add(
+                            egui::Image::new(tex)
+                                .fit_to_exact_size(egui::vec2(28.0, 28.0))
+                                .tint(Color32::from_rgba_unmultiplied(255, 255, 255, (255.0 * a) as u8)),
+                        );
+                    }
+                    ui.label(
+                        RichText::new(i18n.t("launch_tips_title"))
+                            .strong()
+                            .color(text)
+                            .size(16.0),
+                    );
+                });
+                ui.add_space(12.0);
+                for (key_id, desc_id) in rows {
+                    draw_launch_tip_row(ui, a, &i18n.t(key_id), &i18n.t(desc_id), text);
+                    ui.add_space(6.0);
+                }
+                ui.add_space(6.0);
+                ui.label(RichText::new(i18n.t("launch_tips_hint")).small().color(muted));
+                ui.add_space(8.0);
+                let _ = ui.add_enabled(a > 0.4, egui::Button::new(i18n.t("launch_tips_dismiss")));
+            });
+        });
+}
+
+/// Keyboard-key style chip + purpose label (matches CaptureView dark chrome).
+fn draw_launch_tip_row(ui: &mut egui::Ui, alpha: f32, key: &str, purpose: &str, text: Color32) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 12.0;
+        draw_keycap(ui, alpha, key);
+        ui.vertical(|ui| {
+            ui.add_space(4.0);
+            ui.label(RichText::new(purpose).color(text).size(14.0));
+        });
+    });
+}
+
+fn draw_keycap(ui: &mut egui::Ui, alpha: f32, label: &str) {
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let galley = ui.fonts(|f| f.layout_no_wrap(label.to_owned(), font, Color32::WHITE));
+    let pad_x = 12.0_f32;
+    let pad_y = 6.0_f32;
+    let min_w = 52.0_f32;
+    let size = egui::vec2(
+        (galley.size().x + pad_x * 2.0).max(min_w),
+        (galley.size().y + pad_y * 2.0).max(28.0),
+    );
+    let (rect, _resp) = ui.allocate_exact_size(size, Sense::hover());
+    let painter = ui.painter_at(rect);
+
+    let radius = egui::CornerRadius::same(5);
+    // Soft “raised key” stack: shadow lip → face → top highlight.
+    let shadow = Color32::from_rgba_unmultiplied(0, 0, 0, (110.0 * alpha) as u8);
+    let face = Color32::from_rgba_unmultiplied(36, 42, 54, (235.0 * alpha) as u8);
+    let edge = Color32::from_rgba_unmultiplied(120, 135, 160, (200.0 * alpha) as u8);
+    let label_c = Color32::from_rgba_unmultiplied(245, 248, 255, (255.0 * alpha) as u8);
+
+    let lip = rect.translate(egui::vec2(0.0, 2.0));
+    painter.rect_filled(lip, radius, shadow);
+    painter.rect_filled(rect, radius, face);
+    painter.rect_stroke(
+        rect,
+        radius,
+        egui::Stroke::new(1.0_f32, edge),
+        egui::StrokeKind::Inside,
+    );
+    // Subtle top sheen.
+    let sheen = egui::Rect::from_min_max(
+        rect.left_top() + egui::vec2(2.0, 2.0),
+        egui::pos2(rect.right() - 2.0, rect.top() + 5.0),
+    );
+    painter.rect_filled(
+        sheen,
+        egui::CornerRadius {
+            nw: 3,
+            ne: 3,
+            sw: 0,
+            se: 0,
+        },
+        Color32::from_rgba_unmultiplied(255, 255, 255, (22.0 * alpha) as u8),
+    );
+
+    let text_pos = egui::pos2(
+        rect.center().x - galley.size().x * 0.5,
+        rect.center().y - galley.size().y * 0.5 - 0.5,
+    );
+    painter.galley(text_pos, galley, label_c);
 }
 
 fn draw_wizard(

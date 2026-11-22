@@ -1,5 +1,13 @@
 //! CaptureView step (a): wgpu window + MockVideoSource preview.
 
+// Release Windows builds: no console flash. Debug always keeps a console.
+// Opt back in with `--features console` (useful for live stderr while testing release).
+// Logs always go to `%APPDATA%\CaptureView\logs\` regardless.
+#![cfg_attr(
+    all(windows, not(debug_assertions), not(feature = "console")),
+    windows_subsystem = "windows"
+)]
+
 mod brand;
 mod discord_presence;
 mod i18n;

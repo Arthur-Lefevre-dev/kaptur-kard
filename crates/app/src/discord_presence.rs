@@ -116,8 +116,8 @@ mod tests {
 fn worker(app_id: String, rx: Receiver<Cmd>) {
     let mut client = DiscordIpcClient::new(&app_id);
     let mut connected = false;
-    let mut details = String::from("Capture HDMI");
-    let mut state = String::from("En ligne");
+    let mut details = String::from("Capture");
+    let mut state = String::from("Ready");
     let started = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)

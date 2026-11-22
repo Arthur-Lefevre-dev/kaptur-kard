@@ -16,6 +16,8 @@ default = []
 directshow = ["capture/directshow"]
 # Optional NVIDIA Streamline / DLSS probe — see docs/DLSS.md (SDK not vendored).
 dlss = ["render/dlss"]
+# Keep a console window on Windows release builds (default release uses windows_subsystem).
+console = []
 
 [dependencies]
 capture = { workspace = true, features = ["mock"] }
@@ -38,7 +40,6 @@ parking_lot = { workspace = true }
 pollster = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
-sys-locale = { workspace = true }
 arboard = { version = "3" }
 discord-rich-presence = "1.1.0"
 image = { version = "0.25", default-features = false, features = ["png"] }
