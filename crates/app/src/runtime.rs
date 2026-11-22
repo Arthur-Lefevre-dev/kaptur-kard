@@ -162,6 +162,10 @@ pub struct App {
     lag_test_started: Option<Instant>,
     lag_flash_until: Option<Instant>,
     last_hotplug_at: Instant,
+    /// True while stop/start runs — keep showing the last GPU frame (audio stays up).
+    capture_restarting: bool,
+    prefs_dirty: bool,
+    prefs_dirty_at: Instant,
     /// Per-device last FormatDesc for reconnect-after-unplug.
     device_settings: HashMap<String, FormatDesc>,
 }
@@ -375,6 +379,9 @@ impl Default for App {
             lag_test_started: None,
             lag_flash_until: None,
             last_hotplug_at: Instant::now(),
+            capture_restarting: false,
+            prefs_dirty: false,
+            prefs_dirty_at: Instant::now(),
             device_settings: HashMap::new(),
         }
     }
@@ -463,6 +470,7 @@ impl ApplicationHandler for App {
             WindowEvent::CloseRequested => {
                 self.persist_audio_prefs();
                 self.persist_ui_prefs();
+                self.flush_prefs_now();
                 self.audio.stop();
                 self.stop_source();
                 event_loop.exit();
@@ -483,33 +491,21 @@ impl ApplicationHandler for App {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.poll_hotplug();
+        self.flush_prefs_if_due();
 
-        let has_pending = self
-            .source
-            .as_ref()
-            .map(|s| !s.receiver().is_empty())
-            .unwrap_or(false);
-        let min_gap = if has_pending {
-            Duration::from_millis(0)
-        } else {
-            Duration::from_secs_f64(1.0 / self.target_display_hz())
-        };
-
-        let due = self.last_redraw_at.elapsed() >= min_gap;
-        if has_pending || due {
+        // Always honor the display FPS cap — pending capture frames must wait in the
+        // drop-oldest bus (Arthur saw 240 FPS écran with limit 120 when has_pending bypassed).
+        let period = Duration::from_secs_f64(1.0 / self.target_display_hz());
+        let due = self.last_redraw_at.elapsed() >= period;
+        if due {
             if let Some(gpu) = self.gpu.as_ref() {
                 gpu.window.request_redraw();
             }
         }
-
-        let wait = if has_pending {
-            Duration::from_millis(1)
-        } else {
-            min_gap
-                .saturating_sub(self.last_redraw_at.elapsed())
-                .max(Duration::from_millis(1))
-                .min(Duration::from_millis(33))
-        };
+        let wait = period
+            .saturating_sub(self.last_redraw_at.elapsed())
+            .max(Duration::from_millis(1))
+            .min(Duration::from_millis(33));
         event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + wait));
     }
 }
@@ -584,23 +580,37 @@ impl App {
         device_idx: usize,
         format: FormatDesc,
     ) -> Result<(), CaptureError> {
+        // Hold last presented frame through stop/join/start so the picture does not
+        // flash "Pas de signal" while audio keeps playing.
+        self.capture_restarting = true;
+        self.last_frame_at = Instant::now();
         self.stop_source();
         let info = self.devices[device_idx].clone();
-        let mut source = match info.backend {
-            "mock" => ActiveSource::Mock(MockVideoSource::new()),
-            #[cfg(windows)]
-            "mf" => ActiveSource::Mf(capture::MfVideoSource::open(info.clone())?),
-            #[cfg(target_os = "linux")]
-            "v4l2" => ActiveSource::V4l2(capture::V4l2VideoSource::open(info.clone())?),
-            #[cfg(target_os = "macos")]
-            "avf" => ActiveSource::Avf(capture::AvfVideoSource::open(info.clone())?),
-            other => {
-                return Err(CaptureError::Unsupported(format!(
-                    "backend '{other}' not available on this OS"
-                )));
+        let result = (|| -> Result<ActiveSource, CaptureError> {
+            let mut source = match info.backend {
+                "mock" => ActiveSource::Mock(MockVideoSource::new()),
+                #[cfg(windows)]
+                "mf" => ActiveSource::Mf(capture::MfVideoSource::open(info.clone())?),
+                #[cfg(target_os = "linux")]
+                "v4l2" => ActiveSource::V4l2(capture::V4l2VideoSource::open(info.clone())?),
+                #[cfg(target_os = "macos")]
+                "avf" => ActiveSource::Avf(capture::AvfVideoSource::open(info.clone())?),
+                other => {
+                    return Err(CaptureError::Unsupported(format!(
+                        "backend '{other}' not available on this OS"
+                    )));
+                }
+            };
+            source.start(&format)?;
+            Ok(source)
+        })();
+        let source = match result {
+            Ok(s) => s,
+            Err(e) => {
+                self.capture_restarting = false;
+                return Err(e);
             }
         };
-        source.start(&format)?;
         self.overlay.device_busy = false;
         if info.backend != "mock" {
             self.device_settings
@@ -630,6 +640,7 @@ impl App {
         self.running = true;
         self.last_frame_at = Instant::now();
         self.black_since = None;
+        self.capture_restarting = false;
         Ok(())
     }
 
@@ -1164,7 +1175,32 @@ impl App {
         self.ui_prefs.sharpness = self.effects_ui.sharpness;
         self.ui_prefs.interp_mode = self.effects_ui.interp_mode.clone();
         self.ui_prefs.deinterlace_mode = self.effects_ui.deinterlace_mode.clone();
+        // Debounce disk writes — sync save on every slider tick froze the picture.
+        self.prefs_dirty = true;
+        self.prefs_dirty_at = Instant::now();
+    }
+
+    fn flush_prefs_if_due(&mut self) {
+        if !self.prefs_dirty {
+            return;
+        }
+        if self.prefs_dirty_at.elapsed() < Duration::from_millis(400) {
+            return;
+        }
         save_ui_prefs(&self.ui_prefs);
+        self.prefs_dirty = false;
+    }
+
+    fn flush_prefs_now(&mut self) {
+        if !self.prefs_dirty {
+            self.ui_prefs.wizard_step = self.chrome.wizard_step;
+            self.ui_prefs.upscale_mode = self.effects_ui.mode.clone();
+            self.ui_prefs.sharpness = self.effects_ui.sharpness;
+            self.ui_prefs.interp_mode = self.effects_ui.interp_mode.clone();
+            self.ui_prefs.deinterlace_mode = self.effects_ui.deinterlace_mode.clone();
+        }
+        save_ui_prefs(&self.ui_prefs);
+        self.prefs_dirty = false;
     }
 
     fn sync_effects_ui(&mut self) {
@@ -1329,8 +1365,10 @@ impl App {
             stream_health,
             StreamHealth::DeviceBusy | StreamHealth::StreamError
         );
-        // True HDMI black / no input: do not conflate with HW busy (OBS, etc.).
-        let no_signal = !device_busy && self.last_frame_at.elapsed() > Duration::from_secs(1);
+        // True HDMI black / no input — never during an intentional capture restart.
+        let no_signal = !device_busy
+            && !self.capture_restarting
+            && self.last_frame_at.elapsed() > Duration::from_secs(1);
         let soft_black = self
             .black_since
             .map(|t| t.elapsed() > Duration::from_secs(3))

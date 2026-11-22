@@ -890,7 +890,9 @@ impl VideoSource for MfVideoSource {
                 .map_err(|e| CaptureError::Other(Box::new(e)))?,
         );
 
-        match ready_rx.recv_timeout(std::time::Duration::from_secs(10)) {
+        // Keep UI responsive when switching formats — long stalls froze the picture
+        // while audio kept playing.
+        match ready_rx.recv_timeout(std::time::Duration::from_secs(3)) {
             Ok(Ok(_)) => Ok(()),
             Ok(Err(e)) => {
                 self.running.store(false, Ordering::SeqCst);
