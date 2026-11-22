@@ -1,6 +1,7 @@
 //! winit + wgpu + egui runtime with Mock and platform video sources.
 
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -458,12 +459,18 @@ impl ApplicationHandler for App {
         _window_id: WindowId,
         event: WindowEvent,
     ) {
+        // Compute before borrowing GPU (egui repaint must honor the same FPS cap).
+        let period = Duration::from_secs_f64(1.0 / self.target_display_hz());
+        let redraw_due = self.last_redraw_at.elapsed() >= period;
+
         let Some(gpu) = self.gpu.as_mut() else {
             return;
         };
 
         let egui_response = gpu.egui_state.on_window_event(&gpu.window, &event);
-        if egui_response.repaint {
+        // Defer egui repaints through the display-FPS cap (Mesures used to
+        // request_redraw unbound and fight WaitUntil pacing).
+        if egui_response.repaint && redraw_due {
             gpu.window.request_redraw();
         }
 
@@ -494,19 +501,34 @@ impl ApplicationHandler for App {
         self.poll_hotplug();
         self.flush_prefs_if_due();
 
-        // Always honor the display FPS cap — pending capture frames must wait in the
-        // drop-oldest bus (Arthur saw 240 FPS écran with limit 120 when has_pending bypassed).
+        // Always honor the display FPS cap — never let has_pending alone bypass it
+        // (Arthur saw 240 FPS écran with limit 120 when pending woke every tick).
         let period = Duration::from_secs_f64(1.0 / self.target_display_hz());
-        let due = self.last_redraw_at.elapsed() >= period;
+        let elapsed = self.last_redraw_at.elapsed();
+        let has_pending = self
+            .source
+            .as_ref()
+            .map(|s| !s.receiver().is_empty())
+            .unwrap_or(false);
+        let due = elapsed >= period;
         if due {
             if let Some(gpu) = self.gpu.as_ref() {
                 gpu.window.request_redraw();
             }
         }
-        let wait = period
-            .saturating_sub(self.last_redraw_at.elapsed())
-            .max(Duration::from_millis(1))
-            .min(Duration::from_millis(33));
+        // If a capture frame is waiting, wake exactly when the cap allows so we
+        // present it on the next legal tick instead of drifting into a coalesce.
+        let wait = if has_pending && !due {
+            period
+                .saturating_sub(elapsed)
+                .max(Duration::from_micros(200))
+                .min(Duration::from_millis(33))
+        } else {
+            period
+                .saturating_sub(elapsed)
+                .max(Duration::from_millis(1))
+                .min(Duration::from_millis(33))
+        };
         event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + wait));
     }
 }
@@ -542,18 +564,23 @@ impl App {
         hz.clamp(24.0, 360.0)
     }
 
-    /// Game profile: AutoNoVsync + lower swap latency. Other profiles: AutoVsync.
+    /// Auto/Game: AutoNoVsync + latency 1. We already software-pace in `about_to_wait`;
+    /// pairing that with Fifo (AutoVsync) phase-beats the refresh → ~20 ms frames →
+    /// 1% low ≈ 48 on a 60 Hz capture (Arthur). Quality/Economy keep AutoVsync.
     fn apply_present_mode_for_profile(&mut self) {
         let Some(gpu) = self.gpu.as_mut() else {
             return;
         };
-        let game = self.selection.mode == CaptureMode::Game;
-        let want = if game {
+        let low_latency = matches!(
+            self.selection.mode,
+            CaptureMode::Game | CaptureMode::Auto
+        );
+        let want = if low_latency {
             wgpu::PresentMode::AutoNoVsync
         } else {
             wgpu::PresentMode::AutoVsync
         };
-        let latency = if game { 1 } else { 2 };
+        let latency = if low_latency { 1 } else { 2 };
         if gpu.config.present_mode == want && gpu.config.desired_maximum_frame_latency == latency {
             return;
         }
@@ -1509,19 +1536,12 @@ impl App {
         };
 
         let new_capture = latest.is_some();
+        // Pipeline delay only updates on a fresh capture; frame-time / 1% low are
+        // recorded after swapchain present so they match FPS écran (not coalesce gaps).
+        let mut latency_ns = self.metrics.last_latency_ns.load(Ordering::Relaxed);
         if let Some(frame) = latest {
-            let latency_ns = frame.captured_at.elapsed().as_nanos() as u64;
+            latency_ns = frame.captured_at.elapsed().as_nanos() as u64;
             if upload_frame(&gpu.device, &gpu.queue, &mut gpu.pipeline, &frame) {
-                let now = Instant::now();
-                let frame_time_ns = self
-                    .last_present_at
-                    .map(|t| now.duration_since(t).as_nanos() as u64)
-                    .unwrap_or(0);
-                self.last_present_at = Some(now);
-                self.metrics.record_present(latency_ns, frame_time_ns);
-                let frame_ms = frame_time_ns as f32 / 1_000_000.0;
-                let _ = gpu.upscale.observe_frame_ms(frame_ms);
-                let _ = gpu.interpolate.observe_frame_ms(frame_ms);
                 let rate = self
                     .current_format
                     .frame_rates
@@ -1785,6 +1805,17 @@ impl App {
                 .chain(std::iter::once(encoder.finish())),
         );
         frame.present();
+
+        let now = Instant::now();
+        let frame_time_ns = self
+            .last_present_at
+            .map(|t| now.duration_since(t).as_nanos() as u64)
+            .unwrap_or(0);
+        self.last_present_at = Some(now);
+        self.metrics.record_present(latency_ns, frame_time_ns);
+        let frame_ms = frame_time_ns as f32 / 1_000_000.0;
+        let _ = gpu.upscale.observe_frame_ms(frame_ms);
+        let _ = gpu.interpolate.observe_frame_ms(frame_ms);
         }
 
         // GPU borrow ended with the block above; safe to restart capture from UI.
