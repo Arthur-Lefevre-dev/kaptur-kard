@@ -48,6 +48,9 @@ pub struct UiPrefs {
     pub dlssg_multiplier: String,
     #[serde(default)]
     pub interp_mode: String,
+    /// Optical framegen Mid motion blur (0 = off … 1 = strong).
+    #[serde(default)]
+    pub interp_motion_blur: f32,
     #[serde(default = "default_deinterlace")]
     pub deinterlace_mode: String,
     /// Cap on display presents. 0 = Auto (capture, or 2× with frame gen). 9999 = unlimited.
@@ -146,6 +149,7 @@ impl Default for UiPrefs {
             dlss_boost: true,
             dlssg_multiplier: "off".into(),
             interp_mode: "off".into(),
+            interp_motion_blur: 0.0,
             deinterlace_mode: "auto".into(),
             display_fps_limit: 0,
             vsync_mode: default_vsync(),

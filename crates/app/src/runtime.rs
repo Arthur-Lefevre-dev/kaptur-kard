@@ -418,6 +418,7 @@ impl Default for App {
                 mode: ui_prefs.upscale_mode.clone(),
                 sharpness: ui_prefs.sharpness.clamp(0.0, 1.0),
                 interp_mode: ui_prefs.interp_mode.clone(),
+                interp_motion_blur: ui_prefs.interp_motion_blur.clamp(0.0, 1.0),
                 deinterlace_mode: ui_prefs.deinterlace_mode.clone(),
                 source_interlaced: format.interlaced,
                 vsync_mode: normalize_vsync_mode(&ui_prefs.vsync_mode),
@@ -549,6 +550,8 @@ impl ApplicationHandler<UserEvent> for App {
         ));
         gpu.interpolate
             .set_mode(InterpMode::from_str_lossy(&self.effects_ui.interp_mode));
+        gpu.interpolate
+            .set_motion_blur(self.effects_ui.interp_motion_blur);
         gpu.deinterlace
             .set_mode(DeinterlaceMode::from_str_lossy(&self.effects_ui.deinterlace_mode));
         gpu.deinterlace
@@ -1319,6 +1322,7 @@ impl App {
             self.effects_ui.mode = "off".into();
             self.effects_ui.sharpness = 0.4;
             self.effects_ui.interp_mode = "off".into();
+            self.effects_ui.interp_motion_blur = 0.0;
             self.effects_ui.deinterlace_mode = "auto".into();
             self.effects_ui.vsync_mode = "auto".into();
             self.ui_prefs.vsync_mode = "auto".into();
@@ -1329,6 +1333,7 @@ impl App {
                 gpu.upscale.set_mode(UpscaleMode::Off);
                 gpu.upscale.set_sharpness(0.4);
                 gpu.interpolate.set_mode(InterpMode::Off);
+                gpu.interpolate.set_motion_blur(0.0);
                 gpu.deinterlace.set_mode(DeinterlaceMode::Auto);
             }
             self.apply_present_mode_for_profile();
@@ -1467,6 +1472,15 @@ impl App {
             }
             self.persist_ui_prefs();
         }
+        if let Some(blur) = actions.interp_motion_blur_changed {
+            let blur = blur.clamp(0.0, 1.0);
+            self.effects_ui.interp_motion_blur = blur;
+            self.ui_prefs.interp_motion_blur = blur;
+            if let Some(gpu) = self.gpu.as_mut() {
+                gpu.interpolate.set_motion_blur(blur);
+            }
+            self.persist_ui_prefs();
+        }
         if let Some(limit) = actions.display_fps_limit {
             self.ui_prefs.display_fps_limit = limit;
             self.overlay.display_fps_limit = limit;
@@ -1559,6 +1573,7 @@ impl App {
         self.ui_prefs.dlss_boost = self.effects_ui.dlss_boost;
         self.ui_prefs.dlssg_multiplier = self.effects_ui.dlssg_multiplier.clone();
         self.ui_prefs.interp_mode = self.effects_ui.interp_mode.clone();
+        self.ui_prefs.interp_motion_blur = self.effects_ui.interp_motion_blur;
         self.ui_prefs.deinterlace_mode = self.effects_ui.deinterlace_mode.clone();
         self.ui_prefs.vsync_mode = normalize_vsync_mode(&self.effects_ui.vsync_mode);
         // Debounce disk writes — sync save on every slider tick froze the picture.
@@ -1585,6 +1600,7 @@ impl App {
             self.ui_prefs.dlss_boost = self.effects_ui.dlss_boost;
             self.ui_prefs.dlssg_multiplier = self.effects_ui.dlssg_multiplier.clone();
             self.ui_prefs.interp_mode = self.effects_ui.interp_mode.clone();
+            self.ui_prefs.interp_motion_blur = self.effects_ui.interp_motion_blur;
             self.ui_prefs.deinterlace_mode = self.effects_ui.deinterlace_mode.clone();
             self.ui_prefs.vsync_mode = normalize_vsync_mode(&self.effects_ui.vsync_mode);
         }
