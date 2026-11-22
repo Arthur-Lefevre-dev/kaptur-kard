@@ -554,6 +554,108 @@ impl InterpolateEngine {
         }
     }
 
+    /// Like [`prepare`] but ingests an already color-converted (and optionally deinterlaced) RGBA texture.
+    pub fn prepare_from_texture(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        src: &wgpu::Texture,
+        width: u32,
+        height: u32,
+        new_capture: bool,
+    ) -> Option<InterpFrame> {
+        if !self.active() || width == 0 || height == 0 {
+            return None;
+        }
+        let _ = queue;
+        ensure_rgba(device, &mut self.curr, width, height, "interp-curr", false);
+        ensure_rgba(device, &mut self.prev, width, height, "interp-prev", false);
+        ensure_rgba(device, &mut self.mid, width, height, "interp-mid", true);
+        ensure_flow(device, &mut self.flow, width, height);
+
+        if let Some(curr) = self.curr.as_ref() {
+            encoder.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: src,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: &curr.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+
+        if new_capture && self.has_prev {
+            self.dispatch_flow_warp(device, queue, encoder, width, height);
+            self.pending_mid = true;
+            if let (Some(curr), Some(prev)) = (self.curr.as_ref(), self.prev.as_ref()) {
+                encoder.copy_texture_to_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &curr.texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &prev.texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::Extent3d {
+                        width,
+                        height,
+                        depth_or_array_layers: 1,
+                    },
+                );
+            }
+        } else if new_capture && !self.has_prev {
+            if let (Some(curr), Some(prev)) = (self.curr.as_ref(), self.prev.as_ref()) {
+                encoder.copy_texture_to_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &curr.texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &prev.texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::Extent3d {
+                        width,
+                        height,
+                        depth_or_array_layers: 1,
+                    },
+                );
+            }
+            self.has_prev = true;
+            self.block = InterpBlockReason::NeedPrevFrame;
+        }
+
+        if self.pending_mid {
+            self.pending_mid = false;
+            self.block = InterpBlockReason::None;
+            Some(InterpFrame::Mid)
+        } else {
+            self.block = InterpBlockReason::None;
+            Some(InterpFrame::Curr)
+        }
+    }
+
     /// Letterbox-present an RGBA view to the swapchain.
     pub fn present_view(
         &self,

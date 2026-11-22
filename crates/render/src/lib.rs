@@ -9,6 +9,7 @@ pub mod present;
 pub mod upload;
 pub mod upscale;
 
+pub use deinterlace::{DeinterlaceEngine, DeinterlaceMode};
 pub use gpu::GpuContext;
 pub use pipeline::VideoPipeline;
 pub use interpolate::{

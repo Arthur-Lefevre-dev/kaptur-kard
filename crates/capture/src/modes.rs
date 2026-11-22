@@ -216,26 +216,58 @@ mod tests {
                 width: 1280,
                 height: 720,
                 frame_rates: vec![Rational::new(30, 1), Rational::new(60, 1)],
+                interlaced: false,
             },
             FormatDesc {
                 pixel_format: PixelFormat::Yuy2,
                 width: 1920,
                 height: 1080,
                 frame_rates: vec![Rational::new(60, 1)],
+                interlaced: false,
             },
             FormatDesc {
                 pixel_format: PixelFormat::Mjpeg,
                 width: 1920,
                 height: 1080,
                 frame_rates: vec![Rational::new(60, 1)],
+                interlaced: false,
             },
             FormatDesc {
                 pixel_format: PixelFormat::Bgra8,
                 width: 3840,
                 height: 2160,
                 frame_rates: vec![Rational::new(30, 1)],
+                interlaced: false,
+            },
+            FormatDesc {
+                pixel_format: PixelFormat::Yuy2,
+                width: 720,
+                height: 480,
+                frame_rates: vec![Rational::new(30000, 1001)],
+                interlaced: true,
+            },
+            FormatDesc {
+                pixel_format: PixelFormat::Nv12,
+                width: 1920,
+                height: 1080,
+                frame_rates: vec![Rational::new(30000, 1001)],
+                interlaced: true,
             },
         ]
+    }
+
+    #[test]
+    fn interlaced_modes_are_selectable() {
+        let caps = caps();
+        let i480 = pick_format_at(&caps, 720, 480, Rational::new(30000, 1001)).expect("480i");
+        assert!(i480.interlaced);
+        let i1080 = pick_format_at(&caps, 1920, 1080, Rational::new(30000, 1001)).expect("1080i");
+        assert!(i1080.interlaced);
+        // Auto still prefers progressive 1080p60 when available.
+        let auto = select_auto(&caps).expect("auto");
+        assert!(!auto.interlaced);
+        assert_eq!(auto.height, 1080);
+        assert!((auto.frame_rates[0].as_f64() - 60.0).abs() < 0.01);
     }
 
     #[test]
@@ -262,7 +294,9 @@ mod tests {
     #[test]
     fn economy_prefers_small() {
         let selected = select_economy(&caps()).expect("caps");
-        assert_eq!(selected.width, 1280);
+        // Smallest area among fixtures (includes 720x480 interlaced).
+        assert_eq!(selected.width, 720);
+        assert_eq!(selected.height, 480);
     }
 
     #[test]

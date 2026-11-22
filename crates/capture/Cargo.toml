@@ -9,6 +9,9 @@ rust-version.workspace = true
 [features]
 default = ["mock"]
 mock = []
+# Optional DirectShow last-resort backend (Windows). Off by default so MF is unchanged.
+# Currently scaffolding: enumeration is empty; see platform/windows_dshow.rs.
+directshow = []
 
 [dependencies]
 serde = { workspace = true }
@@ -23,3 +26,6 @@ windows = { version = "0.58", features = [
     "Win32_System_Com",
     "Win32_Foundation",
 ] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+v4l = { version = "0.14", default-features = true }

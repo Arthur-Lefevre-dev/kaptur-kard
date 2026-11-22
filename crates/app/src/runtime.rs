@@ -1,5 +1,6 @@
-//! winit + wgpu + egui runtime with Mock and Media Foundation sources.
+//! winit + wgpu + egui runtime with Mock and platform video sources.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -17,8 +18,8 @@ use metrics::{sample_process, SharedMetrics};
 use render::pipeline::VideoPipeline;
 use render::upload::upload_frame;
 use render::{
-    target_size, InterpBlockReason, InterpMode, InterpolateEngine, UpscaleBlockReason,
-    UpscaleEngine, UpscaleMode,
+    target_size, DeinterlaceEngine, DeinterlaceMode, InterpBlockReason, InterpMode,
+    InterpolateEngine, UpscaleBlockReason, UpscaleEngine, UpscaleMode,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -38,6 +39,10 @@ enum ActiveSource {
     Mock(MockVideoSource),
     #[cfg(windows)]
     Mf(capture::MfVideoSource),
+    #[cfg(target_os = "linux")]
+    V4l2(capture::V4l2VideoSource),
+    #[cfg(target_os = "macos")]
+    Avf(capture::AvfVideoSource),
 }
 
 impl ActiveSource {
@@ -46,6 +51,10 @@ impl ActiveSource {
             Self::Mock(s) => s.info(),
             #[cfg(windows)]
             Self::Mf(s) => s.info(),
+            #[cfg(target_os = "linux")]
+            Self::V4l2(s) => s.info(),
+            #[cfg(target_os = "macos")]
+            Self::Avf(s) => s.info(),
         }
     }
 
@@ -54,6 +63,10 @@ impl ActiveSource {
             Self::Mock(s) => s.start(selected),
             #[cfg(windows)]
             Self::Mf(s) => s.start(selected),
+            #[cfg(target_os = "linux")]
+            Self::V4l2(s) => s.start(selected),
+            #[cfg(target_os = "macos")]
+            Self::Avf(s) => s.start(selected),
         }
     }
 
@@ -62,6 +75,10 @@ impl ActiveSource {
             Self::Mock(s) => s.stop(),
             #[cfg(windows)]
             Self::Mf(s) => s.stop(),
+            #[cfg(target_os = "linux")]
+            Self::V4l2(s) => s.stop(),
+            #[cfg(target_os = "macos")]
+            Self::Avf(s) => s.stop(),
         }
     }
 
@@ -70,6 +87,10 @@ impl ActiveSource {
             Self::Mock(s) => s.receiver(),
             #[cfg(windows)]
             Self::Mf(s) => s.receiver(),
+            #[cfg(target_os = "linux")]
+            Self::V4l2(s) => s.receiver(),
+            #[cfg(target_os = "macos")]
+            Self::Avf(s) => s.receiver(),
         }
     }
 }
@@ -82,12 +103,15 @@ struct GpuState {
     pipeline: VideoPipeline,
     upscale: UpscaleEngine,
     interpolate: InterpolateEngine,
+    deinterlace: DeinterlaceEngine,
     window: Arc<Window>,
     egui_renderer: egui_wgpu::Renderer,
     egui_state: EguiWinitState,
     egui_ctx: egui::Context,
     adapter_name: String,
 }
+
+const HOTPLUG_INTERVAL: Duration = Duration::from_secs(2);
 
 pub struct App {
     gpu: Option<GpuState>,
@@ -119,28 +143,46 @@ pub struct App {
     process_sample_at: Instant,
     lag_test_started: Option<Instant>,
     lag_flash_until: Option<Instant>,
+    last_hotplug_at: Instant,
+    /// Per-device last FormatDesc for reconnect-after-unplug.
+    device_settings: HashMap<String, FormatDesc>,
 }
 
 impl Default for App {
     fn default() -> Self {
         let mock_info = MockVideoSource::device_info();
         let mut devices = vec![mock_info.clone()];
-        #[cfg(windows)]
-        match capture::enumerate_devices() {
+        match capture::list_devices() {
             Ok(mut real) => {
-                tracing::info!(count = real.len(), "MF devices enumerated");
+                tracing::info!(count = real.len(), "platform devices enumerated");
                 devices.append(&mut real);
             }
-            Err(e) => tracing::warn!(error = %e, "MF enumeration failed; mock only"),
+            Err(e) => tracing::warn!(error = %e, "device enumeration failed; mock only"),
         }
 
-        let device_idx = devices
-            .iter()
-            .enumerate()
-            .filter(|(_, d)| d.backend != "mock" && !d.formats.is_empty())
-            .max_by_key(|(_, d)| capture::device_capture_score(&d.display_name))
-            .map(|(i, _)| i)
-            .unwrap_or(0);
+        let ui_prefs_early = load_ui_prefs();
+        let device_idx = if !ui_prefs_early.last_device_id.is_empty() {
+            devices
+                .iter()
+                .position(|d| d.id.as_str() == ui_prefs_early.last_device_id)
+                .unwrap_or_else(|| {
+                    devices
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, d)| d.backend != "mock" && !d.formats.is_empty())
+                        .max_by_key(|(_, d)| capture::device_capture_score(&d.display_name))
+                        .map(|(i, _)| i)
+                        .unwrap_or(0)
+                })
+        } else {
+            devices
+                .iter()
+                .enumerate()
+                .filter(|(_, d)| d.backend != "mock" && !d.formats.is_empty())
+                .max_by_key(|(_, d)| capture::device_capture_score(&d.display_name))
+                .map(|(i, _)| i)
+                .unwrap_or(0)
+        };
 
         let caps = &devices[device_idx].formats;
         let format = modes::select_format(CaptureMode::Auto, caps)
@@ -164,11 +206,28 @@ impl Default for App {
             delay_ms: prefs.delay_ms,
             buffer_ms: prefs.buffer_ms,
         };
-        let ui_prefs = load_ui_prefs();
+        let ui_prefs = ui_prefs_early;
         let i18n = I18n::load();
         let mut chrome = UiChrome::default();
         chrome.wizard_open = !ui_prefs.wizard_done;
         chrome.wizard_step = ui_prefs.wizard_step.min(2);
+
+        // Prefer last resolution/rate for this device when still advertised.
+        let format = if ui_prefs.last_width > 0
+            && ui_prefs.last_height > 0
+            && ui_prefs.last_rate_den > 0
+        {
+            let rate = Rational::new(ui_prefs.last_rate_num.max(1), ui_prefs.last_rate_den);
+            modes::pick_format_at(
+                &devices[device_idx].formats,
+                ui_prefs.last_width,
+                ui_prefs.last_height,
+                rate,
+            )
+            .unwrap_or(format)
+        } else {
+            format
+        };
         // Validate remembered ids still exist.
         if !audio_inputs.iter().any(|d| d.id == audio_ui.input_id) {
             audio_ui.input_id = NONE_INPUT_ID.into();
@@ -203,7 +262,7 @@ impl Default for App {
                     .unwrap_or(Rational::new(60, 1)),
                 mode: CaptureMode::Auto,
             },
-            current_format: format,
+            current_format: format.clone(),
             metrics: SharedMetrics::new(),
             overlay: OverlayState::default(),
             fps_window_start: Instant::now(),
@@ -222,6 +281,8 @@ impl Default for App {
                 mode: ui_prefs.upscale_mode.clone(),
                 sharpness: ui_prefs.sharpness.clamp(0.0, 1.0),
                 interp_mode: ui_prefs.interp_mode.clone(),
+                deinterlace_mode: ui_prefs.deinterlace_mode.clone(),
+                source_interlaced: format.interlaced,
                 ..EffectsUiState::default()
             },
             i18n,
@@ -233,6 +294,8 @@ impl Default for App {
             process_sample_at: Instant::now(),
             lag_test_started: None,
             lag_flash_until: None,
+            last_hotplug_at: Instant::now(),
+            device_settings: HashMap::new(),
         }
     }
 }
@@ -262,6 +325,10 @@ impl ApplicationHandler for App {
         gpu.upscale.set_sharpness(self.effects_ui.sharpness);
         gpu.interpolate
             .set_mode(InterpMode::from_str_lossy(&self.effects_ui.interp_mode));
+        gpu.deinterlace
+            .set_mode(DeinterlaceMode::from_str_lossy(&self.effects_ui.deinterlace_mode));
+        gpu.deinterlace
+            .set_source_interlaced(self.current_format.interlaced);
         self.effects_ui.vendor = gpu.upscale.vendor.clone();
         self.effects_ui.backend = gpu.upscale.backend.clone();
         self.effects_ui.compute_ok = gpu.upscale.compute_ok;
@@ -326,6 +393,7 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        self.poll_hotplug();
         if let Some(gpu) = self.gpu.as_ref() {
             gpu.window.request_redraw();
         }
@@ -347,27 +415,143 @@ impl App {
     ) -> Result<(), capture::CaptureError> {
         self.stop_source();
         let info = self.devices[device_idx].clone();
-        let mut source = if info.backend == "mock" {
-            ActiveSource::Mock(MockVideoSource::new())
-        } else {
+        let mut source = match info.backend {
+            "mock" => ActiveSource::Mock(MockVideoSource::new()),
             #[cfg(windows)]
-            {
-                ActiveSource::Mf(capture::MfVideoSource::open(info)?)
-            }
-            #[cfg(not(windows))]
-            {
-                return Err(capture::CaptureError::Unsupported(
-                    "MF only on Windows".into(),
-                ));
+            "mf" => ActiveSource::Mf(capture::MfVideoSource::open(info.clone())?),
+            #[cfg(target_os = "linux")]
+            "v4l2" => ActiveSource::V4l2(capture::V4l2VideoSource::open(info.clone())?),
+            #[cfg(target_os = "macos")]
+            "avf" => ActiveSource::Avf(capture::AvfVideoSource::open(info.clone())?),
+            other => {
+                return Err(capture::CaptureError::Unsupported(format!(
+                    "backend '{other}' not available on this OS"
+                )));
             }
         };
         source.start(&format)?;
+        if info.backend != "mock" {
+            self.device_settings
+                .insert(info.id.as_str().to_string(), format.clone());
+            self.ui_prefs.last_device_id = info.id.as_str().to_string();
+            self.ui_prefs.last_width = format.width;
+            self.ui_prefs.last_height = format.height;
+            if let Some(r) = format.frame_rates.first() {
+                self.ui_prefs.last_rate_num = r.num;
+                self.ui_prefs.last_rate_den = r.den;
+            }
+            self.persist_ui_prefs();
+        }
         self.source = Some(source);
         self.current_format = format;
+        self.effects_ui.source_interlaced = self.current_format.interlaced;
+        if let Some(gpu) = self.gpu.as_mut() {
+            gpu.deinterlace
+                .set_source_interlaced(self.current_format.interlaced);
+        }
         self.running = true;
         self.last_frame_at = Instant::now();
         self.black_since = None;
         Ok(())
+    }
+
+    /// Light ~2s poll: refresh device list, reconnect last settings by device id.
+    fn poll_hotplug(&mut self) {
+        if self.last_hotplug_at.elapsed() < HOTPLUG_INTERVAL {
+            return;
+        }
+        self.last_hotplug_at = Instant::now();
+
+        let Ok(real) = capture::list_devices() else {
+            return;
+        };
+        let mut next = vec![MockVideoSource::device_info()];
+        next.extend(real);
+
+        let current_id = self
+            .devices
+            .get(self.selection.device_idx)
+            .map(|d| d.id.as_str().to_string());
+        let was_real = self
+            .devices
+            .get(self.selection.device_idx)
+            .map(|d| d.backend != "mock")
+            .unwrap_or(false);
+
+        let ids_before: std::collections::HashSet<String> =
+            self.devices.iter().map(|d| d.id.as_str().to_string()).collect();
+        let ids_after: std::collections::HashSet<String> =
+            next.iter().map(|d| d.id.as_str().to_string()).collect();
+
+        self.devices = next;
+
+        // Active real device disappeared → fall back to mock.
+        if was_real {
+            if let Some(id) = current_id.as_ref() {
+                if !ids_after.contains(id) {
+                    tracing::warn!(%id, "capture device removed");
+                    self.selection.device_idx = 0;
+                    let fmt = self.devices[0].formats[0].clone();
+                    let _ = self.open_and_start(0, fmt);
+                    self.show_toast(self.i18n.t("msg_device_gone"));
+                    return;
+                }
+                // Refresh index if list order changed.
+                if let Some(idx) = self.devices.iter().position(|d| d.id.as_str() == id) {
+                    self.selection.device_idx = idx;
+                }
+            }
+        }
+
+        // Preferred device reappeared while on mock → reconnect last settings.
+        let preferred = self.ui_prefs.last_device_id.clone();
+        if preferred.is_empty() {
+            return;
+        }
+        let on_mock = self
+            .devices
+            .get(self.selection.device_idx)
+            .map(|d| d.backend == "mock")
+            .unwrap_or(true);
+        if on_mock && !ids_before.contains(&preferred) && ids_after.contains(&preferred) {
+            if let Some(idx) = self.devices.iter().position(|d| d.id.as_str() == preferred) {
+                let fmt = self
+                    .device_settings
+                    .get(&preferred)
+                    .cloned()
+                    .or_else(|| {
+                        let caps = &self.devices[idx].formats;
+                        if self.ui_prefs.last_width > 0 {
+                            modes::pick_format_at(
+                                caps,
+                                self.ui_prefs.last_width,
+                                self.ui_prefs.last_height,
+                                Rational::new(
+                                    self.ui_prefs.last_rate_num.max(1),
+                                    self.ui_prefs.last_rate_den.max(1),
+                                ),
+                            )
+                        } else {
+                            None
+                        }
+                    })
+                    .or_else(|| modes::select_format(CaptureMode::Auto, &self.devices[idx].formats))
+                    .or_else(|| self.devices[idx].formats.first().cloned());
+                if let Some(fmt) = fmt {
+                    self.selection.device_idx = idx;
+                    self.selection.width = fmt.width;
+                    self.selection.height = fmt.height;
+                    self.selection.rate = fmt
+                        .frame_rates
+                        .first()
+                        .copied()
+                        .unwrap_or(self.selection.rate);
+                    if self.open_and_start(idx, fmt).is_ok() {
+                        self.show_toast(self.i18n.t("msg_device_back"));
+                    }
+                }
+            }
+        }
     }
 
     fn restart_with_fallback(
@@ -567,10 +751,12 @@ impl App {
             self.effects_ui.mode = "off".into();
             self.effects_ui.sharpness = 0.4;
             self.effects_ui.interp_mode = "off".into();
+            self.effects_ui.deinterlace_mode = "auto".into();
             if let Some(gpu) = self.gpu.as_mut() {
                 gpu.upscale.set_mode(UpscaleMode::Off);
                 gpu.upscale.set_sharpness(0.4);
                 gpu.interpolate.set_mode(InterpMode::Off);
+                gpu.deinterlace.set_mode(DeinterlaceMode::Auto);
             }
             self.persist_ui_prefs();
         }
@@ -644,6 +830,15 @@ impl App {
             }
             self.persist_ui_prefs();
         }
+        if let Some(mode) = actions.deinterlace_mode {
+            self.effects_ui.deinterlace_mode = mode.to_string();
+            self.ui_prefs.deinterlace_mode = mode.to_string();
+            if let Some(gpu) = self.gpu.as_mut() {
+                gpu.deinterlace
+                    .set_mode(DeinterlaceMode::from_str_lossy(mode));
+            }
+            self.persist_ui_prefs();
+        }
     }
 
     fn persist_ui_prefs(&mut self) {
@@ -651,6 +846,7 @@ impl App {
         self.ui_prefs.upscale_mode = self.effects_ui.mode.clone();
         self.ui_prefs.sharpness = self.effects_ui.sharpness;
         self.ui_prefs.interp_mode = self.effects_ui.interp_mode.clone();
+        self.ui_prefs.deinterlace_mode = self.effects_ui.deinterlace_mode.clone();
         save_ui_prefs(&self.ui_prefs);
     }
 
@@ -683,6 +879,9 @@ impl App {
             self.effects_ui.interp_auto_disabled =
                 ist.block == InterpBlockReason::AutoDisabled;
             self.effects_ui.interp_delay_ms = ist.delay_ms;
+            self.effects_ui.deinterlace_mode = gpu.deinterlace.mode.as_str().into();
+            self.effects_ui.source_interlaced = gpu.deinterlace.source_interlaced;
+            self.effects_ui.deinterlace_active = gpu.deinterlace.should_run();
         } else {
             self.effects_ui.native_res = native;
         }
@@ -1020,18 +1219,43 @@ impl App {
                 label: Some("frame-encoder"),
             });
 
-        // Pipeline: upload → color → interpolate → upscale → present.
+        // Pipeline: upload → color → deinterlace → interpolate → upscale → present.
         let mut presented = false;
         if !no_signal {
-            let interp_frame = gpu.interpolate.prepare(
-                &gpu.device,
-                &gpu.queue,
-                &mut encoder,
-                &gpu.pipeline,
-                new_capture,
-            );
+            let (cw, ch) = gpu.pipeline.content_size;
+            let source_interlaced = self.current_format.interlaced;
+            gpu.deinterlace.set_source_interlaced(source_interlaced);
+            let ran_deint = gpu.deinterlace.should_run()
+                && gpu
+                    .deinterlace
+                    .prepare(&gpu.device, &gpu.queue, &mut encoder, &gpu.pipeline)
+                    .is_some();
+
+            let interp_frame = if ran_deint {
+                if let Some(tex) = gpu.deinterlace.output_texture() {
+                    gpu.interpolate.prepare_from_texture(
+                        &gpu.device,
+                        &gpu.queue,
+                        &mut encoder,
+                        tex,
+                        cw,
+                        ch,
+                        new_capture,
+                    )
+                } else {
+                    None
+                }
+            } else {
+                gpu.interpolate.prepare(
+                    &gpu.device,
+                    &gpu.queue,
+                    &mut encoder,
+                    &gpu.pipeline,
+                    new_capture,
+                )
+            };
+
             if let Some(frame_kind) = interp_frame {
-                let (cw, ch) = gpu.pipeline.content_size;
                 if let Some(rgba) = gpu.interpolate.frame_view(frame_kind) {
                     presented = gpu.upscale.encode_from_rgba(
                         &gpu.device,
@@ -1059,6 +1283,33 @@ impl App {
                         );
                         presented = true;
                     }
+                }
+            } else if let Some(rgba) = gpu.deinterlace.output_view() {
+                presented = gpu.upscale.encode_from_rgba(
+                    &gpu.device,
+                    &gpu.queue,
+                    &mut encoder,
+                    rgba,
+                    cw,
+                    ch,
+                    &view,
+                    gpu.config.width,
+                    gpu.config.height,
+                    clear,
+                );
+                if !presented {
+                    gpu.interpolate.present_view(
+                        &gpu.device,
+                        &gpu.queue,
+                        &mut encoder,
+                        rgba,
+                        (cw, ch),
+                        &view,
+                        gpu.config.width,
+                        gpu.config.height,
+                        clear,
+                    );
+                    presented = true;
                 }
             } else {
                 presented = gpu.upscale.encode(
@@ -1245,6 +1496,7 @@ async fn init_gpu(window: Arc<Window>) -> anyhow::Result<GpuState> {
     let pipeline = VideoPipeline::new(&device, format);
     let upscale = UpscaleEngine::new(&device, &queue, format, &adapter, backend);
     let interpolate = InterpolateEngine::new(&device, format, &adapter);
+    let deinterlace = DeinterlaceEngine::new(&device, &adapter);
 
     let egui_ctx = egui::Context::default();
     let egui_state = EguiWinitState::new(
@@ -1265,6 +1517,7 @@ async fn init_gpu(window: Arc<Window>) -> anyhow::Result<GpuState> {
         pipeline,
         upscale,
         interpolate,
+        deinterlace,
         window,
         egui_renderer,
         egui_state,

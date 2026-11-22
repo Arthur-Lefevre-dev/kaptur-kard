@@ -39,6 +39,7 @@ impl MockVideoSource {
                 width: DEFAULT_WIDTH,
                 height: DEFAULT_HEIGHT,
                 frame_rates: vec![Rational::new(60, 1), Rational::new(30, 1)],
+                interlaced: false,
             }],
         };
 

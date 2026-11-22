@@ -39,10 +39,27 @@ pub struct UiPrefs {
     pub sharpness: f32,
     #[serde(default)]
     pub interp_mode: String,
+    #[serde(default = "default_deinterlace")]
+    pub deinterlace_mode: String,
+    /// Last non-mock device id for hot-plug reconnect.
+    #[serde(default)]
+    pub last_device_id: String,
+    #[serde(default)]
+    pub last_width: u32,
+    #[serde(default)]
+    pub last_height: u32,
+    #[serde(default)]
+    pub last_rate_num: u32,
+    #[serde(default)]
+    pub last_rate_den: u32,
 }
 
 fn default_sharpness() -> f32 {
     0.4
+}
+
+fn default_deinterlace() -> String {
+    "auto".into()
 }
 
 impl Default for UiPrefs {
@@ -53,6 +70,12 @@ impl Default for UiPrefs {
             upscale_mode: "off".into(),
             sharpness: 0.4,
             interp_mode: "off".into(),
+            deinterlace_mode: "auto".into(),
+            last_device_id: String::new(),
+            last_width: 0,
+            last_height: 0,
+            last_rate_num: 0,
+            last_rate_den: 1,
         }
     }
 }

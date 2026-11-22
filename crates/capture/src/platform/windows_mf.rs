@@ -15,12 +15,13 @@ use windows::Win32::Media::MediaFoundation::{
     MFVideoFormat_YUY2, MFSTARTUP_FULL, MF_API_VERSION, MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME,
     MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE, MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID,
     MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
-    MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_SOURCE_READER_FIRST_VIDEO_STREAM, MF_VERSION,
+    MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_SOURCE_READER_FIRST_VIDEO_STREAM,
+    MF_VERSION,
 };
 use windows::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, COINIT_MULTITHREADED};
 
 use crate::device::{DeviceId, DeviceInfo, FormatDesc};
-use crate::format::{PixelFormat, Rational};
+use crate::format::{looks_interlaced, PixelFormat, Rational};
 use crate::labels::device_capture_score;
 use crate::pool::BufferPool;
 use crate::source::{
@@ -152,10 +153,21 @@ fn subtype_of(mt: &IMFMediaType) -> Result<GUID, CaptureError> {
     }
 }
 
+/// MFVideoInterlace_Progressive = 2; anything else non-zero is treated as interlaced.
+fn interlace_flag_of(mt: &IMFMediaType) -> bool {
+    unsafe {
+        match mt.GetUINT32(&MF_MT_INTERLACE_MODE) {
+            Ok(mode) => mode != 0 && mode != 2,
+            Err(_) => false,
+        }
+    }
+}
+
 fn merge_format(formats: &mut Vec<FormatDesc>, desc: FormatDesc) {
     if let Some(existing) = formats.iter_mut().find(|f| {
         f.pixel_format == desc.pixel_format && f.width == desc.width && f.height == desc.height
     }) {
+        existing.interlaced |= desc.interlaced;
         for r in desc.frame_rates {
             if !existing
                 .frame_rates
@@ -198,6 +210,8 @@ fn enumerate_native_types(reader: &IMFSourceReader) -> Result<Vec<FormatDesc>, C
         if matches!(pixel_format, PixelFormat::Unknown(_)) {
             continue;
         }
+        let interlaced =
+            interlace_flag_of(&mt) || looks_interlaced(width, height, rate);
         merge_format(
             &mut formats,
             FormatDesc {
@@ -205,6 +219,7 @@ fn enumerate_native_types(reader: &IMFSourceReader) -> Result<Vec<FormatDesc>, C
                 width,
                 height,
                 frame_rates: vec![rate],
+                interlaced,
             },
         );
     }

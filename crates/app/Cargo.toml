@@ -10,6 +10,11 @@ rust-version.workspace = true
 name = "captureview"
 path = "src/main.rs"
 
+[features]
+default = []
+# Optional DirectShow scaffolding (capture crate). Does not change the default MF path.
+directshow = ["capture/directshow"]
+
 [dependencies]
 capture = { workspace = true, features = ["mock"] }
 audio = { workspace = true }

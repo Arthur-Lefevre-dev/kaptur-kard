@@ -50,3 +50,33 @@ pub enum CaptureMode {
     /// Prefer CPU/GPU budget.
     Economy,
 }
+
+/// Heuristic for classic SD/HD interlaced modes when the driver omits flags.
+/// 480i/576i: SD heights. 1080i: typically reported near 25/29.97/30 (not 50/60p).
+pub fn looks_interlaced(width: u32, height: u32, rate: Rational) -> bool {
+    let fps = rate.as_f64();
+    let near = |t: f64| (fps - t).abs() < 0.6;
+    match height {
+        480 | 486 | 487 | 512 if width <= 720 => {
+            near(29.97) || near(30.0) || near(59.94) || near(60.0)
+        }
+        576 | 608 if width <= 720 => near(25.0) || near(50.0),
+        1080 if width >= 1280 => near(25.0) || near(29.97) || near(30.0),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_480i_576i_1080i() {
+        assert!(looks_interlaced(720, 480, Rational::new(30000, 1001)));
+        assert!(looks_interlaced(1920, 1080, Rational::new(30000, 1001)));
+        assert!(looks_interlaced(720, 576, Rational::new(25, 1)));
+        assert!(!looks_interlaced(1920, 1080, Rational::new(60, 1)));
+        assert!(!looks_interlaced(1280, 720, Rational::new(60, 1)));
+        assert!(!looks_interlaced(1920, 1080, Rational::new(24, 1)));
+    }
+}

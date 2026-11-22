@@ -195,6 +195,7 @@ pub struct UiActions {
     pub upscale_mode: Option<&'static str>,
     pub sharpness_changed: Option<f32>,
     pub interp_mode: Option<&'static str>,
+    pub deinterlace_mode: Option<&'static str>,
 }
 
 #[derive(Clone, Debug)]
@@ -211,6 +212,9 @@ pub struct EffectsUiState {
     pub interp_compute_ok: bool,
     pub interp_auto_disabled: bool,
     pub interp_delay_ms: f32,
+    pub deinterlace_mode: String,
+    pub source_interlaced: bool,
+    pub deinterlace_active: bool,
 }
 
 impl Default for EffectsUiState {
@@ -228,6 +232,9 @@ impl Default for EffectsUiState {
             interp_compute_ok: true,
             interp_auto_disabled: false,
             interp_delay_ms: 0.0,
+            deinterlace_mode: "auto".into(),
+            source_interlaced: false,
+            deinterlace_active: false,
         }
     }
 }
@@ -842,6 +849,30 @@ fn draw_effects_tab(ui: &mut egui::Ui, input: &DrawInput<'_>, actions: &mut UiAc
     }
     ui.label(RichText::new(i18n.t("tip_interp")).small().italics());
     ui.label(RichText::new(i18n.t("explain_interp")).small());
+
+    ui.add_space(10.0);
+    ui.separator();
+    ui.label(RichText::new(i18n.t("label_deinterlace")).strong());
+    ui.horizontal(|ui| {
+        for (id, key) in [
+            ("auto", "effect_deint_auto"),
+            ("off", "effect_deint_off"),
+            ("bob", "effect_deint_bob"),
+        ] {
+            let selected = fx.deinterlace_mode == id;
+            if ui.selectable_label(selected, i18n.t(key)).clicked() {
+                actions.deinterlace_mode = Some(id);
+            }
+        }
+    });
+    if fx.source_interlaced {
+        ui.small(i18n.t("label_source_interlaced"));
+    }
+    if fx.deinterlace_active {
+        ui.small(i18n.t("label_deint_active"));
+    }
+    ui.label(RichText::new(i18n.t("tip_deinterlace")).small().italics());
+    ui.label(RichText::new(i18n.t("explain_deinterlace")).small());
 
     ui.add_space(10.0);
     ui.separator();
