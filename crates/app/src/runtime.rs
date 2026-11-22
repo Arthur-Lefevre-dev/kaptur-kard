@@ -19,8 +19,8 @@ use render::pipeline::VideoPipeline;
 use render::upload::upload_frame;
 use render::{
     is_native_or_downscale, resolve_color_convert, ColorMatrixMode, ColorRangeMode,
-    DeinterlaceEngine, DeinterlaceMode, InterpBlockReason, InterpMode, InterpolateEngine,
-    UpscaleBlockReason, UpscaleEngine, UpscaleMode,
+    DeinterlaceEngine, DeinterlaceMode, InterpBlockReason, InterpFrame, InterpMode,
+    InterpolateEngine, UpscaleBlockReason, UpscaleEngine, UpscaleMode,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -139,6 +139,7 @@ pub struct App {
     fps_window_start: Instant,
     frames_in_window: u32,
     captures_in_window: u32,
+    gen_frames_in_window: u32,
     last_frame_at: Instant,
     last_present_at: Option<Instant>,
     last_redraw_at: Instant,
@@ -344,6 +345,7 @@ impl Default for App {
             fps_window_start: Instant::now(),
             frames_in_window: 0,
             captures_in_window: 0,
+            gen_frames_in_window: 0,
             last_frame_at: Instant::now(),
             last_present_at: None,
             last_redraw_at: Instant::now(),
@@ -482,31 +484,15 @@ impl ApplicationHandler for App {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.poll_hotplug();
 
-        // Hard-cap redraw rate. Metrics open used to keep ~240 Hz presents → drops + spikes.
         let has_pending = self
             .source
             .as_ref()
             .map(|s| !s.receiver().is_empty())
             .unwrap_or(false);
-        let capture_hz = self
-            .current_format
-            .frame_rates
-            .first()
-            .map(|r| r.as_f64())
-            .unwrap_or(60.0)
-            .clamp(24.0, 120.0);
-        let capture_period = Duration::from_secs_f64(1.0 / capture_hz);
-        // UI / metrics: at most ~60 Hz. Idle video: capture period only.
         let min_gap = if has_pending {
             Duration::from_millis(0)
-        } else if self.chrome.settings_open
-            || self.chrome.wizard_open
-            || self.chrome.toolbar_visible
-            || self.overlay.metrics_mode != MetricsMode::Off
-        {
-            Duration::from_millis(16)
         } else {
-            capture_period
+            Duration::from_secs_f64(1.0 / self.target_display_hz())
         };
 
         let due = self.last_redraw_at.elapsed() >= min_gap;
@@ -522,7 +508,7 @@ impl ApplicationHandler for App {
             min_gap
                 .saturating_sub(self.last_redraw_at.elapsed())
                 .max(Duration::from_millis(1))
-                .min(Duration::from_millis(20))
+                .min(Duration::from_millis(33))
         };
         event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + wait));
     }
@@ -534,6 +520,29 @@ impl App {
             let _ = source.stop();
         }
         self.running = false;
+    }
+
+    /// Target on-screen present rate from prefs + capture / frame-gen.
+    fn target_display_hz(&self) -> f64 {
+        let capture_hz = self
+            .current_format
+            .frame_rates
+            .first()
+            .map(|r| r.as_f64())
+            .unwrap_or(60.0)
+            .clamp(24.0, 240.0);
+        let limit = self.ui_prefs.display_fps_limit;
+        let auto = if self.effects_ui.interp_mode != "off" {
+            (capture_hz * 2.0).min(240.0)
+        } else {
+            capture_hz
+        };
+        let hz = match limit {
+            0 => auto,
+            9999 => 360.0,
+            n => n as f64,
+        };
+        hz.clamp(24.0, 360.0)
     }
 
     /// Game profile: AutoNoVsync + lower swap latency. Other profiles: AutoVsync.
@@ -1103,6 +1112,11 @@ impl App {
             }
             self.persist_ui_prefs();
         }
+        if let Some(limit) = actions.display_fps_limit {
+            self.ui_prefs.display_fps_limit = limit;
+            self.overlay.display_fps_limit = limit;
+            self.persist_ui_prefs();
+        }
         if let Some(mode) = actions.deinterlace_mode {
             self.effects_ui.deinterlace_mode = mode.to_string();
             self.ui_prefs.deinterlace_mode = mode.to_string();
@@ -1210,7 +1224,7 @@ impl App {
              device={}\n\
              format={}x{} {:?} @ {:?}\n\
              audio_in={} audio_out={}\n\
-             fps={:.1} capture_fps={:.1} pipeline_delay_ms={:.1}\n\
+             fps={:.1} capture_fps={:.1} frame_gen_fps={:.1} display_limit={} pipeline_delay_ms={:.1}\n\
              dropped={} 1%low={:.1} gpu={}\n\
              -- log --\n{}\n",
             self.i18n.lang(),
@@ -1223,6 +1237,8 @@ impl App {
             self.audio_ui.output_id,
             self.overlay.fps,
             self.overlay.capture_fps,
+            self.overlay.frame_gen_fps,
+            self.ui_prefs.display_fps_limit,
             self.overlay.pipeline_delay_ms,
             self.overlay.dropped_frames,
             self.overlay.one_percent_low_fps,
@@ -1332,10 +1348,13 @@ impl App {
         if elapsed >= 0.5 {
             self.overlay.fps = self.frames_in_window as f32 / elapsed;
             self.overlay.capture_fps = self.captures_in_window as f32 / elapsed;
+            self.overlay.frame_gen_fps = self.gen_frames_in_window as f32 / elapsed;
             self.frames_in_window = 0;
             self.captures_in_window = 0;
+            self.gen_frames_in_window = 0;
             self.fps_window_start = Instant::now();
         }
+        self.overlay.display_fps_limit = self.ui_prefs.display_fps_limit;
 
         // Refresh process CPU/RAM ~2 Hz (UI thread only).
         if self.process_sample_at.elapsed() >= Duration::from_millis(500) {
@@ -1585,6 +1604,9 @@ impl App {
             };
 
             if let Some(frame_kind) = interp_frame {
+                if matches!(frame_kind, InterpFrame::Mid) {
+                    self.gen_frames_in_window = self.gen_frames_in_window.saturating_add(1);
+                }
                 if let Some(rgba) = gpu.interpolate.frame_view(frame_kind) {
                     presented = gpu.upscale.encode_from_rgba(
                         &gpu.device,

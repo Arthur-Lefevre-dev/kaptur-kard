@@ -63,8 +63,13 @@ impl Impact {
 
 #[derive(Clone, Debug)]
 pub struct OverlayState {
+    /// Display / screen present rate.
     pub fps: f32,
     pub capture_fps: f32,
+    /// Optical-flow generated frames per second (0 when interpolation is off).
+    pub frame_gen_fps: f32,
+    /// User display FPS cap (0 = Auto, 9999 = unlimited).
+    pub display_fps_limit: u32,
     pub label: String,
     pub frame_w: u32,
     pub frame_h: u32,
@@ -97,6 +102,8 @@ impl Default for OverlayState {
         Self {
             fps: 0.0,
             capture_fps: 0.0,
+            frame_gen_fps: 0.0,
+            display_fps_limit: 0,
             label: String::new(),
             frame_w: 0,
             frame_h: 0,
@@ -206,6 +213,8 @@ pub struct UiActions {
     pub sharpness_changed: Option<f32>,
     pub interp_mode: Option<&'static str>,
     pub deinterlace_mode: Option<&'static str>,
+    /// None = unchanged; Some(0)=Auto, Some(9999)=unlimited, else Hz cap.
+    pub display_fps_limit: Option<u32>,
     pub color_range_changed: Option<&'static str>,
     pub color_matrix_changed: Option<&'static str>,
     pub color_range_toggle: bool,
@@ -963,6 +972,29 @@ fn draw_effects_tab(ui: &mut egui::Ui, input: &DrawInput<'_>, actions: &mut UiAc
     ui.label(RichText::new(i18n.t("explain_interp")).small());
 
     ui.add_space(10.0);
+    ui.label(RichText::new(i18n.t("label_display_fps_limit")).strong());
+    ui.label(
+        RichText::new(i18n.t("tip_display_fps_limit"))
+            .small()
+            .italics(),
+    );
+    ui.horizontal_wrapped(|ui| {
+        for (hz, key) in [
+            (0u32, "fps_limit_auto"),
+            (60, "fps_limit_60"),
+            (120, "fps_limit_120"),
+            (144, "fps_limit_144"),
+            (240, "fps_limit_240"),
+            (9999, "fps_limit_unlimited"),
+        ] {
+            let selected = input.overlay.display_fps_limit == hz;
+            if ui.selectable_label(selected, i18n.t(key)).clicked() {
+                actions.display_fps_limit = Some(hz);
+            }
+        }
+    });
+
+    ui.add_space(10.0);
     ui.separator();
     ui.label(RichText::new(i18n.t("label_deinterlace")).strong());
     ui.horizontal(|ui| {
@@ -1038,6 +1070,14 @@ fn draw_info_tab(ui: &mut egui::Ui, input: &DrawInput<'_>, actions: &mut UiActio
     }
 }
 
+fn display_fps_limit_label(i18n: &I18n, limit: u32) -> String {
+    match limit {
+        0 => i18n.t("fps_limit_auto"),
+        9999 => i18n.t("fps_limit_unlimited"),
+        n => format!("{n}"),
+    }
+}
+
 fn draw_metrics_overlay(ctx: &Context, i18n: &I18n, overlay: &OverlayState) {
     egui::Area::new(egui::Id::new("metrics_overlay"))
         .anchor(egui::Align2::LEFT_TOP, [12.0, 12.0])
@@ -1067,23 +1107,30 @@ fn draw_metrics_overlay(ctx: &Context, i18n: &I18n, overlay: &OverlayState) {
 }
 
 fn draw_metrics_body(ui: &mut egui::Ui, i18n: &I18n, o: &OverlayState, detailed: bool) {
+    let gen_label = if o.frame_gen_fps > 0.5 {
+        format!("{:.0}", o.frame_gen_fps)
+    } else {
+        "—".into()
+    };
     ui.label(format!(
-        "{}: {:.0}  ·  {}: {:.0} ms",
-        i18n.t("label_fps"),
-        o.fps,
+        "{}: {:.0}  ·  {}: {}  ·  {}: {:.0}",
+        i18n.t("label_capture_fps"),
+        o.capture_fps,
+        i18n.t("label_frame_gen_fps"),
+        gen_label,
+        i18n.t("label_display_fps"),
+        o.fps
+    ));
+    ui.label(format!(
+        "{}: {:.0} ms  ·  {}: {}",
         i18n.t("label_pipeline_delay"),
-        o.pipeline_delay_ms
+        o.pipeline_delay_ms,
+        i18n.t("label_display_fps_limit"),
+        display_fps_limit_label(i18n, o.display_fps_limit)
     ));
     if !detailed {
         return;
     }
-    ui.label(format!(
-        "{}: {:.0}  ·  {}: {:.0}",
-        i18n.t("label_capture_fps"),
-        o.capture_fps,
-        i18n.t("label_display_fps"),
-        o.fps
-    ));
     ui.label(format!(
         "{}: {:.0}  ·  {}: {}",
         i18n.t("label_one_percent_low"),

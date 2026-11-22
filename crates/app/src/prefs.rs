@@ -44,6 +44,9 @@ pub struct UiPrefs {
     pub interp_mode: String,
     #[serde(default = "default_deinterlace")]
     pub deinterlace_mode: String,
+    /// Cap on display presents. 0 = Auto (capture, or 2× with frame gen). 9999 = unlimited.
+    #[serde(default)]
+    pub display_fps_limit: u32,
     /// Last non-mock device id for hot-plug reconnect.
     #[serde(default)]
     pub last_device_id: String,
@@ -101,6 +104,7 @@ impl Default for UiPrefs {
             sharpness: 0.4,
             interp_mode: "off".into(),
             deinterlace_mode: "auto".into(),
+            display_fps_limit: 0,
             last_device_id: String::new(),
             last_width: 0,
             last_height: 0,
