@@ -59,6 +59,9 @@ pub struct UiPrefs {
     /// tracing filter level: error | warn | info | debug | trace (RUST_LOG overrides when set).
     #[serde(default = "default_log_level")]
     pub log_level: String,
+    /// UI language: "en" (default) or "fr".
+    #[serde(default = "default_ui_language")]
+    pub ui_language: String,
     #[serde(default)]
     pub metrics_pinned: bool,
     #[serde(default)]
@@ -114,6 +117,10 @@ fn default_log_level() -> String {
     "info".into()
 }
 
+fn default_ui_language() -> String {
+    "en".into()
+}
+
 fn default_color_range() -> String {
     "auto".into()
 }
@@ -137,6 +144,7 @@ impl Default for UiPrefs {
             discord_presence: true,
             discord_app_id: String::new(),
             log_level: default_log_level(),
+            ui_language: default_ui_language(),
             metrics_pinned: false,
             settings_pinned: false,
             last_device_id: String::new(),

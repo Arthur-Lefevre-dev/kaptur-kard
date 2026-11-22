@@ -36,6 +36,10 @@ cargo build --release -p captureview
 cargo test --workspace
 ```
 
+## Language
+
+UI strings live in `locales/en.toml` and `locales/fr.toml`. **Default is English.** Switch in **Infos** (F1 → Infos); the choice is saved in `%APPDATA%\CaptureView\ui.toml` (`ui_language`).
+
 ## Logs
 
 CaptureView writes **tracing** logs to a daily rotating file (and to stderr when a console is attached):

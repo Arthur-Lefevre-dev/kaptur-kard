@@ -246,6 +246,8 @@ pub struct UiActions {
     pub discord_presence_changed: Option<bool>,
     pub discord_app_id_changed: Option<String>,
     pub log_level_changed: Option<&'static str>,
+    /// UI language pref: "en" | "fr".
+    pub language_changed: Option<&'static str>,
     pub color_range_changed: Option<&'static str>,
     pub color_matrix_changed: Option<&'static str>,
     pub color_range_toggle: bool,
@@ -1142,6 +1144,22 @@ fn draw_info_tab(ui: &mut egui::Ui, input: &DrawInput<'_>, actions: &mut UiActio
     ui.label(RichText::new(i18n.t("metrics_disclaimer")).small().weak());
     ui.add_space(4.0);
     draw_metrics_body(ui, i18n, o, true);
+    ui.add_space(8.0);
+    ui.separator();
+    ui.label(RichText::new(i18n.t("label_language")).strong());
+    ui.label(RichText::new(i18n.t("tip_language")).small().italics());
+    ui.horizontal(|ui| {
+        let current = i18n.lang().as_str();
+        for (id, label_key) in [("en", "lang_en"), ("fr", "lang_fr")] {
+            if ui
+                .selectable_label(current == id, i18n.t(label_key))
+                .clicked()
+                && current != id
+            {
+                actions.language_changed = Some(id);
+            }
+        }
+    });
     ui.add_space(8.0);
     ui.separator();
     ui.label(RichText::new(i18n.t("label_discord")).strong());

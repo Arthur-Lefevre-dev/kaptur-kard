@@ -33,7 +33,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow};
 use winit::window::{Window, WindowId};
 
 use crate::discord_presence::{resolve_app_id, DiscordPresence};
-use crate::i18n::I18n;
+use crate::i18n::{I18n, Lang};
 use crate::prefs::{
     load_audio_prefs, load_ui_prefs, save_audio_prefs, save_ui_prefs, AudioPrefs, UiPrefs,
 };
@@ -289,7 +289,7 @@ impl Default for App {
             buffer_ms: prefs.buffer_ms,
         };
         let ui_prefs = ui_prefs_early;
-        let i18n = I18n::load();
+        let i18n = I18n::load_pref(&ui_prefs.ui_language);
         let mut chrome = UiChrome::default();
         let real_device_count = devices.iter().filter(|d| d.backend != "mock").count();
         let multi_sources = real_device_count >= 2;
@@ -1325,6 +1325,16 @@ impl App {
             self.ui_prefs.log_level = level.clone();
             self.overlay.log_level = level.clone();
             let _ = crate::logging::set_level(&level);
+            self.persist_ui_prefs();
+        }
+        if let Some(lang) = actions.language_changed {
+            let lang = Lang::from_pref(lang);
+            self.ui_prefs.ui_language = lang.as_str().into();
+            self.i18n = I18n::with_lang(lang);
+            if let Some(gpu) = self.gpu.as_ref() {
+                gpu.window.set_title(&self.i18n.t("app_title"));
+            }
+            self.push_discord_activity(true);
             self.persist_ui_prefs();
         }
         if let Some(mode) = actions.deinterlace_mode {

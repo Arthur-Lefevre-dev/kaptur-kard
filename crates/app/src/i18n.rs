@@ -1,4 +1,4 @@
-//! TOML-backed UI strings (French + English via sys-locale).
+//! TOML-backed UI strings (English default; French optional via Infos prefs).
 
 use std::collections::HashMap;
 
@@ -11,13 +11,18 @@ pub enum Lang {
 }
 
 impl Lang {
-    pub fn from_sys() -> Self {
-        let loc = sys_locale::get_locale().unwrap_or_else(|| "en".into());
-        let lower = loc.to_ascii_lowercase();
-        if lower.starts_with("fr") {
-            Lang::Fr
-        } else {
-            Lang::En
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Lang::En => "en",
+            Lang::Fr => "fr",
+        }
+    }
+
+    /// Prefs / combo value. Unknown or empty → English (app default).
+    pub fn from_pref(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "fr" | "french" | "francais" | "français" => Lang::Fr,
+            _ => Lang::En,
         }
     }
 }
@@ -36,9 +41,9 @@ pub struct I18n {
 }
 
 impl I18n {
-    pub fn load() -> Self {
-        let lang = Lang::from_sys();
-        Self::with_lang(lang)
+    /// Load from prefs string (`"en"` / `"fr"`). Empty / unknown → English.
+    pub fn load_pref(pref: &str) -> Self {
+        Self::with_lang(Lang::from_pref(pref))
     }
 
     pub fn with_lang(lang: Lang) -> Self {
@@ -95,13 +100,31 @@ mod tests {
         assert!(i18n.t("hint_f2_metrics").contains("F2"));
         assert_eq!(i18n.t("launch_tips_title"), "Raccourcis");
         assert!(i18n.t("launch_tips_f1").contains("F1"));
+        assert_eq!(i18n.t("label_language"), "Langue");
     }
 
     #[test]
-    fn english_fallback_works() {
-        let i18n = I18n::with_lang(Lang::En);
+    fn english_is_default_and_complete() {
+        let i18n = I18n::load_pref("");
+        assert_eq!(i18n.lang(), Lang::En);
         assert_eq!(i18n.t("toolbar_fullscreen"), "Full screen");
         assert_eq!(i18n.t("launch_tips_title"), "Shortcuts");
         assert!(i18n.t("launch_tips_f2").contains("F2"));
+        assert_eq!(i18n.t("label_language"), "Language");
+        assert_eq!(Lang::from_pref(""), Lang::En);
+        assert_eq!(Lang::from_pref("fr"), Lang::Fr);
+    }
+
+    #[test]
+    fn fr_en_locale_keys_match() {
+        let fr = parse_locale(include_str!("../../../locales/fr.toml"));
+        let en = parse_locale(include_str!("../../../locales/en.toml"));
+        let mut only_fr: Vec<_> = fr.keys().filter(|k| !en.contains_key(*k)).cloned().collect();
+        let mut only_en: Vec<_> = en.keys().filter(|k| !fr.contains_key(*k)).cloned().collect();
+        only_fr.sort();
+        only_en.sort();
+        assert!(only_fr.is_empty(), "keys only in fr.toml: {only_fr:?}");
+        assert!(only_en.is_empty(), "keys only in en.toml: {only_en:?}");
+        assert!(!fr.is_empty());
     }
 }
