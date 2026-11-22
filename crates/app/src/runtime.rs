@@ -18,8 +18,9 @@ use metrics::{sample_process, SharedMetrics};
 use render::pipeline::VideoPipeline;
 use render::upload::upload_frame;
 use render::{
-    target_size, DeinterlaceEngine, DeinterlaceMode, InterpBlockReason, InterpMode,
-    InterpolateEngine, UpscaleBlockReason, UpscaleEngine, UpscaleMode,
+    resolve_color_convert, target_size, ColorMatrixMode, ColorRangeMode, DeinterlaceEngine,
+    DeinterlaceMode, InterpBlockReason, InterpMode, InterpolateEngine, UpscaleBlockReason,
+    UpscaleEngine, UpscaleMode,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -32,7 +33,8 @@ use crate::prefs::{
     load_audio_prefs, load_ui_prefs, save_audio_prefs, save_ui_prefs, AudioPrefs, UiPrefs,
 };
 use crate::ui::{
-    self, AudioUiState, EffectsUiState, MetricsMode, OverlayState, UiChrome, UiSelection,
+    self, AudioUiState, ColorUiState, EffectsUiState, MetricsMode, OverlayState, UiChrome,
+    UiSelection,
 };
 
 enum ActiveSource {
@@ -134,6 +136,7 @@ pub struct App {
     audio_outputs: Vec<AudioDeviceInfo>,
     audio_ui: AudioUiState,
     effects_ui: EffectsUiState,
+    color_ui: ColorUiState,
     i18n: I18n,
     chrome: UiChrome,
     ui_prefs: UiPrefs,
@@ -278,6 +281,25 @@ impl Default for App {
             }
         }
 
+        let color_ui = {
+            let dev = &devices[device_idx];
+            let (range, matrix) = ui_prefs.color_for_device(dev.id.as_str());
+            let resolved = resolve_color_convert(
+                ColorRangeMode::from_str_lossy(&range),
+                ColorMatrixMode::from_str_lossy(&matrix),
+                format.width,
+                format.height,
+                &dev.display_name,
+                dev.id.as_str(),
+            );
+            ColorUiState {
+                range_mode: range,
+                matrix_mode: matrix,
+                resolved_limited: resolved.limited,
+                resolved_bt709: resolved.bt709,
+            }
+        };
+
         Self {
             gpu: None,
             devices,
@@ -316,6 +338,7 @@ impl Default for App {
                 source_interlaced: format.interlaced,
                 ..EffectsUiState::default()
             },
+            color_ui,
             i18n,
             chrome,
             ui_prefs,
@@ -365,6 +388,7 @@ impl ApplicationHandler for App {
         self.effects_ui.compute_ok = gpu.upscale.compute_ok;
         self.effects_ui.interp_compute_ok = gpu.interpolate.compute_ok;
         self.gpu = Some(gpu);
+        self.apply_color_convert();
 
         if let Err(e) = self.open_and_start(self.selection.device_idx, self.current_format.clone()) {
             tracing::error!(error = %e, "failed to start capture; falling back to mock");
@@ -480,10 +504,41 @@ impl App {
             gpu.deinterlace
                 .set_source_interlaced(self.current_format.interlaced);
         }
+        // Reload per-device color prefs when switching sources.
+        let id = self.devices[device_idx].id.as_str();
+        let (range, matrix) = self.ui_prefs.color_for_device(id);
+        self.color_ui.range_mode = range;
+        self.color_ui.matrix_mode = matrix;
+        self.apply_color_convert();
         self.running = true;
         self.last_frame_at = Instant::now();
         self.black_since = None;
         Ok(())
+    }
+
+    fn apply_color_convert(&mut self) {
+        let device = &self.devices[self.selection.device_idx];
+        let resolved = resolve_color_convert(
+            ColorRangeMode::from_str_lossy(&self.color_ui.range_mode),
+            ColorMatrixMode::from_str_lossy(&self.color_ui.matrix_mode),
+            self.current_format.width,
+            self.current_format.height,
+            &device.display_name,
+            device.id.as_str(),
+        );
+        self.color_ui.resolved_limited = resolved.limited;
+        self.color_ui.resolved_bt709 = resolved.bt709;
+        if let Some(gpu) = self.gpu.as_mut() {
+            gpu.pipeline.set_color_convert(resolved);
+        }
+        tracing::info!(
+            device = %device.display_name,
+            range = %self.color_ui.range_mode,
+            matrix = %self.color_ui.matrix_mode,
+            limited = resolved.limited,
+            bt709 = resolved.bt709,
+            "color convert params"
+        );
     }
 
     /// Light ~2s poll: refresh device list, reconnect last settings by device id.
@@ -809,12 +864,17 @@ impl App {
             self.effects_ui.sharpness = 0.4;
             self.effects_ui.interp_mode = "off".into();
             self.effects_ui.deinterlace_mode = "auto".into();
+            self.color_ui.range_mode = "auto".into();
+            self.color_ui.matrix_mode = "auto".into();
             if let Some(gpu) = self.gpu.as_mut() {
                 gpu.upscale.set_mode(UpscaleMode::Off);
                 gpu.upscale.set_sharpness(0.4);
                 gpu.interpolate.set_mode(InterpMode::Off);
                 gpu.deinterlace.set_mode(DeinterlaceMode::Auto);
             }
+            let id = self.devices[self.selection.device_idx].id.as_str().to_string();
+            self.ui_prefs.set_color_for_device(&id, "auto", "auto");
+            self.apply_color_convert();
             self.persist_ui_prefs();
         }
         if actions.retry {
@@ -894,6 +954,36 @@ impl App {
                 gpu.deinterlace
                     .set_mode(DeinterlaceMode::from_str_lossy(mode));
             }
+            self.persist_ui_prefs();
+        }
+        if let Some(range) = actions.color_range_changed {
+            self.color_ui.range_mode = range.to_string();
+            let id = self.devices[self.selection.device_idx].id.as_str().to_string();
+            let matrix = self.color_ui.matrix_mode.clone();
+            self.ui_prefs
+                .set_color_for_device(&id, &self.color_ui.range_mode, &matrix);
+            self.apply_color_convert();
+            self.persist_ui_prefs();
+        }
+        if actions.color_range_toggle {
+            let next = ColorRangeMode::from_str_lossy(&self.color_ui.range_mode)
+                .toggle_concrete(self.color_ui.resolved_limited);
+            self.color_ui.range_mode = next.as_str().into();
+            let id = self.devices[self.selection.device_idx].id.as_str().to_string();
+            let matrix = self.color_ui.matrix_mode.clone();
+            self.ui_prefs
+                .set_color_for_device(&id, &self.color_ui.range_mode, &matrix);
+            self.apply_color_convert();
+            self.persist_ui_prefs();
+            self.show_toast(self.i18n.t("msg_color_toggled"));
+        }
+        if let Some(matrix) = actions.color_matrix_changed {
+            self.color_ui.matrix_mode = matrix.to_string();
+            let id = self.devices[self.selection.device_idx].id.as_str().to_string();
+            let range = self.color_ui.range_mode.clone();
+            self.ui_prefs
+                .set_color_for_device(&id, &range, &self.color_ui.matrix_mode);
+            self.apply_color_convert();
             self.persist_ui_prefs();
         }
     }
@@ -1162,6 +1252,7 @@ impl App {
         let i18n = self.i18n.clone();
         self.sync_effects_ui();
         let effects = self.effects_ui.clone();
+        let color = self.color_ui.clone();
         // Video presents every tick; egui widgets only draw when chrome/overlay is active.
 
         let mut actions = ui::UiActions::default();
@@ -1229,6 +1320,7 @@ impl App {
                     audio: &audio_ui,
                     chrome: &chrome,
                     effects: &effects,
+                    color: &color,
                 },
             );
         });
@@ -1530,12 +1622,16 @@ async fn init_gpu(window: Arc<Window>) -> anyhow::Result<GpuState> {
         .await?;
 
     let caps = surface.get_capabilities(&adapter);
+    // Prefer non-sRGB for video: YUV→RGB yields display-referred R'G'B'. Writing that
+    // into an sRGB target (GPU assumes linear) lifts midtones and looks washed out.
     let format = caps
         .formats
         .iter()
         .copied()
-        .find(|f| f.is_srgb())
+        .find(|f| !f.is_srgb())
+        .or_else(|| caps.formats.iter().copied().find(|f| f.is_srgb()))
         .unwrap_or(caps.formats[0]);
+    tracing::info!(?format, srgb = format.is_srgb(), "surface format selected");
 
     let size = window.inner_size();
     let config = wgpu::SurfaceConfiguration {

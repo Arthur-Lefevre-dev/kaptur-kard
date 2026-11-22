@@ -52,6 +52,24 @@ pub struct UiPrefs {
     pub last_rate_num: u32,
     #[serde(default)]
     pub last_rate_den: u32,
+    /// Global color range: auto | limited | full
+    #[serde(default = "default_color_range")]
+    pub color_range: String,
+    /// Global YUV matrix: auto | bt601 | bt709
+    #[serde(default = "default_color_matrix")]
+    pub color_matrix: String,
+    /// Per-device overrides (id → range/matrix).
+    #[serde(default)]
+    pub device_colors: Vec<DeviceColorPrefs>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DeviceColorPrefs {
+    pub device_id: String,
+    #[serde(default = "default_color_range")]
+    pub color_range: String,
+    #[serde(default = "default_color_matrix")]
+    pub color_matrix: String,
 }
 
 fn default_sharpness() -> f32 {
@@ -59,6 +77,14 @@ fn default_sharpness() -> f32 {
 }
 
 fn default_deinterlace() -> String {
+    "auto".into()
+}
+
+fn default_color_range() -> String {
+    "auto".into()
+}
+
+fn default_color_matrix() -> String {
     "auto".into()
 }
 
@@ -76,7 +102,39 @@ impl Default for UiPrefs {
             last_height: 0,
             last_rate_num: 0,
             last_rate_den: 1,
+            color_range: "auto".into(),
+            color_matrix: "auto".into(),
+            device_colors: Vec::new(),
         }
+    }
+}
+
+impl UiPrefs {
+    pub fn color_for_device(&self, device_id: &str) -> (String, String) {
+        if let Some(d) = self.device_colors.iter().find(|d| d.device_id == device_id) {
+            return (d.color_range.clone(), d.color_matrix.clone());
+        }
+        (self.color_range.clone(), self.color_matrix.clone())
+    }
+
+    pub fn set_color_for_device(&mut self, device_id: &str, range: &str, matrix: &str) {
+        if let Some(d) = self
+            .device_colors
+            .iter_mut()
+            .find(|d| d.device_id == device_id)
+        {
+            d.color_range = range.into();
+            d.color_matrix = matrix.into();
+        } else {
+            self.device_colors.push(DeviceColorPrefs {
+                device_id: device_id.into(),
+                color_range: range.into(),
+                color_matrix: matrix.into(),
+            });
+        }
+        // Keep globals in sync with the last edited device for simple launches.
+        self.color_range = range.into();
+        self.color_matrix = matrix.into();
     }
 }
 

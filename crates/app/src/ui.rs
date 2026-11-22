@@ -196,6 +196,9 @@ pub struct UiActions {
     pub sharpness_changed: Option<f32>,
     pub interp_mode: Option<&'static str>,
     pub deinterlace_mode: Option<&'static str>,
+    pub color_range_changed: Option<&'static str>,
+    pub color_matrix_changed: Option<&'static str>,
+    pub color_range_toggle: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -239,6 +242,25 @@ impl Default for EffectsUiState {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct ColorUiState {
+    pub range_mode: String,
+    pub matrix_mode: String,
+    pub resolved_limited: bool,
+    pub resolved_bt709: bool,
+}
+
+impl Default for ColorUiState {
+    fn default() -> Self {
+        Self {
+            range_mode: "auto".into(),
+            matrix_mode: "auto".into(),
+            resolved_limited: true,
+            resolved_bt709: true,
+        }
+    }
+}
+
 pub struct DrawInput<'a> {
     pub i18n: &'a I18n,
     pub devices: &'a [DeviceInfo],
@@ -251,6 +273,7 @@ pub struct DrawInput<'a> {
     pub audio: &'a AudioUiState,
     pub chrome: &'a UiChrome,
     pub effects: &'a EffectsUiState,
+    pub color: &'a ColorUiState,
 }
 
 pub fn draw_ui(ctx: &Context, input: DrawInput<'_>) -> UiActions {
@@ -621,6 +644,68 @@ fn draw_image_tab(ui: &mut egui::Ui, input: &DrawInput<'_>, actions: &mut UiActi
                 }
             },
         );
+
+        ui.add_space(8.0);
+        ui.label(RichText::new(i18n.t("label_color_section")).strong());
+        ui.label(RichText::new(i18n.t("tip_color_range")).small().italics());
+
+        let color = input.color;
+        let range_label = if color.resolved_limited {
+            i18n.t("color_range_limited")
+        } else {
+            i18n.t("color_range_full")
+        };
+        ui.label(format!(
+            "{}: {} ({})",
+            i18n.t("label_color_range"),
+            color.range_mode,
+            range_label
+        ));
+        ui.horizontal(|ui| {
+            for (id, key) in [
+                ("auto", "color_range_auto"),
+                ("limited", "color_range_limited"),
+                ("full", "color_range_full"),
+            ] {
+                if ui
+                    .selectable_label(color.range_mode == id, i18n.t(key))
+                    .clicked()
+                {
+                    actions.color_range_changed = Some(id);
+                }
+            }
+        });
+        if ui.button(i18n.t("btn_color_toggle")).clicked() {
+            actions.color_range_toggle = true;
+        }
+
+        ui.add_space(6.0);
+        let matrix_label = if color.resolved_bt709 {
+            i18n.t("color_matrix_bt709")
+        } else {
+            i18n.t("color_matrix_bt601")
+        };
+        ui.label(format!(
+            "{}: {} ({})",
+            i18n.t("label_color_matrix"),
+            color.matrix_mode,
+            matrix_label
+        ));
+        ui.horizontal(|ui| {
+            for (id, key) in [
+                ("auto", "color_matrix_auto"),
+                ("bt601", "color_matrix_bt601"),
+                ("bt709", "color_matrix_bt709"),
+            ] {
+                if ui
+                    .selectable_label(color.matrix_mode == id, i18n.t(key))
+                    .clicked()
+                {
+                    actions.color_matrix_changed = Some(id);
+                }
+            }
+        });
+        ui.label(RichText::new(i18n.t("explain_color")).small());
     });
 }
 

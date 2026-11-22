@@ -9,6 +9,10 @@ pub mod present;
 pub mod upload;
 pub mod upscale;
 
+pub use color::{
+    prefer_limited_range, resolve_color_convert, ColorConvertParams, ColorMatrixMode,
+    ColorRangeMode,
+};
 pub use deinterlace::{DeinterlaceEngine, DeinterlaceMode};
 pub use gpu::GpuContext;
 pub use pipeline::VideoPipeline;

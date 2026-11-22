@@ -4,7 +4,7 @@ use bytemuck::{Pod, Zeroable};
 use capture::PixelFormat;
 use wgpu::util::DeviceExt;
 
-use crate::color::{gpu_mode, GpuPixelMode};
+use crate::color::{gpu_mode, ColorConvertParams, GpuPixelMode};
 use crate::present::{compute_letterbox, LetterboxUniforms};
 
 const COPY_ALIGN: u32 = 256;
@@ -34,6 +34,8 @@ pub struct VideoPipeline {
     bind_group: Option<wgpu::BindGroup>,
     pub content_size: (u32, u32),
     pub mode: GpuPixelMode,
+    /// YUV → RGB range/matrix flags (ignored for BGRA).
+    pub color: ColorConvertParams,
 }
 
 impl VideoPipeline {
@@ -110,7 +112,8 @@ impl VideoPipeline {
             label: Some("video-params"),
             contents: bytemuck::bytes_of(&ParamsGpu {
                 scale_offset: [1.0, 1.0, 0.0, 0.0],
-                format_pad: [0, 0, 0, 0],
+                // Default: limited + BT.709 (HD capture-card friendly).
+                format_pad: [0, 1, 1, 0],
             }),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -145,7 +148,24 @@ impl VideoPipeline {
             bind_group: None,
             content_size: (0, 0),
             mode: GpuPixelMode::Bgra,
+            color: ColorConvertParams {
+                limited: true,
+                bt709: true,
+            },
         }
+    }
+
+    pub fn set_color_convert(&mut self, color: ColorConvertParams) {
+        self.color = color;
+    }
+
+    fn format_pad(&self) -> [u32; 4] {
+        [
+            self.mode as u32,
+            u32::from(self.color.limited),
+            u32::from(self.color.bt709),
+            0,
+        ]
     }
 
     pub fn ensure_textures(
@@ -163,7 +183,8 @@ impl VideoPipeline {
         }
 
         let (primary_fmt, primary_w, primary_h) = match mode {
-            GpuPixelMode::Bgra => (wgpu::TextureFormat::Bgra8UnormSrgb, width, height),
+            // Unorm (not sRGB): bytes are already display-referred when sampled.
+            GpuPixelMode::Bgra => (wgpu::TextureFormat::Bgra8Unorm, width, height),
             GpuPixelMode::Yuy2 => (wgpu::TextureFormat::Rgba8Unorm, width / 2, height),
             GpuPixelMode::Nv12 => (wgpu::TextureFormat::R8Unorm, width, height),
         };
@@ -282,7 +303,7 @@ impl VideoPipeline {
             0,
             bytemuck::bytes_of(&ParamsGpu {
                 scale_offset,
-                format_pad: [self.mode as u32, 0, 0, 0],
+                format_pad: self.format_pad(),
             }),
         );
     }
@@ -306,7 +327,7 @@ impl VideoPipeline {
             0,
             bytemuck::bytes_of(&ParamsGpu {
                 scale_offset: [1.0, 1.0, 0.0, 0.0],
-                format_pad: [self.mode as u32, 0, 0, 0],
+                format_pad: self.format_pad(),
             }),
         );
     }
