@@ -2,15 +2,21 @@
 //!
 //! Needs a Discord Application ID (Developer Portal). The activity `.name("KapturKard")`
 //! overrides the portal app name. Missing ID / Discord closed → silent no-op.
+//!
+//! Large-image asset key `kapturkard` must be uploaded once in the Developer Portal
+//! (Rich Presence → Art Assets). Without it Discord still shows Playing; only the
+//! artwork is missing.
 
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use discord_rich_presence::activity::{Activity, ActivityType, Timestamps};
+use discord_rich_presence::activity::{Activity, ActivityType, Assets, Timestamps};
 use discord_rich_presence::{DiscordIpc, DiscordIpcClient};
 
 const ACTIVITY_NAME: &str = "KapturKard";
+/// Rich Presence Art Asset key (upload `assets/kapturkard-logo-256.png` under this name).
+const LARGE_ASSET: &str = "kapturkard";
 const REFRESH: Duration = Duration::from_secs(15);
 
 /// Built-in Discord Developer Portal Application ID for KapturKard.
@@ -117,7 +123,7 @@ fn worker(app_id: String, rx: Receiver<Cmd>) {
     let mut client = DiscordIpcClient::new(&app_id);
     let mut connected = false;
     let mut details = String::from("Capture HDMI");
-    let mut state = String::from("En ligne");
+    let mut state = String::from("Prêt");
     let started = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -177,11 +183,17 @@ fn set_activity(
     state: &str,
     started: i64,
 ) -> Result<(), discord_rich_presence::error::Error> {
+    // Keep ActivityType::Playing — changing type breaks “Joue à KapturKard”.
     let activity = Activity::new()
         .name(ACTIVITY_NAME)
         .activity_type(ActivityType::Playing)
         .details(details)
         .state(state)
+        .assets(
+            Assets::new()
+                .large_image(LARGE_ASSET)
+                .large_text(ACTIVITY_NAME),
+        )
         .timestamps(Timestamps::new().start(started));
     client.set_activity(activity)
 }

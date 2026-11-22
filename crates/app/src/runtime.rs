@@ -1621,6 +1621,25 @@ impl App {
             self.overlay.ram_mb = sample.rss_bytes as f32 / (1024.0 * 1024.0);
             self.overlay.cpu_one_core = sample.cpu_one_core;
             self.process_sample_at = Instant::now();
+            // Sparse RSS breadcrumb for soak / RAM budget reports (not every tick).
+            static LAST_RAM_LOG: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let prev = LAST_RAM_LOG.load(std::sync::atomic::Ordering::Relaxed);
+            if now_secs.saturating_sub(prev) >= 30 {
+                LAST_RAM_LOG.store(now_secs, std::sync::atomic::Ordering::Relaxed);
+                tracing::info!(
+                    ram_mb = format!("{:.1}", self.overlay.ram_mb),
+                    cpu_core = format!("{:.2}", self.overlay.cpu_one_core),
+                    fps = format!("{:.1}", self.overlay.fps),
+                    one_pct = format!("{:.1}", self.cached_one_percent_low),
+                    dropped = self.overlay.dropped_frames,
+                    "soak_sample"
+                );
+            }
         }
 
         if let Some(start) = self.lag_test_started {
@@ -2067,13 +2086,21 @@ impl App {
             return;
         }
         self.last_discord_push = Instant::now();
-        let details = self.overlay.format_label.clone();
+
+        // details = picture format; state = device / signal (Discord shows both under Playing).
+        let details = if !self.overlay.format_label.is_empty() {
+            format!("Capture · {}", self.overlay.format_label)
+        } else {
+            "Capture HDMI".into()
+        };
         let state = if self.overlay.no_signal {
             self.i18n.t("label_no_signal")
         } else if !self.overlay.label.is_empty() {
             self.overlay.label.clone()
+        } else if self.running {
+            self.i18n.t("discord_state_live")
         } else {
-            "Capture".into()
+            self.i18n.t("discord_state_idle")
         };
         self.discord.update(details, state);
     }
@@ -2107,19 +2134,49 @@ fn approx_black(frame: &VideoFrame) -> bool {
 }
 
 async fn init_gpu(window: Arc<Window>) -> anyhow::Result<GpuState> {
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::PRIMARY,
-        ..Default::default()
-    });
-    let surface = instance.create_surface(window.clone())?;
-    let adapter = instance
-        .request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            compatible_surface: Some(&surface),
-            force_fallback_adapter: false,
-        })
-        .await
-        .ok_or_else(|| anyhow::anyhow!("no suitable GPU adapter"))?;
+    // Windows: DX12 first (single backend → less driver RSS). Fall back to PRIMARY
+    // if DX12 has no adapter (rare on modern GPUs).
+    #[cfg(windows)]
+    let preferred = [wgpu::Backends::DX12, wgpu::Backends::PRIMARY];
+    #[cfg(not(windows))]
+    let preferred = [wgpu::Backends::PRIMARY];
+
+    let mut last_err = anyhow::anyhow!("no suitable GPU adapter");
+    let mut chosen: Option<(
+        wgpu::Instance,
+        wgpu::Surface<'static>,
+        wgpu::Adapter,
+    )> = None;
+    for backends in preferred {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends,
+            ..Default::default()
+        });
+        let surface = match instance.create_surface(window.clone()) {
+            Ok(s) => s,
+            Err(e) => {
+                last_err = e.into();
+                continue;
+            }
+        };
+        match instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: Some(&surface),
+                force_fallback_adapter: false,
+            })
+            .await
+        {
+            Some(adapter) => {
+                chosen = Some((instance, surface, adapter));
+                break;
+            }
+            None => {
+                last_err = anyhow::anyhow!("no adapter for backends {backends:?}");
+            }
+        }
+    }
+    let (_instance, surface, adapter) = chosen.ok_or(last_err)?;
     let adapter_info = adapter.get_info();
     let adapter_name = adapter_info.name.clone();
     let backend = adapter_info.backend;
@@ -2127,7 +2184,7 @@ async fn init_gpu(window: Arc<Window>) -> anyhow::Result<GpuState> {
         gpu = %adapter_name,
         backend = ?backend,
         vendor = adapter_info.vendor,
-        "GPU adapter selected (DX12/Vulkan preferred; GL is a fallback path)"
+        "GPU adapter selected (DX12 preferred on Windows for RAM; GL is a fallback path)"
     );
     if matches!(backend, wgpu::Backend::Gl) {
         tracing::warn!(
@@ -2141,7 +2198,8 @@ async fn init_gpu(window: Arc<Window>) -> anyhow::Result<GpuState> {
                 label: Some("captureview"),
                 required_features: wgpu::Features::empty(),
                 required_limits: wgpu::Limits::default(),
-                memory_hints: wgpu::MemoryHints::Performance,
+                // Prefer smaller heaps over max throughput — CaptureView is display, not batch.
+                memory_hints: wgpu::MemoryHints::MemoryUsage,
             },
             None,
         )
@@ -2168,7 +2226,8 @@ async fn init_gpu(window: Arc<Window>) -> anyhow::Result<GpuState> {
         present_mode: wgpu::PresentMode::AutoVsync,
         alpha_mode: caps.alpha_modes[0],
         view_formats: vec![],
-        desired_maximum_frame_latency: 2,
+        // One frame of latency: fewer swapchain buffers in the Working Set.
+        desired_maximum_frame_latency: 1,
     };
     surface.configure(&device, &config);
 

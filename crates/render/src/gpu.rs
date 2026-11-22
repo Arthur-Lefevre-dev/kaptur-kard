@@ -18,8 +18,15 @@ pub struct GpuContext {
 
 impl GpuContext {
     pub async fn new() -> Result<Self, GpuError> {
+        // Prefer a single native backend on Windows so we do not load Vulkan + DX12
+        // drivers into the process working set.
+        #[cfg(windows)]
+        let backends = wgpu::Backends::DX12;
+        #[cfg(not(windows))]
+        let backends = wgpu::Backends::PRIMARY;
+
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::PRIMARY,
+            backends,
             ..Default::default()
         });
         let adapter = instance
@@ -37,7 +44,7 @@ impl GpuContext {
                     label: Some("captureview-device"),
                     required_features: wgpu::Features::empty(),
                     required_limits: wgpu::Limits::default(),
-                    memory_hints: wgpu::MemoryHints::Performance,
+                    memory_hints: wgpu::MemoryHints::MemoryUsage,
                 },
                 None,
             )

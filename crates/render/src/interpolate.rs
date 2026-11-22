@@ -393,7 +393,17 @@ impl InterpolateEngine {
         if !mode.wants_effect() {
             self.pending_mid = false;
             self.delay_ms = 0.0;
+            self.release_scratch();
         }
+    }
+
+    /// Drop prev/curr/mid/flow textures while interpolation is off.
+    pub fn release_scratch(&mut self) {
+        self.prev = None;
+        self.curr = None;
+        self.mid = None;
+        self.flow = None;
+        self.has_prev = false;
     }
 
     pub fn set_source_delay_ms(&mut self, ms: f32) {
