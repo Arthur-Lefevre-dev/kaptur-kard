@@ -23,8 +23,11 @@ use winit::event::WindowEvent;
 use winit::event_loop::ActiveEventLoop;
 use winit::window::{Window, WindowId};
 
-use crate::prefs::{load_audio_prefs, save_audio_prefs, AudioPrefs};
-use crate::ui::{self, AudioUiState, OverlayState, UiSelection};
+use crate::i18n::I18n;
+use crate::prefs::{
+    load_audio_prefs, load_ui_prefs, save_audio_prefs, save_ui_prefs, AudioPrefs, UiPrefs,
+};
+use crate::ui::{self, AudioUiState, OverlayState, UiChrome, UiSelection};
 
 enum ActiveSource {
     Mock(MockVideoSource),
@@ -95,6 +98,12 @@ pub struct App {
     audio_inputs: Vec<AudioDeviceInfo>,
     audio_outputs: Vec<AudioDeviceInfo>,
     audio_ui: AudioUiState,
+    i18n: I18n,
+    chrome: UiChrome,
+    ui_prefs: UiPrefs,
+    last_pointer_at: Instant,
+    toast_until: Option<Instant>,
+    support_log: Vec<String>,
 }
 
 impl Default for App {
@@ -139,8 +148,12 @@ impl Default for App {
             muted: prefs.muted,
             delay_ms: prefs.delay_ms,
             buffer_ms: prefs.buffer_ms,
-            show_advanced: false,
         };
+        let ui_prefs = load_ui_prefs();
+        let i18n = I18n::load();
+        let mut chrome = UiChrome::default();
+        chrome.wizard_open = !ui_prefs.wizard_done;
+        chrome.wizard_step = ui_prefs.wizard_step.min(2);
         // Validate remembered ids still exist.
         if !audio_inputs.iter().any(|d| d.id == audio_ui.input_id) {
             audio_ui.input_id = NONE_INPUT_ID.into();
@@ -187,6 +200,12 @@ impl Default for App {
             audio_inputs,
             audio_outputs,
             audio_ui,
+            i18n,
+            chrome,
+            ui_prefs,
+            last_pointer_at: Instant::now(),
+            toast_until: None,
+            support_log: Vec::new(),
         }
     }
 }
@@ -201,17 +220,21 @@ impl ApplicationHandler for App {
             event_loop
                 .create_window(
                     Window::default_attributes()
-                        .with_title("CaptureView")
+                        .with_title(self.i18n.t("app_title"))
                         .with_inner_size(LogicalSize::new(1280.0, 720.0)),
                 )
                 .expect("create window"),
         );
 
         let gpu = pollster::block_on(init_gpu(window.clone())).expect("init gpu");
+        // Respect OS DPI / egui style scaling.
+        let scale = window.scale_factor() as f32;
+        gpu.egui_ctx.set_pixels_per_point(scale);
         self.gpu = Some(gpu);
 
         if let Err(e) = self.open_and_start(self.selection.device_idx, self.current_format.clone()) {
             tracing::error!(error = %e, "failed to start capture; falling back to mock");
+            self.push_support(format!("start failed: {e}"));
             self.selection.device_idx = 0;
             let fmt = self.devices[0].formats[0].clone();
             self.current_format = fmt.clone();
@@ -219,9 +242,13 @@ impl ApplicationHandler for App {
             self.selection.height = fmt.height;
             self.selection.rate = fmt.frame_rates[0];
             let _ = self.open_and_start(0, fmt);
+            self.overlay.status = self.i18n.t("err_device_start");
         }
 
         self.restart_audio();
+        if self.devices.iter().all(|d| d.backend == "mock") {
+            self.overlay.status = self.i18n.t("status_no_card");
+        }
         tracing::info!("CaptureView ready");
     }
 
@@ -243,6 +270,7 @@ impl ApplicationHandler for App {
         match event {
             WindowEvent::CloseRequested => {
                 self.persist_audio_prefs();
+                self.persist_ui_prefs();
                 self.audio.stop();
                 self.stop_source();
                 event_loop.exit();
@@ -351,13 +379,16 @@ impl App {
         match self.audio.start(self.audio_config_from_ui()) {
             Ok(()) => {
                 let notice = self.audio.status().notice.clone();
-                if !notice.is_empty() {
-                    self.overlay.audio_notice = notice;
-                }
+                self.overlay.audio_notice = if notice.is_empty() {
+                    String::new()
+                } else {
+                    self.i18n.t("err_audio_out_fallback")
+                };
             }
             Err(e) => {
                 tracing::warn!(error = %e, "audio start failed");
-                self.overlay.audio_notice = format!("Audio indisponible: {e}");
+                self.push_support(format!("audio start failed: {e}"));
+                self.overlay.audio_notice = self.i18n.t("err_audio");
                 self.audio_ui.input_id = NONE_INPUT_ID.into();
             }
         }
@@ -400,10 +431,8 @@ impl App {
                 .first()
                 .copied()
                 .unwrap_or(Rational::new(60, 1));
-            let _ = self.restart_with_fallback(
-                format,
-                "Impossible de démarrer ce périphérique, retour au précédent.",
-            );
+            let msg = self.i18n.t("err_device_start");
+            let _ = self.restart_with_fallback(format, &msg);
             self.suggest_audio_for_current_video();
             self.restart_audio();
         }
@@ -417,10 +446,8 @@ impl App {
                 self.selection.rate = *r;
             }
             if let Some(fmt) = modes::pick_format_at(caps, w, h, self.selection.rate) {
-                let _ = self.restart_with_fallback(
-                    fmt,
-                    "Impossible d'appliquer cette résolution, retour au précédent.",
-                );
+                let msg = self.i18n.t("err_resolution");
+                let _ = self.restart_with_fallback(fmt, &msg);
             }
         }
 
@@ -430,10 +457,8 @@ impl App {
             if let Some(fmt) =
                 modes::pick_format_at(caps, self.selection.width, self.selection.height, rate)
             {
-                let _ = self.restart_with_fallback(
-                    fmt,
-                    "Impossible d'appliquer cette fréquence, retour au précédent.",
-                );
+                let msg = self.i18n.t("err_rate");
+                let _ = self.restart_with_fallback(fmt, &msg);
             }
         }
 
@@ -442,10 +467,8 @@ impl App {
             self.selection.mode = mode;
             let caps = &self.devices[self.selection.device_idx].formats;
             if let Some(fmt) = modes::select_format(mode, caps) {
-                if !self.restart_with_fallback(
-                    fmt,
-                    "Impossible d'appliquer ce mode, retour au précédent.",
-                ) {
+                let msg = self.i18n.t("err_mode");
+                if !self.restart_with_fallback(fmt, &msg) {
                     self.selection.mode = previous_mode;
                 }
             }
@@ -480,12 +503,133 @@ impl App {
             self.audio.set_buffer_ms(b);
             self.persist_audio_prefs();
         }
-        if actions.toggle_advanced {
-            self.audio_ui.show_advanced = !self.audio_ui.show_advanced;
-        }
         if audio_restart {
             self.restart_audio();
         }
+
+        if let Some(tab) = actions.open_settings {
+            self.chrome.settings_open = true;
+            self.chrome.settings_tab = tab;
+            self.chrome.toolbar_visible = true;
+            self.last_pointer_at = Instant::now();
+        }
+        if actions.close_settings {
+            self.chrome.settings_open = false;
+        }
+        if actions.toggle_advanced {
+            self.chrome.advanced_open = !self.chrome.advanced_open;
+        }
+        if actions.toggle_fullscreen {
+            self.toggle_fullscreen();
+        }
+        if actions.show_toolbar {
+            self.chrome.toolbar_visible = true;
+            self.last_pointer_at = Instant::now();
+        }
+        if actions.reset_auto {
+            self.reset_to_auto();
+        }
+        if actions.retry {
+            let fmt = self.current_format.clone();
+            let idx = self.selection.device_idx;
+            let msg = self.i18n.t("err_device_start");
+            let _ = self.open_and_start(idx, fmt).map_err(|e| {
+                self.overlay.status = msg;
+                self.push_support(format!("retry failed: {e}"));
+            });
+            self.restart_audio();
+        }
+        if actions.copy_support {
+            self.copy_support_report();
+        }
+        if actions.wizard_next {
+            self.chrome.wizard_step = (self.chrome.wizard_step + 1).min(2);
+            self.persist_ui_prefs();
+        }
+        if actions.wizard_back {
+            self.chrome.wizard_step = self.chrome.wizard_step.saturating_sub(1);
+            self.persist_ui_prefs();
+        }
+        if actions.wizard_skip || actions.wizard_finish {
+            self.chrome.wizard_open = false;
+            self.ui_prefs.wizard_done = true;
+            self.persist_ui_prefs();
+        }
+    }
+
+    fn persist_ui_prefs(&mut self) {
+        self.ui_prefs.wizard_step = self.chrome.wizard_step;
+        save_ui_prefs(&self.ui_prefs);
+    }
+
+    fn push_support(&mut self, line: String) {
+        if self.support_log.len() > 200 {
+            self.support_log.remove(0);
+        }
+        self.support_log.push(line);
+    }
+
+    fn copy_support_report(&mut self) {
+        let report = format!(
+            "CaptureView support report\n\
+             locale={:?}\n\
+             device={}\n\
+             format={}x{} {:?} @ {:?}\n\
+             audio_in={} audio_out={}\n\
+             fps={:.1} delay_est_ms={:.0}\n\
+             -- log --\n{}\n",
+            self.i18n.lang(),
+            self.overlay.label,
+            self.current_format.width,
+            self.current_format.height,
+            self.current_format.pixel_format,
+            self.current_format.frame_rates,
+            self.audio_ui.input_id,
+            self.audio_ui.output_id,
+            self.overlay.fps,
+            self.overlay.estimated_delay_ms,
+            self.support_log.join("\n")
+        );
+        match arboard::Clipboard::new().and_then(|mut c| c.set_text(report)) {
+            Ok(()) => self.show_toast(self.i18n.t("msg_copied")),
+            Err(e) => {
+                self.push_support(format!("clipboard failed: {e}"));
+                self.show_toast(self.i18n.t("err_audio"));
+            }
+        }
+    }
+
+    fn show_toast(&mut self, msg: String) {
+        self.overlay.toast = msg;
+        self.toast_until = Some(Instant::now() + Duration::from_secs(3));
+    }
+
+    fn toggle_fullscreen(&mut self) {
+        let Some(gpu) = self.gpu.as_ref() else {
+            return;
+        };
+        self.chrome.fullscreen = !self.chrome.fullscreen;
+        gpu.window.set_fullscreen(if self.chrome.fullscreen {
+            Some(winit::window::Fullscreen::Borderless(None))
+        } else {
+            None
+        });
+    }
+
+    fn reset_to_auto(&mut self) {
+        self.selection.mode = CaptureMode::Auto;
+        let caps = self.devices[self.selection.device_idx].formats.clone();
+        if let Some(fmt) = modes::select_format(CaptureMode::Auto, &caps) {
+            let msg = self.i18n.t("err_mode");
+            let _ = self.restart_with_fallback(fmt, &msg);
+        }
+        self.audio_ui.delay_ms = 0.0;
+        self.audio_ui.buffer_ms = 30.0;
+        self.audio_ui.volume = 1.0;
+        self.audio_ui.muted = false;
+        self.suggest_audio_for_current_video();
+        self.restart_audio();
+        self.show_toast(self.i18n.t("msg_reset_auto"));
     }
 
     fn redraw(&mut self) {
@@ -534,8 +678,21 @@ impl App {
         self.overlay.no_signal = no_signal;
         self.overlay.soft_black = soft_black;
         self.overlay.level = self.audio.meter().take_peak();
-        if self.overlay.audio_notice.is_empty() {
-            self.overlay.audio_notice = self.audio.status().notice.clone();
+        self.overlay.estimated_delay_ms =
+            self.audio_ui.buffer_ms + self.audio_ui.delay_ms + 16.0;
+        self.overlay.audio_notice = self.audio.status().notice.clone();
+        if let Some(until) = self.toast_until {
+            if Instant::now() > until {
+                self.overlay.toast.clear();
+                self.toast_until = None;
+            }
+        }
+        // Hide floating toolbar after 3s without pointer motion (unless settings open).
+        if !self.chrome.settings_open
+            && !self.chrome.wizard_open
+            && self.last_pointer_at.elapsed() > Duration::from_secs(3)
+        {
+            self.chrome.toolbar_visible = false;
         }
 
         let devices = self.devices.clone();
@@ -545,6 +702,8 @@ impl App {
         let inputs = self.audio_inputs.clone();
         let outputs = self.audio_outputs.clone();
         let audio_ui = self.audio_ui.clone();
+        let chrome = self.chrome.clone();
+        let i18n = self.i18n.clone();
 
         let mut actions = ui::UiActions::default();
         {
@@ -583,13 +742,17 @@ impl App {
         let full_output = gpu.egui_ctx.run(raw_input, |ctx| {
             actions = ui::draw_ui(
                 ctx,
-                &devices,
-                &selection,
-                &current,
-                &overlay,
-                &inputs,
-                &outputs,
-                &audio_ui,
+                ui::DrawInput {
+                    i18n: &i18n,
+                    devices: &devices,
+                    selection: &selection,
+                    current: &current,
+                    overlay: &overlay,
+                    inputs: &inputs,
+                    outputs: &outputs,
+                    audio: &audio_ui,
+                    chrome: &chrome,
+                },
             );
         });
         gpu.egui_state
