@@ -16,7 +16,10 @@ use egui_winit::State as EguiWinitState;
 use metrics::{sample_process, SharedMetrics};
 use render::pipeline::VideoPipeline;
 use render::upload::upload_frame;
-use render::{target_size, UpscaleBlockReason, UpscaleEngine, UpscaleMode};
+use render::{
+    target_size, InterpBlockReason, InterpMode, InterpolateEngine, UpscaleBlockReason,
+    UpscaleEngine, UpscaleMode,
+};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::WindowEvent;
@@ -78,6 +81,7 @@ struct GpuState {
     config: wgpu::SurfaceConfiguration,
     pipeline: VideoPipeline,
     upscale: UpscaleEngine,
+    interpolate: InterpolateEngine,
     window: Arc<Window>,
     egui_renderer: egui_wgpu::Renderer,
     egui_state: EguiWinitState,
@@ -217,6 +221,7 @@ impl Default for App {
             effects_ui: EffectsUiState {
                 mode: ui_prefs.upscale_mode.clone(),
                 sharpness: ui_prefs.sharpness.clamp(0.0, 1.0),
+                interp_mode: ui_prefs.interp_mode.clone(),
                 ..EffectsUiState::default()
             },
             i18n,
@@ -255,9 +260,12 @@ impl ApplicationHandler for App {
         gpu.upscale
             .set_mode(UpscaleMode::from_str_lossy(&self.effects_ui.mode));
         gpu.upscale.set_sharpness(self.effects_ui.sharpness);
+        gpu.interpolate
+            .set_mode(InterpMode::from_str_lossy(&self.effects_ui.interp_mode));
         self.effects_ui.vendor = gpu.upscale.vendor.clone();
         self.effects_ui.backend = gpu.upscale.backend.clone();
         self.effects_ui.compute_ok = gpu.upscale.compute_ok;
+        self.effects_ui.interp_compute_ok = gpu.interpolate.compute_ok;
         self.gpu = Some(gpu);
 
         if let Err(e) = self.open_and_start(self.selection.device_idx, self.current_format.clone()) {
@@ -558,9 +566,11 @@ impl App {
             self.reset_to_auto();
             self.effects_ui.mode = "off".into();
             self.effects_ui.sharpness = 0.4;
+            self.effects_ui.interp_mode = "off".into();
             if let Some(gpu) = self.gpu.as_mut() {
                 gpu.upscale.set_mode(UpscaleMode::Off);
                 gpu.upscale.set_sharpness(0.4);
+                gpu.interpolate.set_mode(InterpMode::Off);
             }
             self.persist_ui_prefs();
         }
@@ -625,12 +635,22 @@ impl App {
             }
             self.persist_ui_prefs();
         }
+        if let Some(mode) = actions.interp_mode {
+            self.effects_ui.interp_mode = mode.to_string();
+            self.ui_prefs.interp_mode = mode.to_string();
+            if let Some(gpu) = self.gpu.as_mut() {
+                gpu.interpolate
+                    .set_mode(InterpMode::from_str_lossy(mode));
+            }
+            self.persist_ui_prefs();
+        }
     }
 
     fn persist_ui_prefs(&mut self) {
         self.ui_prefs.wizard_step = self.chrome.wizard_step;
         self.ui_prefs.upscale_mode = self.effects_ui.mode.clone();
         self.ui_prefs.sharpness = self.effects_ui.sharpness;
+        self.ui_prefs.interp_mode = self.effects_ui.interp_mode.clone();
         save_ui_prefs(&self.ui_prefs);
     }
 
@@ -654,9 +674,15 @@ impl App {
             self.effects_ui.compute_ok = st.compute_ok;
             self.effects_ui.native_res = native;
             self.effects_ui.auto_disabled = st.block == UpscaleBlockReason::AutoDisabled;
-            self.effects_ui.last_gpu_ms = st.last_gpu_ms;
+            self.effects_ui.last_gpu_ms = st.last_gpu_ms.max(gpu.interpolate.last_gpu_ms);
             self.effects_ui.vendor = st.vendor;
             self.effects_ui.backend = st.backend;
+            let ist = gpu.interpolate.status();
+            self.effects_ui.interp_mode = ist.mode.as_str().into();
+            self.effects_ui.interp_compute_ok = ist.compute_ok;
+            self.effects_ui.interp_auto_disabled =
+                ist.block == InterpBlockReason::AutoDisabled;
+            self.effects_ui.interp_delay_ms = ist.delay_ms;
         } else {
             self.effects_ui.native_res = native;
         }
@@ -888,6 +914,7 @@ impl App {
             return;
         };
 
+        let new_capture = latest.is_some();
         if let Some(frame) = latest {
             let latency_ns = frame.captured_at.elapsed().as_nanos() as u64;
             if upload_frame(&gpu.device, &gpu.queue, &mut gpu.pipeline, &frame) {
@@ -900,6 +927,15 @@ impl App {
                 self.metrics.record_present(latency_ns, frame_time_ns);
                 let frame_ms = frame_time_ns as f32 / 1_000_000.0;
                 let _ = gpu.upscale.observe_frame_ms(frame_ms);
+                let _ = gpu.interpolate.observe_frame_ms(frame_ms);
+                let rate = self
+                    .current_format
+                    .frame_rates
+                    .first()
+                    .map(|r| r.as_f64())
+                    .unwrap_or(60.0);
+                let src_period_ms = if rate > 0.0 { 1000.0 / rate as f32 } else { 16.7 };
+                gpu.interpolate.set_source_delay_ms(src_period_ms);
             }
         }
 
@@ -984,20 +1020,60 @@ impl App {
                 label: Some("frame-encoder"),
             });
 
-        let mut used_upscale = false;
+        // Pipeline: upload → color → interpolate → upscale → present.
+        let mut presented = false;
         if !no_signal {
-            used_upscale = gpu.upscale.encode(
+            let interp_frame = gpu.interpolate.prepare(
                 &gpu.device,
                 &gpu.queue,
                 &mut encoder,
                 &gpu.pipeline,
-                &view,
-                gpu.config.width,
-                gpu.config.height,
-                clear,
+                new_capture,
             );
+            if let Some(frame_kind) = interp_frame {
+                let (cw, ch) = gpu.pipeline.content_size;
+                if let Some(rgba) = gpu.interpolate.frame_view(frame_kind) {
+                    presented = gpu.upscale.encode_from_rgba(
+                        &gpu.device,
+                        &gpu.queue,
+                        &mut encoder,
+                        rgba,
+                        cw,
+                        ch,
+                        &view,
+                        gpu.config.width,
+                        gpu.config.height,
+                        clear,
+                    );
+                    if !presented {
+                        gpu.interpolate.present_view(
+                            &gpu.device,
+                            &gpu.queue,
+                            &mut encoder,
+                            rgba,
+                            (cw, ch),
+                            &view,
+                            gpu.config.width,
+                            gpu.config.height,
+                            clear,
+                        );
+                        presented = true;
+                    }
+                }
+            } else {
+                presented = gpu.upscale.encode(
+                    &gpu.device,
+                    &gpu.queue,
+                    &mut encoder,
+                    &gpu.pipeline,
+                    &view,
+                    gpu.config.width,
+                    gpu.config.height,
+                    clear,
+                );
+            }
         }
-        if !used_upscale {
+        if !presented {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("video-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1053,14 +1129,24 @@ impl App {
         }
 
         // GPU borrow ended with the block above; safe to restart capture from UI.
-        let was_auto = self
+        let (up_auto, interp_auto) = self
             .gpu
             .as_ref()
-            .map(|g| g.upscale.status().block == UpscaleBlockReason::AutoDisabled)
-            .unwrap_or(false);
-        if was_auto && self.effects_ui.mode != "off" {
+            .map(|g| {
+                (
+                    g.upscale.status().block == UpscaleBlockReason::AutoDisabled,
+                    g.interpolate.status().block == InterpBlockReason::AutoDisabled,
+                )
+            })
+            .unwrap_or((false, false));
+        if up_auto && self.effects_ui.mode != "off" {
             self.effects_ui.mode = "off".into();
             self.show_toast(self.i18n.t("msg_upscale_off_budget"));
+            self.persist_ui_prefs();
+        }
+        if interp_auto && self.effects_ui.interp_mode != "off" {
+            self.effects_ui.interp_mode = "off".into();
+            self.show_toast(self.i18n.t("msg_interp_off_budget"));
             self.persist_ui_prefs();
         }
         self.apply_ui_actions(actions);
@@ -1158,6 +1244,7 @@ async fn init_gpu(window: Arc<Window>) -> anyhow::Result<GpuState> {
 
     let pipeline = VideoPipeline::new(&device, format);
     let upscale = UpscaleEngine::new(&device, &queue, format, &adapter, backend);
+    let interpolate = InterpolateEngine::new(&device, format, &adapter);
 
     let egui_ctx = egui::Context::default();
     let egui_state = EguiWinitState::new(
@@ -1177,6 +1264,7 @@ async fn init_gpu(window: Arc<Window>) -> anyhow::Result<GpuState> {
         config,
         pipeline,
         upscale,
+        interpolate,
         window,
         egui_renderer,
         egui_state,

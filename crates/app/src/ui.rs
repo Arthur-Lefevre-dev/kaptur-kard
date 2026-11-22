@@ -194,6 +194,7 @@ pub struct UiActions {
     pub lag_test_stop: bool,
     pub upscale_mode: Option<&'static str>,
     pub sharpness_changed: Option<f32>,
+    pub interp_mode: Option<&'static str>,
 }
 
 #[derive(Clone, Debug)]
@@ -206,6 +207,10 @@ pub struct EffectsUiState {
     pub last_gpu_ms: f32,
     pub vendor: String,
     pub backend: String,
+    pub interp_mode: String,
+    pub interp_compute_ok: bool,
+    pub interp_auto_disabled: bool,
+    pub interp_delay_ms: f32,
 }
 
 impl Default for EffectsUiState {
@@ -219,6 +224,10 @@ impl Default for EffectsUiState {
             last_gpu_ms: 0.0,
             vendor: String::new(),
             backend: String::new(),
+            interp_mode: "off".into(),
+            interp_compute_ok: true,
+            interp_auto_disabled: false,
+            interp_delay_ms: 0.0,
         }
     }
 }
@@ -793,20 +802,46 @@ fn draw_effects_tab(ui: &mut egui::Ui, input: &DrawInput<'_>, actions: &mut UiAc
         },
     );
 
-    ui.add_space(8.0);
-    // Interpolation remains stubbed for step g.
-    ui.add_enabled_ui(false, |ui| {
+    ui.add_space(10.0);
+    ui.separator();
+    ui.label(RichText::new(i18n.t("label_interp_mode")).strong());
+    let interp_blocked = !fx.interp_compute_ok;
+    ui.add_enabled_ui(!interp_blocked, |ui| {
         ui.horizontal(|ui| {
-            ui.checkbox(&mut false, i18n.t("effect_interp"));
-            ui.weak(format!("— {}", i18n.t("label_soon")));
+            for (id, key) in [
+                ("off", "effect_interp_off"),
+                ("x2", "effect_interp_x2"),
+                ("auto", "effect_interp_auto"),
+            ] {
+                let selected = fx.interp_mode == id;
+                if ui.selectable_label(selected, i18n.t(key)).clicked() {
+                    actions.interp_mode = Some(id);
+                }
+            }
         });
     });
-    ui.small(format!(
-        "{}: {}",
-        i18n.t("label_unavailable"),
-        i18n.t("effect_reason_soon")
-    ));
+    if interp_blocked {
+        ui.small(format!(
+            "{}: {}",
+            i18n.t("label_unavailable"),
+            i18n.t("effect_reason_no_compute")
+        ));
+    } else if fx.interp_auto_disabled {
+        ui.small(format!(
+            "{}: {}",
+            i18n.t("label_unavailable"),
+            i18n.t("effect_reason_interp_budget")
+        ));
+    }
+    if fx.interp_delay_ms > 0.0 {
+        ui.label(format!(
+            "{}: ~{:.0} ms",
+            i18n.t("label_interp_delay"),
+            fx.interp_delay_ms
+        ));
+    }
     ui.label(RichText::new(i18n.t("tip_interp")).small().italics());
+    ui.label(RichText::new(i18n.t("explain_interp")).small());
 
     ui.add_space(10.0);
     ui.separator();

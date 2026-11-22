@@ -4,13 +4,23 @@ Desktop preview app for generic UVC / capture-card sources. Product name **Captu
 
 ## Status
 
-**Step (f)** — FSR 1 / NIS upscaling.
+**Step (g)** — optical-flow frame interpolation (x2).
 
-- Effets: **Off** / **Mode A (FSR 1)** / **Mode B (NIS)** + sharpness; target = on-screen content size
-- Greyed when already native resolution or GPU lacks compute (`get_downlevel_capabilities`)
-- Auto-disable if frame time repeatedly exceeds budget (~20 ms × 45 frames)
-- Adapter vendor/backend logged at startup (DX12/Vulkan preferred; GL noted as fallback)
-- Licenses: `licenses/AMD-FSR1-MIT.txt`, `licenses/NVIDIA-NIS-MIT.txt`
+- Effets → **Interpolation**: Off / **x2** / **Auto** (keeps x2 only while the GPU stays within budget)
+- Adds ~**one source frame** of display delay (shown in the UI)
+- Pipeline: upload → color convert → **interpolate** → upscale → present (hot-toggleable)
+- Same performance guard as upscale: repeated frame-budget misses → auto-disable + French notice
+- Greyed when compute shaders are unavailable
+
+### Quality vs latency
+
+| Mode | Motion | Added delay | GPU cost |
+|------|--------|-------------|----------|
+| Off | Source cadence | None | Baseline |
+| x2 | Smoother (inserted mid-frame) | ~1 source frame | Flow + warp every new capture |
+| Auto | Like x2 while budget holds | Same as x2 when on | Auto-off if too heavy |
+
+Spatial upscale (FSR 1 / NIS) can still run **after** interpolation.
 
 ## Build & run
 
@@ -21,13 +31,10 @@ cargo build --release -p captureview
 cargo test --workspace
 ```
 
-Ideal path: launch → Auto card → full-frame video. Open **Effets** to pick FSR 1 or NIS when the capture is below screen resolution.
-
 ## Out of scope (later)
 
-- Optical-flow interpolation (step g)
+- Deinterlace polish / DirectShow / Linux V4L2 / macOS (step h)
 - DLSS / FSR 2 / FSR 3
-- Linux / macOS
 
 ## Licence
 

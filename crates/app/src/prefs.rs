@@ -37,6 +37,8 @@ pub struct UiPrefs {
     pub upscale_mode: String,
     #[serde(default = "default_sharpness")]
     pub sharpness: f32,
+    #[serde(default)]
+    pub interp_mode: String,
 }
 
 fn default_sharpness() -> f32 {
@@ -50,6 +52,7 @@ impl Default for UiPrefs {
             wizard_step: 0,
             upscale_mode: "off".into(),
             sharpness: 0.4,
+            interp_mode: "off".into(),
         }
     }
 }

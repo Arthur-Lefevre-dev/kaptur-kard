@@ -533,15 +533,82 @@ impl UpscaleEngine {
 
         match self.mode {
             UpscaleMode::Fsr1 => {
-                self.dispatch_fsr(device, queue, encoder, src, mid, dst, cw, ch, out_w, out_h);
+                self.dispatch_fsr(
+                    device,
+                    queue,
+                    encoder,
+                    &src.view,
+                    mid,
+                    dst,
+                    cw,
+                    ch,
+                    out_w,
+                    out_h,
+                );
             }
             UpscaleMode::Nis => {
-                self.dispatch_nis(device, queue, encoder, src, dst, cw, ch, out_w, out_h);
+                self.dispatch_nis(device, queue, encoder, &src.view, dst, cw, ch, out_w, out_h);
             }
             UpscaleMode::Off => return false,
         }
 
-        // Present upscaled buffer letterboxed onto the swapchain.
+        self.present_dst(device, queue, encoder, dst, out_w, out_h, surface_view, view_w, view_h, clear);
+        true
+    }
+
+    /// Upscale an already color-converted RGBA view (e.g. after interpolation).
+    pub fn encode_from_rgba(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        src_view: &wgpu::TextureView,
+        src_w: u32,
+        src_h: u32,
+        surface_view: &wgpu::TextureView,
+        view_w: u32,
+        view_h: u32,
+        clear: wgpu::Color,
+    ) -> bool {
+        if src_w == 0 || src_h == 0 || !self.should_run((src_w, src_h), (view_w, view_h)) {
+            return false;
+        }
+        let (out_w, out_h) = target_size(src_w, src_h, view_w, view_h);
+        ensure_tex(device, &mut self.mid, out_w, out_h, "upscale-mid", true);
+        ensure_tex(device, &mut self.rgba_dst, out_w, out_h, "upscale-dst", true);
+        let mid = self.mid.as_ref().unwrap();
+        let dst = self.rgba_dst.as_ref().unwrap();
+
+        match self.mode {
+            UpscaleMode::Fsr1 => {
+                self.dispatch_fsr(
+                    device, queue, encoder, src_view, mid, dst, src_w, src_h, out_w, out_h,
+                );
+            }
+            UpscaleMode::Nis => {
+                self.dispatch_nis(
+                    device, queue, encoder, src_view, dst, src_w, src_h, out_w, out_h,
+                );
+            }
+            UpscaleMode::Off => return false,
+        }
+        self.present_dst(device, queue, encoder, dst, out_w, out_h, surface_view, view_w, view_h, clear);
+        true
+    }
+
+    fn present_dst(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        dst: &TexSlot,
+        out_w: u32,
+        out_h: u32,
+        surface_view: &wgpu::TextureView,
+        view_w: u32,
+        view_h: u32,
+        clear: wgpu::Color,
+    ) {
         let LetterboxUniforms { scale_offset } = compute_letterbox(out_w, out_h, view_w, view_h);
         queue.write_buffer(
             &self.present_buf,
@@ -569,26 +636,23 @@ impl UpscaleEngine {
                 },
             ],
         });
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("upscale-present"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: surface_view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(clear),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-            pass.set_pipeline(&self.present_pipeline);
-            pass.set_bind_group(0, &present_bg, &[]);
-            pass.draw(0..3, 0..1);
-        }
-        true
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("upscale-present"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: surface_view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(clear),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        pass.set_pipeline(&self.present_pipeline);
+        pass.set_bind_group(0, &present_bg, &[]);
+        pass.draw(0..3, 0..1);
     }
 
     /// Observe end-to-end frame time while upscale is active (proxy for GPU cost).
@@ -621,7 +685,7 @@ impl UpscaleEngine {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
-        src: &TexSlot,
+        src_view: &wgpu::TextureView,
         mid: &TexSlot,
         dst: &TexSlot,
         in_w: u32,
@@ -643,7 +707,7 @@ impl UpscaleEngine {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&src.view),
+                    resource: wgpu::BindingResource::TextureView(src_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -710,7 +774,7 @@ impl UpscaleEngine {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
-        src: &TexSlot,
+        src_view: &wgpu::TextureView,
         dst: &TexSlot,
         in_w: u32,
         in_h: u32,
@@ -737,7 +801,7 @@ impl UpscaleEngine {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&src.view),
+                    resource: wgpu::BindingResource::TextureView(src_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
