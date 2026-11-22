@@ -987,7 +987,9 @@ fn draw_effects_tab(ui: &mut egui::Ui, input: &DrawInput<'_>, actions: &mut UiAc
     }
     if fx.mode == "dlss" {
         ui.label(RichText::new(i18n.t("tip_dlss")).small().italics());
-        if fx.dlss_fallback_nis || !fx.dlss_ok {
+        if fx.dlss_ok {
+            ui.small(format!("{}: {}", i18n.t("label_dlss_status"), i18n.t("effect_reason_dlss_active")));
+        } else {
             let key = if fx.dlss_reason_key.is_empty() {
                 "effect_reason_dlss_fallback"
             } else {

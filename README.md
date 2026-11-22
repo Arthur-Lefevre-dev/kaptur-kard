@@ -15,7 +15,7 @@ Desktop preview app for generic UVC / capture-card sources. Product / window nam
 | macOS AVFoundation | **Stub** — `cfg(macos)` scaffolding; compile on Apple hosts |
 | Hot-plug (~2 s poll) | **Done** — reconnect last settings by device id |
 | Frame interp / FSR1 / NIS / audio / metrics | **Done** (steps c–g) |
-| DLSS Mode C (Streamline scaffold + NIS fallback) | **Scaffold** — see [docs/DLSS.md](./docs/DLSS.md) |
+| DLSS 5 NR Mode C (NGX feature 18) | **Wired** — needs `nvngx_dlssnr.dll` + RTX 50; see [docs/DLSS.md](./docs/DLSS.md) |
 
 ## Platform matrix
 
@@ -36,7 +36,8 @@ cargo run -p captureview
 cargo build --release -p captureview
 cargo test --workspace
 
-# Optional: NVIDIA Streamline / DLSS probe (SDK not vendored — docs/DLSS.md)
+# Optional: DLSS 5 Neural Rendering (nvngx_dlssnr.dll not vendored — docs/DLSS.md)
+powershell -ExecutionPolicy Bypass -File native\dlss5-nr\build_native.ps1
 cargo run -p captureview --features dlss
 ```
 
@@ -73,7 +74,7 @@ upload → color convert → **deinterlace (Bob)** → **interpolate** → **ups
 
 - **Deinterlace**: Auto (default) enables Bob when the active format is flagged interlaced; user can force Off or Bob.
 - **Interpolation**: Off / x2 / Auto (~one source frame of added delay when on).
-- **Upscale**: Off / FSR 1 / NIS / DLSS (Mode C) toward the on-screen letterbox size. Mode C falls back to NIS when Streamline/NGX is unavailable — see [docs/DLSS.md](./docs/DLSS.md).
+- **Upscale**: Off / FSR 1 / NIS / **DLSS 5 NR** (Mode C). Mode C runs NGX feature 18 when the runtime + RTX 50 allow it; otherwise pass-through — see [docs/DLSS.md](./docs/DLSS.md).
 
 ## Lag measurement method
 
@@ -99,7 +100,7 @@ Use an external LED / high-speed camera / dedicated lag tester for absolute HDMI
 
 - Full DirectShow sample-grabber graph
 - Production AVFoundation capture
-- Native Streamline `slEvaluateFeature` through wgpu (Mode C scaffold + NIS fallback only until DXGI/VK hook)
+- Bundling proprietary `nvngx_dlssnr.dll` (user must supply)
 - FSR 2 / FSR 3
 - Hardware lag meters
 

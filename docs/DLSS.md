@@ -1,68 +1,81 @@
-# NVIDIA Streamline / DLSS (Mode C)
+# DLSS 5 Neural Rendering (Mode C)
 
-CaptureView Mode **C — DLSS** targets the official **NVIDIA Streamline** SDK with the **DLSS Super Resolution** plugin (current public NGX / DLSS 4.x transformer presets). There is **no separate public “DLSS 5” SDK package** as of this write-up; use the latest Streamline release zip.
+Mode **C** runs **NVIDIA DLSS 5 Neural Rendering** — NGX **feature 18** via `nvngx_dlssnr.dll` — on CaptureView video frames. This is the same family of path used by community tools such as [obs-dlss5-nr](https://github.com/Saganaki22/obs-dlss5-nr), Glasir, and ComfyUI-DLSS5-NR.
 
-## Why binaries are not in git
+It is **not** classic game DLSS Super Resolution (Streamline DLSS-SR). NR is a same-resolution neural enhance / “relight” of the frame.
 
-NVIDIA RTX / Streamline redistributables are under the [NVIDIA RTX SDKs license](https://github.com/NVIDIA/DLSS/blob/main/LICENSE.txt). Signed DLLs (`sl.interposer.dll`, `nvngx_dlss.dll`, …) ship in the **GitHub release zip**, not in the Streamline source tree. We **do not vendor** those DLLs in this repository — Arthur must download them once and point the app at the folder.
+## GPU requirements
 
-## Install on Windows (Arthur)
+| GPU | Status |
+|-----|--------|
+| **RTX 50-series** | Officially supported by NVIDIA for DLSS Neural Rendering |
+| RTX 40 / older | Often `FeatureNotSupported` (`0xBAD00001`) with stock runtimes |
+| AMD / Intel | Not supported |
 
-1. Open [NVIDIA-RTX/Streamline releases](https://github.com/NVIDIA-RTX/Streamline/releases).
-2. Download the production package for **v2.14.16** (or newer 2.14.x) — e.g. the published SDK zip.
-3. Accept the NVIDIA license when prompted / as stated in the package.
-4. Unpack to a stable path, for example:
-   `C:\SDK\Streamline-2.14.16`
-5. Confirm you can see `sl.interposer.dll` and `nvngx_dlss.dll` (often under `bin\x64\` depending on the zip layout).
-6. Set a user or session environment variable:
+Driver: **616.56+** recommended (same floor as obs-dlss5-nr).
 
-```powershell
-$env:STREAMLINE_SDK_PATH = "C:\SDK\Streamline-2.14.16"
-# optional alias:
-# $env:CAPTUREVIEW_STREAMLINE_DIR = $env:STREAMLINE_SDK_PATH
+## Runtime file (NOT in git)
+
+You must supply **`nvngx_dlssnr.dll`** (~158 MB, v310.8+) yourself (NVIDIA proprietary). Legitimate sources include a game that ships DLSS 5 NR (e.g. NBA 2K27) or an NVIDIA SDK package that includes the NR runtime.
+
+Place it here:
+
+```
+%APPDATA%\CaptureView\dlss5-nr\nvngx_dlssnr.dll
 ```
 
-7. Build with the feature flag:
+Or set:
 
 ```powershell
-cd C:\Users\kingd\Documents\GitHub\kaptur-kard   # or your worktree
+$env:CAPTUREVIEW_DLSSNR_DIR = "C:\path\to\folder"   # folder that contains nvngx_dlssnr.dll
+```
+
+Also required next to that layout:
+
+```
+CAPTUREVIEW_DLSSNR_DIR\
+  nvngx_dlssnr.dll
+  caller\nvngx.dll_comfy.dll      # built by native/dlss5-nr/build_native.ps1
+```
+
+and `dlss5nr_bridge.dll` from `native/dlss5-nr/bin\` (auto-discovered relative to the runtime folder / repo).
+
+The NGX core `_nvngx.dll` is loaded from the NVIDIA driver install automatically.
+
+## Build
+
+```powershell
+# Native bridge + caller shim (MSVC required once)
+powershell -ExecutionPolicy Bypass -File native\dlss5-nr\build_native.ps1
+
+# App with NR loader
 cargo run -p captureview --features dlss
-# release:
 cargo build --release -p captureview --features dlss
 ```
 
-8. In CaptureView → Effects → **Mode C — DLSS**.
+Default builds (no `--features dlss`) still show Mode C in the UI but report “feature disabled” and **pass through** unenhanced video (no silent NIS fake).
 
-### Alternate layout (no env var)
+## Pipeline
 
-Copy the Streamline `bin\x64` (or root) contents next to the exe under `streamline\` or `third_party\streamline\`.
+```
+capture upload (CPU→GPU)
+  → color convert / deinterlace / interpolate (GPU)
+  → Mode C: readback RGBA8 → D3D12 NR (feature 18) → upload → present
+  → Mode A/B: FSR1 / NIS compute (GPU) → present
+```
 
-## Graceful fallback
+Temporal mode feeds NVIDIA Optical Flow motion vectors when the bridge enables it (same approach as obs-dlss5-nr CPU path).
 
-| Situation | Behaviour |
-|-----------|-----------|
-| Default build (no `--features dlss`) | Mode C selectable; status explains feature flag; **NIS** runs |
-| AMD / Intel GPU | Mode C → **NIS** fallback |
-| OpenGL backend | Mode C → **NIS** fallback (need DX12/Vulkan) |
-| Feature on, SDK path missing | Mode C → **NIS** fallback |
-| SDK DLLs loaded | Probe succeeds (`SdkPresentPendingHook`); **NIS** still used until native evaluate is wired |
-| FSR 1 / NIS | Unchanged |
+## Native bridge license
 
-## Architecture notes
+`native/dlss5-nr/` is MIT-adapted from [ComfyUI-DLSS5-NR](https://github.com/lisitskyaa/ComfyUI-DLSS5-NR) (same lineage as obs-dlss5-nr’s bridge). See `native/dlss5-nr/LICENSE-ComfyUI-DLSS5-NR.txt`.
 
-- Upscale pipeline: upload → color → deinterlace → interpolate → **upscale (Off / FSR1 / NIS / DLSS)** → present.
-- Streamline needs a **native D3D12 or Vulkan device**. CaptureView presents through **wgpu**, which does not currently expose the underlying `ID3D12Device` / `VkDevice` for `slSetD3DDevice` / `slSetVulkanInfo`.
-- Until that hook exists, Mode C **always falls back to the existing NIS compute path** so picture enhancement never goes blank.
-- Full game-style DLSS SR also expects motion vectors, depth, and jitter — a capture preview may later use a limited / DLAA-style path once the device hook lands.
+## Arthur checklist
 
-## Blockers (honest)
+1. RTX 50-series + recent Game Ready / Studio driver  
+2. Build native bridge (`build_native.ps1`)  
+3. Copy `nvngx_dlssnr.dll` into `%APPDATA%\CaptureView\dlss5-nr\` (and copy `caller\` + bridge DLL as documented)  
+4. `cargo run -p captureview --features dlss`  
+5. Effects → **Mode C — DLSS** — status should read Neural Rendering active  
 
-1. **License / download** — Arthur must fetch the Streamline release zip; we cannot commit NVIDIA-signed NGX DLLs into MIT git history without that install step.
-2. **wgpu native device** — no production `slEvaluateFeature` path yet; probe + UI + NIS fallback only.
-3. **“DLSS 5”** — marketing name not mirrored by a distinct public SDK; track Streamline **2.14.x** / NGX from NVIDIA developer releases.
-
-## References
-
-- Streamline repo: https://github.com/NVIDIA-RTX/Streamline
-- Programming guide (in SDK / docs on GitHub)
-- DLSS overview: https://developer.nvidia.com/rtx/dlss
+If CreateFeature fails, the Status line shows the reason and frames pass through unchanged.

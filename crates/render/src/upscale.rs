@@ -9,7 +9,9 @@ use std::time::Instant;
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
-use crate::dlss::{DlssAvailability, DlssEngine, DlssStatus};
+use crate::dlss::{
+    enhance_rgba8_with_nr, DlssAvailability, DlssEngine, DlssStatus,
+};
 use crate::pipeline::VideoPipeline;
 use crate::present::{compute_letterbox, LetterboxUniforms};
 
@@ -69,8 +71,8 @@ pub struct UpscaleStatus {
     pub last_gpu_ms: f32,
     pub over_budget_streak: u32,
     pub dlss: DlssStatus,
-    /// True when Mode C is active but evaluating via NIS (SDK/GPU/hook unavailable).
-    pub dlss_fallback_nis: bool,
+    /// True when Mode C ran real DLSS 5 NR on the last status snapshot path.
+    pub dlss_nr_active: bool,
 }
 
 #[repr(C)]
@@ -499,8 +501,7 @@ impl UpscaleEngine {
 
     pub fn status(&self) -> UpscaleStatus {
         let dlss = self.dlss.status();
-        let dlss_fallback_nis =
-            self.mode == UpscaleMode::Dlss && dlss.availability.uses_nis_fallback();
+        let dlss_nr_active = self.mode == UpscaleMode::Dlss && dlss.nr_active;
         UpscaleStatus {
             mode: self.mode,
             sharpness: self.sharpness,
@@ -511,7 +512,7 @@ impl UpscaleEngine {
             last_gpu_ms: self.last_gpu_ms,
             over_budget_streak: self.over_budget_streak,
             dlss,
-            dlss_fallback_nis,
+            dlss_nr_active,
         }
     }
 
@@ -547,6 +548,13 @@ impl UpscaleEngine {
             }
             return false;
         }
+        // Mode C uses a separate D3D12 NGX path — does not need wgpu compute shaders.
+        if self.mode == UpscaleMode::Dlss {
+            self.block = UpscaleBlockReason::None;
+            let _ = view;
+            let _ = content;
+            return self.dlss.can_evaluate();
+        }
         if !self.compute_ok {
             self.block = UpscaleBlockReason::NoCompute;
             return false;
@@ -574,7 +582,12 @@ impl UpscaleEngine {
         if cw == 0 || ch == 0 || !self.should_run((cw, ch), (view_w, view_h)) {
             return false;
         }
-        let (out_w, out_h) = target_size(cw, ch, view_w, view_h);
+        let (out_w, out_h) = if self.mode == UpscaleMode::Dlss {
+            // DLSS 5 NR is same-resolution neural enhance (not SR); letterbox at present.
+            (cw, ch)
+        } else {
+            target_size(cw, ch, view_w, view_h)
+        };
         let Some(src_bg) = video.bind_group_ref() else {
             return false;
         };
@@ -619,11 +632,11 @@ impl UpscaleEngine {
                 self.dispatch_nis(device, queue, encoder, &sample, true, cw, ch, out_w, out_h);
             }
             UpscaleMode::Dlss => {
-                // Native Streamline evaluate when Ready; otherwise graceful NIS fallback.
-                if self.dlss.can_evaluate() {
-                    tracing::warn!("DLSS Ready path has no wgpu native hook yet; using NIS");
+                let _ = sample;
+                if !self.dispatch_dlss_nr(device, queue, cw, ch) {
+                    // Unsupported / failed: pass through unenhanced (not NIS).
+                    return false;
                 }
-                self.dispatch_nis(device, queue, encoder, &sample, true, cw, ch, out_w, out_h);
             }
             UpscaleMode::Off => return false,
         }
@@ -652,7 +665,11 @@ impl UpscaleEngine {
         if src_w == 0 || src_h == 0 || !self.should_run((src_w, src_h), (view_w, view_h)) {
             return false;
         }
-        let (out_w, out_h) = target_size(src_w, src_h, view_w, view_h);
+        let (out_w, out_h) = if self.mode == UpscaleMode::Dlss {
+            (src_w, src_h)
+        } else {
+            target_size(src_w, src_h, view_w, view_h)
+        };
         self.ensure_slots(device, src_w, src_h, out_w, out_h);
 
         let blit_ok = self.dispatch_blit(device, queue, encoder, src_view, src_w, src_h);
@@ -674,17 +691,53 @@ impl UpscaleEngine {
                 );
             }
             UpscaleMode::Dlss => {
-                if self.dlss.can_evaluate() {
-                    tracing::warn!("DLSS Ready path has no wgpu native hook yet; using NIS");
+                let _ = (sample, stable_src);
+                if !self.dispatch_dlss_nr(device, queue, src_w, src_h) {
+                    return false;
                 }
-                self.dispatch_nis(
-                    device, queue, encoder, &sample, stable_src, src_w, src_h, out_w, out_h,
-                );
             }
             UpscaleMode::Off => return false,
         }
         self.present_dst(device, queue, encoder, out_w, out_h, surface_view, view_w, view_h, clear);
         true
+    }
+
+    /// DLSS 5 Neural Rendering (NGX feature 18) via CPU staging D3D12 bridge.
+    /// Reads `rgba_src`, enhances, writes `rgba_dst` at the same resolution.
+    fn dispatch_dlss_nr(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        width: u32,
+        height: u32,
+    ) -> bool {
+        if !self.dlss.can_evaluate() {
+            return false;
+        }
+        let Some(src_tex) = self.rgba_src.as_ref().map(|s| s.texture.clone()) else {
+            return false;
+        };
+        let Some(dst_tex) = self.rgba_dst.as_ref().map(|s| s.texture.clone()) else {
+            return false;
+        };
+        match enhance_rgba8_with_nr(device, queue, &mut self.dlss, &src_tex, &dst_tex, width, height)
+        {
+            Ok(true) => {
+                if self.last_sharpen_log.elapsed().as_millis() > 1000 {
+                    tracing::info!(width, height, "DLSS 5 NR (feature 18) enhanced frame");
+                    self.last_sharpen_log = Instant::now();
+                }
+                true
+            }
+            Ok(false) => false,
+            Err(e) => {
+                if self.last_sharpen_log.elapsed().as_millis() > 2000 {
+                    tracing::warn!(%e, "DLSS 5 NR enhance failed — pass-through");
+                    self.last_sharpen_log = Instant::now();
+                }
+                false
+            }
+        }
     }
 
     /// Copy `src_view` into `rgba_src` via textureLoad (works for storage Mid).
@@ -1228,8 +1281,10 @@ fn ensure_tex(
             return false;
         }
     }
-    // Convert path needs RENDER_ATTACHMENT; blit (encode_from_rgba) needs STORAGE.
-    let mut usage = wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC;
+    // Convert path needs RENDER_ATTACHMENT; blit needs STORAGE; DLSS NR needs COPY_SRC/DST.
+    let mut usage = wgpu::TextureUsages::TEXTURE_BINDING
+        | wgpu::TextureUsages::COPY_SRC
+        | wgpu::TextureUsages::COPY_DST;
     if storage {
         usage |= wgpu::TextureUsages::STORAGE_BINDING;
     } else {
