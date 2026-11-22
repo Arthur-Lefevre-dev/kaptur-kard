@@ -158,6 +158,8 @@ pub struct App {
     gen_frames_in_window: u32,
     last_frame_at: Instant,
     last_present_at: Option<Instant>,
+    /// Absolute present phase (deadline pacing). Avoids WaitUntil slip → ~59 fps.
+    next_present_at: Instant,
     last_redraw_at: Instant,
     last_channel_drops: u64,
     black_since: Option<Instant>,
@@ -380,6 +382,7 @@ impl Default for App {
             gen_frames_in_window: 0,
             last_frame_at: Instant::now(),
             last_present_at: None,
+            next_present_at: Instant::now(),
             last_redraw_at: Instant::now(),
             last_channel_drops: 0,
             black_since: None,
@@ -503,8 +506,7 @@ impl ApplicationHandler for App {
         event: WindowEvent,
     ) {
         // Compute before borrowing GPU (egui repaint must honor the same FPS cap).
-        let period = Duration::from_secs_f64(1.0 / self.target_display_hz());
-        let redraw_due = self.last_redraw_at.elapsed() >= period;
+        let redraw_due = Instant::now() >= self.next_present_at;
 
         let Some(gpu) = self.gpu.as_mut() else {
             return;
@@ -542,15 +544,30 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        // Always honor the display FPS cap — never let has_pending alone bypass it
-        // (Arthur saw 240 FPS écran with limit 120 when pending woke every tick).
+        // Absolute deadline pacing (not "now + remaining"): late OS wakes used to
+        // slip the phase → average ~59 fps and a capture↔present latency sawtooth.
         let period = Duration::from_secs_f64(1.0 / self.target_display_hz());
-        let elapsed = self.last_redraw_at.elapsed();
-        let until_due = period.saturating_sub(elapsed);
-        let due = until_due.is_zero();
+        let now = Instant::now();
+        let framegen = self.framegen_wants_2x();
+        let pending = self
+            .source
+            .as_ref()
+            .map(|s| !s.receiver().is_empty())
+            .unwrap_or(false);
+        let since_present = self
+            .last_present_at
+            .map(|t| now.duration_since(t))
+            .unwrap_or(Duration::from_secs(1));
+
+        // Without framegen: present on capture (stable latency) within the rate cap.
+        // With framegen: free-run at 2× so Mid then Curr both get a swapchain present.
+        let min_capture_gap = Duration::from_secs_f64(period.as_secs_f64() * 0.92);
+        let capture_due = !framegen && pending && since_present >= min_capture_gap;
+        let due = now >= self.next_present_at || capture_due;
+        let until_due = self.next_present_at.saturating_duration_since(now);
 
         // Apply finished presence polls; only start a new one when not near a present.
-        self.poll_hotplug_async(until_due > HOTPLUG_PRESENT_SLACK);
+        self.poll_hotplug_async(until_due > HOTPLUG_PRESENT_SLACK && !due);
         self.flush_prefs_if_due();
         self.push_discord_activity(false);
 
@@ -563,11 +580,9 @@ impl ApplicationHandler for App {
             event_loop.set_control_flow(ControlFlow::Wait);
             return;
         }
-        // Wake when the next present is legal under the FPS cap.
-        let wait = until_due
-            .max(Duration::from_micros(200))
-            .min(Duration::from_millis(33));
-        event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + wait));
+        // Wake on the absolute deadline (stable period), not Instant::now()+slack.
+        let wake_at = self.next_present_at;
+        event_loop.set_control_flow(ControlFlow::WaitUntil(wake_at));
     }
 }
 
@@ -577,6 +592,21 @@ impl App {
             let _ = source.stop();
         }
         self.running = false;
+    }
+
+    /// True when optical-flow x2 should drive a 2× present cadence (LS-style).
+    fn framegen_wants_2x(&self) -> bool {
+        let mode = InterpMode::from_str_lossy(&self.effects_ui.interp_mode);
+        if !mode.wants_effect() {
+            return false;
+        }
+        match self.gpu.as_ref() {
+            Some(g) => {
+                g.interpolate.compute_ok
+                    && g.interpolate.status().block != InterpBlockReason::AutoDisabled
+            }
+            None => true,
+        }
     }
 
     /// Target on-screen present rate from prefs + capture / frame-gen.
@@ -589,14 +619,19 @@ impl App {
             .unwrap_or(60.0)
             .clamp(24.0, 240.0);
         let limit = self.ui_prefs.display_fps_limit;
-        let auto = if self.effects_ui.interp_mode != "off" {
-            (capture_hz * 2.0).min(240.0)
+        // Framegen inserts one Mid per capture — needs ~2× swapchain presents
+        // (Lossless Scaling does the same). A 60 Hz VSync/monitor still caps it.
+        let framegen_hz = (capture_hz * 2.0).min(240.0);
+        let auto = if self.framegen_wants_2x() {
+            framegen_hz
         } else {
             capture_hz
         };
         let hz = match limit {
             0 => auto,
             9999 => 360.0,
+            // Explicit 60 while framegen is on would silently drop Curr — bump.
+            n if self.framegen_wants_2x() && (n as f64) + 0.5 < framegen_hz => framegen_hz,
             n => n as f64,
         };
         hz.clamp(24.0, 360.0)
@@ -604,7 +639,9 @@ impl App {
 
     /// Apply swapchain present mode from the VSync pref (auto/on/off).
     /// Auto: Auto/Game → NoVsync (avoids Fifo phase-beat with software pacing);
-    /// Quality/Economy → VSync. Explicit on/off overrides the profile.
+    /// Quality/Economy → VSync. Framegen x2 forces NoVsync under Auto (needs >monitor
+    /// refresh when the panel is 60 Hz — same idea as Lossless Scaling).
+    /// Explicit on/off overrides the profile.
     fn apply_present_mode_for_profile(&mut self) {
         let Some(gpu) = self.gpu.as_mut() else {
             return;
@@ -614,10 +651,12 @@ impl App {
             self.selection.mode,
             CaptureMode::Game | CaptureMode::Auto
         );
+        let framegen = InterpMode::from_str_lossy(&self.effects_ui.interp_mode).wants_effect();
         let use_vsync = match mode.as_str() {
             "on" => true,
             "off" => false,
-            _ => !profile_low_latency,
+            // Auto: NoVsync for Game/Auto profiles, or whenever framegen needs 2× presents.
+            _ => !(profile_low_latency || framegen),
         };
         let want = if use_vsync {
             wgpu::PresentMode::AutoVsync
@@ -1261,6 +1300,12 @@ impl App {
                 gpu.interpolate
                     .set_mode(InterpMode::from_str_lossy(mode));
             }
+            // Framegen needs 2× presents + NoVsync (Auto) — resync phase immediately.
+            self.next_present_at = Instant::now();
+            self.apply_present_mode_for_profile();
+            if InterpMode::from_str_lossy(mode).wants_effect() {
+                self.show_toast(self.i18n.t("msg_interp_needs_120"));
+            }
             self.persist_ui_prefs();
         }
         if let Some(limit) = actions.display_fps_limit {
@@ -1533,11 +1578,34 @@ impl App {
 
     fn redraw(&mut self) {
         let period = Duration::from_secs_f64(1.0 / self.target_display_hz());
+        let now = Instant::now();
+        let framegen = self.framegen_wants_2x();
+        let pending = self
+            .source
+            .as_ref()
+            .map(|s| !s.receiver().is_empty())
+            .unwrap_or(false);
+        let since_present = self
+            .last_present_at
+            .map(|t| now.duration_since(t))
+            .unwrap_or(Duration::from_secs(1));
+        let min_capture_gap = Duration::from_secs_f64(period.as_secs_f64() * 0.92);
+        let capture_due = !framegen && pending && since_present >= min_capture_gap;
         // Hard drop surplus RedrawRequested (egui may queue many under NoVsync).
-        if self.last_redraw_at.elapsed() + Duration::from_micros(500) < period {
+        if !capture_due && now + Duration::from_micros(500) < self.next_present_at {
             return;
         }
-        self.last_redraw_at = Instant::now();
+        // Advance absolute phase by exactly one period (catch-up capped to avoid storms).
+        if capture_due && now < self.next_present_at {
+            self.next_present_at = now + period;
+        } else {
+            self.next_present_at += period;
+            if self.next_present_at + period < now {
+                // Fell behind by >1 frame — resync rather than bursting.
+                self.next_present_at = now + period;
+            }
+        }
+        self.last_redraw_at = now;
         // Drain frames before borrowing GPU exclusively for UI state updates.
         let mut latest: Option<VideoFrame> = None;
         let mut drained = 0u64;
@@ -1731,10 +1799,11 @@ impl App {
         };
 
         let new_capture = latest.is_some();
-        // Pipeline delay only updates on a fresh capture; frame-time / 1% low are
-        // recorded after swapchain present so they match FPS écran (not coalesce gaps).
+        // Pipeline delay = capture Instant → this present, only on a fresh upload.
+        // Present-only / Mid→Curr ticks keep the last reading (no sawtooth from aging).
         let mut latency_ns = self.metrics.last_latency_ns.load(Ordering::Relaxed);
         if let Some(frame) = latest {
+            // Measure after pacing wait, right before GPU work — reflects true display lag.
             latency_ns = frame.captured_at.elapsed().as_nanos() as u64;
             if upload_frame(&gpu.device, &gpu.queue, &mut gpu.pipeline, &frame) {
                 let rate = self

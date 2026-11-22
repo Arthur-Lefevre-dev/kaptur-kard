@@ -103,8 +103,8 @@ pub struct InterpolateEngine {
     pub last_gpu_ms: f32,
     over_budget_streak: u32,
     auto_disabled: bool,
-    /// After a new capture pair, present mid once before curr.
-    pending_mid: bool,
+    /// After presenting Mid, the next present must show Curr (x2 cadence).
+    owed_curr: bool,
     has_prev: bool,
 
     sampler: wgpu::Sampler,
@@ -348,7 +348,7 @@ impl InterpolateEngine {
             last_gpu_ms: 0.0,
             over_budget_streak: 0,
             auto_disabled: false,
-            pending_mid: false,
+            owed_curr: false,
             has_prev: false,
             sampler,
             flow_pipeline,
@@ -377,7 +377,7 @@ impl InterpolateEngine {
             block: self.block,
             delay_ms: self.delay_ms,
             last_gpu_ms: self.last_gpu_ms,
-            showing_mid: self.pending_mid,
+            showing_mid: false,
         }
     }
 
@@ -391,7 +391,7 @@ impl InterpolateEngine {
         self.mode = mode;
         self.over_budget_streak = 0;
         if !mode.wants_effect() {
-            self.pending_mid = false;
+            self.owed_curr = false;
             self.delay_ms = 0.0;
         }
     }
@@ -419,7 +419,7 @@ impl InterpolateEngine {
                 self.auto_disabled = true;
                 self.mode = InterpMode::Off;
                 self.block = InterpBlockReason::AutoDisabled;
-                self.pending_mid = false;
+                self.owed_curr = false;
                 self.delay_ms = 0.0;
                 tracing::warn!(frame_ms, "interpolation auto-disabled after budget overruns");
                 return true;
@@ -432,6 +432,9 @@ impl InterpolateEngine {
 
     /// Convert current video frame; on new capture synthesize mid and queue it.
     /// Returns which buffer should feed upscale/present this tick.
+    ///
+    /// Cadence (needs ~2× display presents, like Lossless Scaling):
+    /// capture → present **Mid**, next present → **Curr**, repeat.
     pub fn prepare(
         &mut self,
         device: &wgpu::Device,
@@ -450,10 +453,17 @@ impl InterpolateEngine {
             };
             return None;
         }
-        // Present-only tick (no new capture): reuse last curr/mid — do not re-convert
-        // or re-run flow (was ~2× CPU work at 120 Hz display; Arthur saw ~95% CPU).
+        // Present-only tick: emit owed Curr after Mid, else hold — no re-flow.
         if !new_capture {
             self.block = InterpBlockReason::None;
+            if self.owed_curr {
+                self.owed_curr = false;
+                return if self.curr.is_some() {
+                    Some(InterpFrame::Curr)
+                } else {
+                    None
+                };
+            }
             return if self.curr.is_some() {
                 Some(InterpFrame::Curr)
             } else {
@@ -498,9 +508,8 @@ impl InterpolateEngine {
             pass.draw(0..3, 0..1);
         }
 
-        if new_capture && self.has_prev {
+        if self.has_prev {
             self.dispatch_flow_warp(device, queue, encoder, cw, ch);
-            self.pending_mid = true;
             // Copy curr → prev for next pair (after warp used the old prev).
             if let (Some(curr), Some(prev)) = (self.curr.as_ref(), self.prev.as_ref()) {
                 encoder.copy_texture_to_texture(
@@ -523,7 +532,10 @@ impl InterpolateEngine {
                     },
                 );
             }
-        } else if new_capture && !self.has_prev {
+            self.owed_curr = true;
+            self.block = InterpBlockReason::None;
+            Some(InterpFrame::Mid)
+        } else {
             if let (Some(curr), Some(prev)) = (self.curr.as_ref(), self.prev.as_ref()) {
                 encoder.copy_texture_to_texture(
                     wgpu::TexelCopyTextureInfo {
@@ -547,14 +559,6 @@ impl InterpolateEngine {
             }
             self.has_prev = true;
             self.block = InterpBlockReason::NeedPrevFrame;
-        }
-
-        if self.pending_mid {
-            self.pending_mid = false;
-            self.block = InterpBlockReason::None;
-            Some(InterpFrame::Mid)
-        } else {
-            self.block = InterpBlockReason::None;
             Some(InterpFrame::Curr)
         }
     }
@@ -580,9 +584,17 @@ impl InterpolateEngine {
         if !self.active() || width == 0 || height == 0 {
             return None;
         }
-        // Present-only tick: reuse buffers (see prepare).
+        // Present-only: emit owed Curr after Mid (see prepare).
         if !new_capture {
             self.block = InterpBlockReason::None;
+            if self.owed_curr {
+                self.owed_curr = false;
+                return if self.curr.is_some() {
+                    Some(InterpFrame::Curr)
+                } else {
+                    None
+                };
+            }
             return if self.curr.is_some() {
                 Some(InterpFrame::Curr)
             } else {
@@ -617,9 +629,8 @@ impl InterpolateEngine {
             );
         }
 
-        if new_capture && self.has_prev {
+        if self.has_prev {
             self.dispatch_flow_warp(device, queue, encoder, width, height);
-            self.pending_mid = true;
             if let (Some(curr), Some(prev)) = (self.curr.as_ref(), self.prev.as_ref()) {
                 encoder.copy_texture_to_texture(
                     wgpu::TexelCopyTextureInfo {
@@ -641,7 +652,10 @@ impl InterpolateEngine {
                     },
                 );
             }
-        } else if new_capture && !self.has_prev {
+            self.owed_curr = true;
+            self.block = InterpBlockReason::None;
+            Some(InterpFrame::Mid)
+        } else {
             if let (Some(curr), Some(prev)) = (self.curr.as_ref(), self.prev.as_ref()) {
                 encoder.copy_texture_to_texture(
                     wgpu::TexelCopyTextureInfo {
@@ -665,14 +679,6 @@ impl InterpolateEngine {
             }
             self.has_prev = true;
             self.block = InterpBlockReason::NeedPrevFrame;
-        }
-
-        if self.pending_mid {
-            self.pending_mid = false;
-            self.block = InterpBlockReason::None;
-            Some(InterpFrame::Mid)
-        } else {
-            self.block = InterpBlockReason::None;
             Some(InterpFrame::Curr)
         }
     }
