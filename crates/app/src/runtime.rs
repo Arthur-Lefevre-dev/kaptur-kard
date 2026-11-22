@@ -194,6 +194,9 @@ pub struct App {
     discord: DiscordPresence,
     last_discord_push: Instant,
     logo_tex: Option<egui::TextureHandle>,
+    /// Brief shortcuts overlay after the wizard (or immediately if wizard already done).
+    launch_tips_started: Option<Instant>,
+    launch_tips_dismissed: bool,
 }
 
 impl Default for App {
@@ -424,7 +427,26 @@ impl Default for App {
                 .checked_sub(Duration::from_secs(60))
                 .unwrap_or_else(Instant::now),
             logo_tex: None,
+            launch_tips_started: None,
+            launch_tips_dismissed: false,
         }
+    }
+}
+
+/// Soft fade-in / hold / fade-out for the launch shortcuts card.
+fn launch_tips_alpha(elapsed: Duration) -> f32 {
+    const FADE_IN: f32 = 0.35;
+    const HOLD: f32 = 4.5;
+    const FADE_OUT: f32 = 0.85;
+    let t = elapsed.as_secs_f32();
+    if t < FADE_IN {
+        (t / FADE_IN).clamp(0.0, 1.0)
+    } else if t < FADE_IN + HOLD {
+        1.0
+    } else if t < FADE_IN + HOLD + FADE_OUT {
+        1.0 - ((t - FADE_IN - HOLD) / FADE_OUT).clamp(0.0, 1.0)
+    } else {
+        0.0
     }
 }
 
@@ -1220,6 +1242,14 @@ impl App {
             self.ui_prefs.wizard_done = true;
             self.ui_prefs.source_confirmed = true;
             self.persist_ui_prefs();
+            // Start tips right after the welcome / source picker closes.
+            if self.launch_tips_started.is_none() && !self.launch_tips_dismissed {
+                self.launch_tips_started = Some(Instant::now());
+            }
+        }
+        if actions.dismiss_launch_tips {
+            self.launch_tips_dismissed = true;
+            self.chrome.launch_tips_alpha = 0.0;
         }
         if actions.cycle_metrics {
             // F2: metrics overlay only — never open Image/Son/Effets toolbar.
@@ -1706,6 +1736,22 @@ impl App {
             && self.last_pointer_at.elapsed() > Duration::from_secs(3)
         {
             self.chrome.toolbar_visible = false;
+        }
+
+        // Launch shortcuts tip: wait until the wizard is gone, then fade in once.
+        if !self.launch_tips_dismissed && !self.chrome.wizard_open {
+            if self.launch_tips_started.is_none() {
+                self.launch_tips_started = Some(Instant::now());
+            }
+            if let Some(start) = self.launch_tips_started {
+                let alpha = launch_tips_alpha(start.elapsed());
+                self.chrome.launch_tips_alpha = alpha;
+                if alpha <= 0.0 && start.elapsed() > Duration::from_secs(1) {
+                    self.launch_tips_dismissed = true;
+                }
+            }
+        } else if self.chrome.wizard_open {
+            self.chrome.launch_tips_alpha = 0.0;
         }
 
         let devices = self.devices.clone();

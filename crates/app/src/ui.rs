@@ -180,6 +180,8 @@ pub struct UiChrome {
     /// Pinned windows stay put and are not auto-hidden with the toolbar.
     pub metrics_pinned: bool,
     pub settings_pinned: bool,
+    /// 0 = hidden, 1 = fully visible. Soft launch tips overlay opacity.
+    pub launch_tips_alpha: f32,
 }
 
 impl Default for UiChrome {
@@ -195,6 +197,7 @@ impl Default for UiChrome {
             fullscreen: false,
             metrics_pinned: false,
             settings_pinned: false,
+            launch_tips_alpha: 0.0,
         }
     }
 }
@@ -246,6 +249,8 @@ pub struct UiActions {
     pub color_range_changed: Option<&'static str>,
     pub color_matrix_changed: Option<&'static str>,
     pub color_range_toggle: bool,
+    /// User dismissed the brief launch shortcuts overlay.
+    pub dismiss_launch_tips: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -356,8 +361,10 @@ pub fn draw_ui(ctx: &Context, input: DrawInput<'_>) -> UiActions {
             actions.mute_toggled = Some(!input.audio.muted);
         }
         if i.key_pressed(Key::Escape) {
-            // Settings first, then leave fullscreen (Esc must exit plein écran).
-            if input.chrome.settings_open {
+            // Launch tips → settings → leave fullscreen.
+            if input.chrome.launch_tips_alpha > 0.01 {
+                actions.dismiss_launch_tips = true;
+            } else if input.chrome.settings_open {
                 actions.close_settings = true;
             } else if input.chrome.fullscreen {
                 actions.toggle_fullscreen = true;
@@ -386,6 +393,16 @@ pub fn draw_ui(ctx: &Context, input: DrawInput<'_>) -> UiActions {
 
     if input.chrome.toolbar_visible {
         draw_toolbar(ctx, i18n, input.chrome, &mut actions);
+    }
+
+    if input.chrome.launch_tips_alpha > 0.01 {
+        draw_launch_tips(
+            ctx,
+            i18n,
+            input.chrome.launch_tips_alpha,
+            input.logo.as_ref(),
+            &mut actions,
+        );
     }
 
     // Status toasts / signal hints (non-blocking).
@@ -1369,6 +1386,69 @@ fn draw_brand_header(
         });
     });
     ui.add_space(6.0);
+}
+
+/// Soft, centered shortcuts card shown once after launch (auto-fades; Esc/click dismiss).
+fn draw_launch_tips(
+    ctx: &Context,
+    i18n: &I18n,
+    alpha: f32,
+    logo: Option<&egui::TextureHandle>,
+    actions: &mut UiActions,
+) {
+    let a = alpha.clamp(0.0, 1.0);
+    // Smooth fade without a busy loop (display FPS still caps presents).
+    ctx.request_repaint_after(std::time::Duration::from_millis(16));
+    // Any click dismisses (button / card / empty space).
+    if ctx.input(|i| i.pointer.any_click()) {
+        actions.dismiss_launch_tips = true;
+    }
+
+    let fill = Color32::from_rgba_unmultiplied(12, 14, 18, (200.0 * a) as u8);
+    let text = Color32::from_rgba_unmultiplied(235, 238, 245, (255.0 * a) as u8);
+    let muted = Color32::from_rgba_unmultiplied(180, 186, 198, (220.0 * a) as u8);
+
+    egui::Area::new(egui::Id::new("launch_tips"))
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .order(egui::Order::Foreground)
+        .show(ctx, |ui| {
+            let frame = egui::Frame::NONE
+                .fill(fill)
+                .corner_radius(egui::CornerRadius::same(10))
+                .inner_margin(egui::Margin::symmetric(18, 14))
+                .stroke(egui::Stroke::new(
+                    1.0_f32,
+                    Color32::from_rgba_unmultiplied(80, 90, 110, (140.0 * a) as u8),
+                ));
+            frame.show(ui, |ui| {
+                ui.set_min_width(320.0);
+                ui.horizontal(|ui| {
+                    if let Some(tex) = logo {
+                        ui.add(
+                            egui::Image::new(tex)
+                                .fit_to_exact_size(egui::vec2(28.0, 28.0))
+                                .tint(Color32::from_rgba_unmultiplied(255, 255, 255, (255.0 * a) as u8)),
+                        );
+                    }
+                    ui.label(RichText::new(i18n.t("launch_tips_title")).strong().color(text).size(16.0));
+                });
+                ui.add_space(8.0);
+                for key in [
+                    "launch_tips_f1",
+                    "launch_tips_f2",
+                    "launch_tips_f11",
+                    "launch_tips_esc",
+                    "launch_tips_pin",
+                    "launch_tips_mouse",
+                ] {
+                    ui.label(RichText::new(i18n.t(key)).color(text));
+                }
+                ui.add_space(10.0);
+                ui.label(RichText::new(i18n.t("launch_tips_hint")).small().color(muted));
+                ui.add_space(6.0);
+                let _ = ui.add_enabled(a > 0.4, egui::Button::new(i18n.t("launch_tips_dismiss")));
+            });
+        });
 }
 
 fn draw_wizard(

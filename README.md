@@ -38,7 +38,7 @@ cargo test --workspace
 
 ## Logs
 
-CaptureView writes **tracing** logs to stderr and to a daily rotating file:
+CaptureView writes **tracing** logs to a daily rotating file (and to stderr when a console is attached):
 
 `%APPDATA%\CaptureView\logs\captureview.YYYY-MM-DD.log`
 
@@ -46,6 +46,7 @@ CaptureView writes **tracing** logs to stderr and to a daily rotating file:
 - Override with `RUST_LOG` (e.g. `RUST_LOG=debug`).
 - **Copy report for support** includes the log path and a tail of the file.
 - Older files are pruned (keeps ~14 days).
+- **Windows release** builds use `windows_subsystem = "windows"` (no console window). File logging still works. For a release build *with* a console: `cargo build --release -p captureview --features console`. Debug `cargo run` always shows a console.
 
 ### Linux
 

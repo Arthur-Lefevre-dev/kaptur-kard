@@ -24,6 +24,17 @@ tip_pin_window = "Pin to lock position. Otherwise drag the title bar to move."
 hint_f2_metrics = "F2: metrics · F1: settings"
 btn_source_auto = "Automatic (recommended)"
 
+# Brief launch overlay — keyboard shortcuts
+launch_tips_title = "Shortcuts"
+launch_tips_f1 = "F1 — Settings menu"
+launch_tips_f2 = "F2 — metrics (simple / detailed / off)"
+launch_tips_f11 = "F11 — full screen"
+launch_tips_esc = "Esc — close menu / leave full screen"
+launch_tips_pin = "Pin — lock window positions"
+launch_tips_mouse = "Mouse — show Picture / Sound / Effects / Info bar"
+launch_tips_dismiss = "Got it"
+launch_tips_hint = "Click or press Esc to dismiss"
+
 label_device = "Video source"
 label_resolution = "Picture quality"
 label_hz = "Smoothness"

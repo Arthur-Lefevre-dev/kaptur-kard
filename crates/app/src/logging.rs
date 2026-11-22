@@ -1,6 +1,8 @@
-//! Durable tracing to `%APPDATA%\CaptureView\logs\` (+ stderr).
+//! Durable tracing to `%APPDATA%\CaptureView\logs\` (+ stderr when a console exists).
 //!
 //! Daily rotation via `tracing-appender`. Level: `RUST_LOG` if set, else Infos prefs (default info).
+//! Windows release builds hide the console (`windows_subsystem`); file logs remain the support path.
+//! Use `--features console` or a debug build to also see stderr live.
 
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};

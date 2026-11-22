@@ -93,11 +93,15 @@ mod tests {
         assert_eq!(i18n.t("vsync_off"), "Désactivé");
         assert_eq!(i18n.t("btn_pin"), "Épingler");
         assert!(i18n.t("hint_f2_metrics").contains("F2"));
+        assert_eq!(i18n.t("launch_tips_title"), "Raccourcis");
+        assert!(i18n.t("launch_tips_f1").contains("F1"));
     }
 
     #[test]
     fn english_fallback_works() {
         let i18n = I18n::with_lang(Lang::En);
         assert_eq!(i18n.t("toolbar_fullscreen"), "Full screen");
+        assert_eq!(i18n.t("launch_tips_title"), "Shortcuts");
+        assert!(i18n.t("launch_tips_f2").contains("F2"));
     }
 }

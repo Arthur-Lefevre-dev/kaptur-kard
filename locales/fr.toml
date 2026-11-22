@@ -24,6 +24,17 @@ tip_pin_window = "Épingler pour fixer la fenêtre. Sinon, glissez la barre de t
 hint_f2_metrics = "F2 : mesures · F1 : réglages"
 btn_source_auto = "Automatique (recommandé)"
 
+# Brief launch overlay — keyboard shortcuts
+launch_tips_title = "Raccourcis"
+launch_tips_f1 = "F1 — menu Réglages"
+launch_tips_f2 = "F2 — mesures (simple / détail / off)"
+launch_tips_f11 = "F11 — plein écran"
+launch_tips_esc = "Échap — fermer le menu / quitter le plein écran"
+launch_tips_pin = "Épingler — fige la position des fenêtres"
+launch_tips_mouse = "Souris — affiche la barre Image / Son / Effets / Infos"
+launch_tips_dismiss = "Compris"
+launch_tips_hint = "Cliquez ou appuyez sur Échap pour fermer"
+
 label_device = "Source vidéo"
 label_resolution = "Qualité d'image"
 label_hz = "Fluidité"
