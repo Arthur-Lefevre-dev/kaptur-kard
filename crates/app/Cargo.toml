@@ -1,0 +1,30 @@
+[package]
+name = "captureview"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CaptureView desktop application"
+rust-version.workspace = true
+
+[[bin]]
+name = "captureview"
+path = "src/main.rs"
+
+[dependencies]
+capture = { workspace = true, features = ["mock"] }
+audio = { workspace = true }
+render = { workspace = true }
+metrics = { workspace = true }
+
+winit = { workspace = true }
+wgpu = { workspace = true }
+egui = { workspace = true }
+egui-wgpu = { workspace = true }
+egui-winit = { workspace = true }
+
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+crossbeam-channel = { workspace = true }
+parking_lot = { workspace = true }
+pollster = { workspace = true }

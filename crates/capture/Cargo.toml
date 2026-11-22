@@ -1,0 +1,26 @@
+[package]
+name = "capture"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "UVC / capture-card video source abstraction"
+rust-version.workspace = true
+
+[features]
+default = ["mock"]
+mock = []
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+parking_lot = { workspace = true }
+crossbeam-channel = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+# Media Foundation backend lands in a later step; keep the dep ready.
+windows = { version = "0.58", features = [
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Com",
+    "Win32_Foundation",
+] }

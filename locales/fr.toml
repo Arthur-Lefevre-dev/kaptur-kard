@@ -1,0 +1,3 @@
+# French UI strings (i18n wiring lands later)
+app_title = "CaptureView"
+mock_label = "Mock"

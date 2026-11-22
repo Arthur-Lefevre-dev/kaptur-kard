@@ -1,0 +1,21 @@
+[package]
+name = "render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "wgpu video present pipeline for CaptureView"
+rust-version.workspace = true
+
+[features]
+default = []
+interpolate = []
+upscale = []
+
+[dependencies]
+wgpu = { workspace = true }
+bytemuck = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+parking_lot = { workspace = true }
+capture = { workspace = true }
+metrics = { workspace = true }

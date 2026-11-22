@@ -1,0 +1,14 @@
+/target/
+**/target/
+.idea/
+.vscode/
+*.pdb
+*.exe
+*.dll
+*.ilk
+*.obj
+.DS_Store
+Thumbs.db
+*.log
+.env
+.env.*

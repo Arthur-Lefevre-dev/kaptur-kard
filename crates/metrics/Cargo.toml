@@ -1,0 +1,10 @@
+[package]
+name = "metrics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Atomic counters for CaptureView (fps, drops, latency)"
+rust-version.workspace = true
+
+[dependencies]
+tracing = { workspace = true }

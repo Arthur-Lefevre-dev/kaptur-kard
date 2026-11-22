@@ -1,0 +1,57 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/capture",
+    "crates/audio",
+    "crates/render",
+    "crates/metrics",
+    "crates/app",
+]
+default-members = ["crates/app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.78"
+
+[workspace.dependencies]
+# Internal
+capture = { path = "crates/capture" }
+audio = { path = "crates/audio" }
+render = { path = "crates/render" }
+metrics = { path = "crates/metrics" }
+
+# Window / GPU / UI
+winit = { version = "0.30", default-features = true }
+wgpu = { version = "24.0", default-features = true }
+egui = { version = "0.31" }
+egui-wgpu = { version = "0.31" }
+egui-winit = { version = "0.31" }
+
+# Audio (wired later; stubs compile against these)
+cpal = { version = "0.15" }
+rubato = { version = "0.16" }
+ringbuf = { version = "0.4" }
+
+# Config / i18n / log
+serde = { version = "1", features = ["derive"] }
+toml = { version = "0.8" }
+sys-locale = { version = "0.3" }
+tracing = { version = "0.1" }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Concurrency / misc
+thiserror = { version = "2" }
+anyhow = { version = "1" }
+crossbeam-channel = { version = "0.5" }
+parking_lot = { version = "0.12" }
+bytemuck = { version = "1", features = ["derive"] }
+pollster = { version = "0.4" }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+opt-level = 3
+panic = "abort"
+strip = true
