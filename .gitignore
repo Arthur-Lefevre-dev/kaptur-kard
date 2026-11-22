@@ -13,3 +13,8 @@ Thumbs.db
 *.log
 .env
 .env.*
+
+# MSVC leftovers
+*.exp
+*.lib
+!**/Cargo.lock
