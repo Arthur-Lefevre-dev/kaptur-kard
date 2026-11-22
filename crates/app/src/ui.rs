@@ -1,5 +1,6 @@
-//! egui selectors + status overlay (device / resolution / Hz / mode).
+//! egui selectors + sound panel.
 
+use audio::AudioDeviceInfo;
 use capture::{
     display_hz, hz_label, resolution_label, CaptureMode, DeviceInfo, FormatDesc, Rational,
 };
@@ -13,6 +14,8 @@ pub struct OverlayState {
     pub status: String,
     pub no_signal: bool,
     pub soft_black: bool,
+    pub audio_notice: String,
+    pub level: f32,
 }
 
 impl Default for OverlayState {
@@ -25,6 +28,8 @@ impl Default for OverlayState {
             status: String::new(),
             no_signal: false,
             soft_black: false,
+            audio_notice: String::new(),
+            level: 0.0,
         }
     }
 }
@@ -38,12 +43,30 @@ pub struct UiSelection {
     pub mode: CaptureMode,
 }
 
+#[derive(Clone, Debug)]
+pub struct AudioUiState {
+    pub input_id: String,
+    pub output_id: String,
+    pub volume: f32,
+    pub muted: bool,
+    pub delay_ms: f32,
+    pub buffer_ms: f32,
+    pub show_advanced: bool,
+}
+
 #[derive(Debug, Default)]
 pub struct UiActions {
     pub device_changed: Option<usize>,
     pub resolution_changed: Option<(u32, u32)>,
     pub rate_changed: Option<Rational>,
     pub mode_changed: Option<CaptureMode>,
+    pub audio_input_changed: Option<String>,
+    pub audio_output_changed: Option<String>,
+    pub volume_changed: Option<f32>,
+    pub mute_toggled: Option<bool>,
+    pub delay_changed: Option<f32>,
+    pub buffer_changed: Option<f32>,
+    pub toggle_advanced: bool,
 }
 
 pub fn draw_ui(
@@ -52,6 +75,9 @@ pub fn draw_ui(
     selection: &UiSelection,
     current: &FormatDesc,
     overlay: &OverlayState,
+    inputs: &[AudioDeviceInfo],
+    outputs: &[AudioDeviceInfo],
+    audio: &AudioUiState,
 ) -> UiActions {
     let mut actions = UiActions::default();
 
@@ -59,7 +85,6 @@ pub fn draw_ui(
         ui.horizontal_wrapped(|ui| {
             ui.heading("CaptureView");
 
-            // Device
             let mut device_idx = selection.device_idx.min(devices.len().saturating_sub(1));
             let device_label = devices
                 .get(device_idx)
@@ -85,7 +110,6 @@ pub fn draw_ui(
                 .unwrap_or(&[]);
             let resolutions = capture::modes::unique_resolutions(caps);
 
-            // Resolution
             let res_text = resolution_label(selection.width, selection.height);
             egui::ComboBox::from_id_salt("resolution")
                 .selected_text(res_text)
@@ -104,7 +128,6 @@ pub fn draw_ui(
                     }
                 });
 
-            // Hz
             let rates =
                 capture::modes::rates_for_resolution(caps, selection.width, selection.height);
             let hz_text = hz_label(selection.rate);
@@ -125,7 +148,6 @@ pub fn draw_ui(
                     }
                 });
 
-            // Mode
             let mode_text = match selection.mode {
                 CaptureMode::Auto => "Auto",
                 CaptureMode::Game => "Game",
@@ -141,10 +163,7 @@ pub fn draw_ui(
                         (CaptureMode::Quality, "Quality"),
                         (CaptureMode::Economy, "Economy"),
                     ] {
-                        if ui
-                            .selectable_label(selection.mode == m, label)
-                            .clicked()
-                        {
+                        if ui.selectable_label(selection.mode == m, label).clicked() {
                             actions.mode_changed = Some(m);
                         }
                     }
@@ -152,12 +171,8 @@ pub fn draw_ui(
 
             ui.separator();
             ui.label(format!(
-                "{:.0} FPS · {} · {}×{} {:?}",
-                overlay.fps,
-                overlay.label,
-                current.width,
-                current.height,
-                current.pixel_format
+                "{:.0} FPS · {} · {}×{}",
+                overlay.fps, overlay.label, current.width, current.height
             ));
         });
 
@@ -167,9 +182,105 @@ pub fn draw_ui(
         if overlay.no_signal {
             ui.colored_label(egui::Color32::LIGHT_RED, "Pas de signal");
         } else if overlay.soft_black {
+            ui.colored_label(egui::Color32::GRAY, "Signal noir / source faible");
+        }
+    });
+
+    egui::TopBottomPanel::bottom("captureview_sound").show(ctx, |ui| {
+        ui.horizontal(|ui| {
+            ui.label("Son");
+            let input_label = inputs
+                .iter()
+                .find(|d| d.id == audio.input_id)
+                .map(|d| d.display_name.as_str())
+                .unwrap_or("Source du son");
+            egui::ComboBox::from_id_salt("audio_in")
+                .selected_text(input_label)
+                .width(180.0)
+                .show_ui(ui, |ui| {
+                    for d in inputs {
+                        if ui
+                            .selectable_label(d.id == audio.input_id, &d.display_name)
+                            .clicked()
+                        {
+                            actions.audio_input_changed = Some(d.id.clone());
+                        }
+                    }
+                });
+
+            let output_label = outputs
+                .iter()
+                .find(|d| d.id == audio.output_id)
+                .map(|d| d.display_name.as_str())
+                .unwrap_or("Sortie");
+            egui::ComboBox::from_id_salt("audio_out")
+                .selected_text(output_label)
+                .width(180.0)
+                .show_ui(ui, |ui| {
+                    for d in outputs {
+                        if ui
+                            .selectable_label(d.id == audio.output_id, &d.display_name)
+                            .clicked()
+                        {
+                            actions.audio_output_changed = Some(d.id.clone());
+                        }
+                    }
+                });
+
+            let mut muted = audio.muted;
+            if ui.checkbox(&mut muted, "Muet").changed() {
+                actions.mute_toggled = Some(muted);
+            }
+            let mut vol = audio.volume;
+            if ui
+                .add(egui::Slider::new(&mut vol, 0.0..=1.25).text("Vol"))
+                .changed()
+            {
+                actions.volume_changed = Some(vol);
+            }
+            // Level meter
+            let level = overlay.level.clamp(0.0, 1.0);
+            ui.add(
+                egui::ProgressBar::new(level)
+                    .desired_width(80.0)
+                    .text("Niveau"),
+            );
+
+            if ui
+                .button(if audio.show_advanced {
+                    "Masquer avancé"
+                } else {
+                    "Avancé"
+                })
+                .clicked()
+            {
+                actions.toggle_advanced = true;
+            }
+        });
+
+        if audio.show_advanced {
+            ui.horizontal(|ui| {
+                let mut delay = audio.delay_ms;
+                if ui
+                    .add(egui::Slider::new(&mut delay, 0.0..=500.0).text("Délai audio (ms)"))
+                    .changed()
+                {
+                    actions.delay_changed = Some(delay);
+                }
+                let mut buf = audio.buffer_ms;
+                if ui
+                    .add(egui::Slider::new(&mut buf, 20.0..=40.0).text("Buffer (ms)"))
+                    .changed()
+                {
+                    actions.buffer_changed = Some(buf);
+                }
+            });
+        }
+
+        if !overlay.audio_notice.is_empty() {
             ui.colored_label(
-                egui::Color32::GRAY,
-                "Signal noir / source faible",
+                egui::Color32::from_rgb(255, 200, 120),
+                &overlay.audio_notice,
             );
         }
     });

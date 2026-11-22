@@ -1,5 +1,6 @@
 //! CaptureView step (a): wgpu window + MockVideoSource preview.
 
+mod prefs;
 mod runtime;
 mod ui;
 

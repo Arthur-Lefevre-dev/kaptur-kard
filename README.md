@@ -4,20 +4,20 @@ Desktop preview app for generic UVC / capture-card sources. Product name **Captu
 
 ## Status
 
-**Step (b)** — Windows Media Foundation capture behind `VideoSource`, plus Mock for card-free work.
+**Step (c)** — audio in/out on top of MF video + Mock.
 
-- Enumerates real video capture devices / modes (MF)
-- Prefers native NV12 / YUY2 / BGRA; MJPEG is decoded by MF to NV12 (or RGB32 fallback)
-- GPU shader converts YUY2/NV12 → RGB with letterboxing
-- UI: device, resolution, Hz, mode (Auto / Game / Quality / Economy)
-- No-signal (>1s) and soft-black (>3s) hints
-- Frame bus depth **2**, drop-oldest; CPU buffer pool on the capture path
+- Video: Media Foundation + Mock (step b)
+- Audio: `cpal` capture/playback, `rubato` resample, `ringbuf` bus
+- Input list starts with **Aucun son**; USB VID/PID / name heuristics associate capture-card audio when possible
+- Output defaults to system default; remembered in `%APPDATA%\CaptureView\audio.toml`; missing device → French fallback notice
+- Volume, mute, level meter; Advanced: delay 0–500 ms, buffer 20–40 ms
+- Soft clock-drift correction from ring fill
 
 ## Requirements (Windows)
 
 - Rust stable (1.78+, tested with 1.100)
 - GPU with DirectX 12 / Vulkan (wgpu)
-- Optional: UVC / capture card for live MF testing
+- Optional: UVC / capture card + its USB audio endpoint
 
 ## Build & run
 
@@ -34,30 +34,28 @@ cargo build --release -p captureview
 .\target\release\captureview.exe
 ```
 
+### Enable sound
+
+1. Bottom **Son** bar → choose **Source du son** (or keep **Aucun son** for silent / Mock)
+2. Choose output (default system device is marked)
+3. Uncheck **Muet**, set **Vol**; watch **Niveau**
+4. **Avancé**: audio delay (ms) to resync with video; buffer 20–40 ms
+
+Prefs persist under `%APPDATA%\CaptureView\audio.toml`.
+
 Tests:
 
 ```powershell
 cargo test --workspace
 ```
 
-The device list always includes **Mock Color Bars**. Real MF devices appear below (capture-card names ranked first). Default mode is **Auto**.
+## Out of scope (later)
 
-## Out of scope (v1 / later steps)
-
-- Audio
 - Recording, streaming, HDR
-- H.264/HEVC-only cards (beyond what MF can decode to NV12/RGB)
-- Proprietary SDKs (DeckLink, etc.)
-- DLSS / FSR / NIS / interpolation
-- Full Linux / macOS capture backends
-- DirectShow
-- Full consumer chrome polish
-
-## Gaps (step b)
-
-- Some exotic FourCCs are skipped at enum time
-- MJPEG relies on MF decoder insertion; if both NV12 and RGB32 output fail, start errors and UI falls back
-- RAM budget target &lt;100 Mo @1080p60 without effects is **not** met with the CPU mock path (full BGRA fill); live MF should be lower — see `internal/step-b-report.md` in the Project store
+- FSR / NIS / interpolation
+- Full i18n / consumer wizard (step d)
+- Linux / macOS audio/video backends
+- True Windows ContainerId SetupAPI walk (heuristic VID/PID + name for now)
 
 ## Licence
 

@@ -4,6 +4,10 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use audio::{
+    list_inputs, list_outputs, suggest_input_for_video, AudioDeviceInfo, AudioEngine,
+    AudioEngineConfig, NONE_INPUT_ID,
+};
 use capture::{
     modes, CaptureMode, DeviceInfo, FormatDesc, FrameReceiver, MockVideoSource, PixelFormat,
     Rational, VideoFrame, VideoSource,
@@ -19,7 +23,8 @@ use winit::event::WindowEvent;
 use winit::event_loop::ActiveEventLoop;
 use winit::window::{Window, WindowId};
 
-use crate::ui::{self, OverlayState, UiSelection};
+use crate::prefs::{load_audio_prefs, save_audio_prefs, AudioPrefs};
+use crate::ui::{self, AudioUiState, OverlayState, UiSelection};
 
 enum ActiveSource {
     Mock(MockVideoSource),
@@ -86,6 +91,10 @@ pub struct App {
     last_frame_at: Instant,
     black_since: Option<Instant>,
     running: bool,
+    audio: AudioEngine,
+    audio_inputs: Vec<AudioDeviceInfo>,
+    audio_outputs: Vec<AudioDeviceInfo>,
+    audio_ui: AudioUiState,
 }
 
 impl Default for App {
@@ -114,6 +123,43 @@ impl Default for App {
             .or_else(|| caps.first().cloned())
             .unwrap_or_else(|| mock_info.formats[0].clone());
 
+        let audio_inputs = list_inputs().unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "audio input enum failed");
+            vec![AudioDeviceInfo::none_input()]
+        });
+        let audio_outputs = list_outputs().unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "audio output enum failed");
+            Vec::new()
+        });
+        let prefs = load_audio_prefs();
+        let mut audio_ui = AudioUiState {
+            input_id: prefs.input_id.clone(),
+            output_id: prefs.output_id.clone(),
+            volume: prefs.volume,
+            muted: prefs.muted,
+            delay_ms: prefs.delay_ms,
+            buffer_ms: prefs.buffer_ms,
+            show_advanced: false,
+        };
+        // Validate remembered ids still exist.
+        if !audio_inputs.iter().any(|d| d.id == audio_ui.input_id) {
+            audio_ui.input_id = NONE_INPUT_ID.into();
+        }
+        if !audio_outputs.iter().any(|d| d.id == audio_ui.output_id) {
+            if let Some(d) = audio_outputs.first() {
+                audio_ui.output_id = d.id.clone();
+            }
+        }
+        // If still "none" and video looks like a capture card, suggest association.
+        if audio_ui.input_id == NONE_INPUT_ID {
+            let video = &devices[device_idx];
+            if let Some(idx) =
+                suggest_input_for_video(&video.display_name, video.id.as_str(), &audio_inputs)
+            {
+                audio_ui.input_id = audio_inputs[idx].id.clone();
+            }
+        }
+
         Self {
             gpu: None,
             devices,
@@ -137,6 +183,10 @@ impl Default for App {
             last_frame_at: Instant::now(),
             black_since: None,
             running: false,
+            audio: AudioEngine::new(),
+            audio_inputs,
+            audio_outputs,
+            audio_ui,
         }
     }
 }
@@ -171,6 +221,7 @@ impl ApplicationHandler for App {
             let _ = self.open_and_start(0, fmt);
         }
 
+        self.restart_audio();
         tracing::info!("CaptureView ready");
     }
 
@@ -191,6 +242,8 @@ impl ApplicationHandler for App {
 
         match event {
             WindowEvent::CloseRequested => {
+                self.persist_audio_prefs();
+                self.audio.stop();
                 self.stop_source();
                 event_loop.exit();
             }
@@ -283,6 +336,56 @@ impl App {
         }
     }
 
+    fn audio_config_from_ui(&self) -> AudioEngineConfig {
+        AudioEngineConfig {
+            input_id: self.audio_ui.input_id.clone(),
+            output_id: self.audio_ui.output_id.clone(),
+            volume: self.audio_ui.volume,
+            muted: self.audio_ui.muted,
+            delay_ms: self.audio_ui.delay_ms,
+            buffer_ms: self.audio_ui.buffer_ms,
+        }
+    }
+
+    fn restart_audio(&mut self) {
+        match self.audio.start(self.audio_config_from_ui()) {
+            Ok(()) => {
+                let notice = self.audio.status().notice.clone();
+                if !notice.is_empty() {
+                    self.overlay.audio_notice = notice;
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "audio start failed");
+                self.overlay.audio_notice = format!("Audio indisponible: {e}");
+                self.audio_ui.input_id = NONE_INPUT_ID.into();
+            }
+        }
+        self.persist_audio_prefs();
+    }
+
+    fn persist_audio_prefs(&self) {
+        save_audio_prefs(&AudioPrefs {
+            input_id: self.audio_ui.input_id.clone(),
+            output_id: self.audio_ui.output_id.clone(),
+            volume: self.audio_ui.volume,
+            muted: self.audio_ui.muted,
+            delay_ms: self.audio_ui.delay_ms,
+            buffer_ms: self.audio_ui.buffer_ms,
+        });
+    }
+
+    fn suggest_audio_for_current_video(&mut self) {
+        let video = &self.devices[self.selection.device_idx];
+        if let Some(idx) =
+            suggest_input_for_video(&video.display_name, video.id.as_str(), &self.audio_inputs)
+        {
+            self.audio_ui.input_id = self.audio_inputs[idx].id.clone();
+        } else if video.backend == "mock" {
+            self.audio_ui.input_id = NONE_INPUT_ID.into();
+        }
+    }
+
     fn apply_ui_actions(&mut self, actions: ui::UiActions) {
         if let Some(idx) = actions.device_changed {
             self.selection.device_idx = idx;
@@ -301,6 +404,8 @@ impl App {
                 format,
                 "Impossible de démarrer ce périphérique, retour au précédent.",
             );
+            self.suggest_audio_for_current_video();
+            self.restart_audio();
         }
 
         if let Some((w, h)) = actions.resolution_changed {
@@ -344,6 +449,42 @@ impl App {
                     self.selection.mode = previous_mode;
                 }
             }
+        }
+
+        let mut audio_restart = false;
+        if let Some(id) = actions.audio_input_changed {
+            self.audio_ui.input_id = id;
+            audio_restart = true;
+        }
+        if let Some(id) = actions.audio_output_changed {
+            self.audio_ui.output_id = id;
+            audio_restart = true;
+        }
+        if let Some(v) = actions.volume_changed {
+            self.audio_ui.volume = v;
+            self.audio.set_volume(v);
+            self.persist_audio_prefs();
+        }
+        if let Some(m) = actions.mute_toggled {
+            self.audio_ui.muted = m;
+            self.audio.set_muted(m);
+            self.persist_audio_prefs();
+        }
+        if let Some(d) = actions.delay_changed {
+            self.audio_ui.delay_ms = d;
+            self.audio.set_delay_ms(d);
+            self.persist_audio_prefs();
+        }
+        if let Some(b) = actions.buffer_changed {
+            self.audio_ui.buffer_ms = b;
+            self.audio.set_buffer_ms(b);
+            self.persist_audio_prefs();
+        }
+        if actions.toggle_advanced {
+            self.audio_ui.show_advanced = !self.audio_ui.show_advanced;
+        }
+        if audio_restart {
+            self.restart_audio();
         }
     }
 
@@ -392,11 +533,18 @@ impl App {
             .unwrap_or_else(|| "—".into());
         self.overlay.no_signal = no_signal;
         self.overlay.soft_black = soft_black;
+        self.overlay.level = self.audio.meter().take_peak();
+        if self.overlay.audio_notice.is_empty() {
+            self.overlay.audio_notice = self.audio.status().notice.clone();
+        }
 
         let devices = self.devices.clone();
         let selection = self.selection.clone();
         let current = self.current_format.clone();
         let overlay = self.overlay.clone();
+        let inputs = self.audio_inputs.clone();
+        let outputs = self.audio_outputs.clone();
+        let audio_ui = self.audio_ui.clone();
 
         let mut actions = ui::UiActions::default();
         {
@@ -433,7 +581,16 @@ impl App {
 
         let raw_input = gpu.egui_state.take_egui_input(&gpu.window);
         let full_output = gpu.egui_ctx.run(raw_input, |ctx| {
-            actions = ui::draw_ui(ctx, &devices, &selection, &current, &overlay);
+            actions = ui::draw_ui(
+                ctx,
+                &devices,
+                &selection,
+                &current,
+                &overlay,
+                &inputs,
+                &outputs,
+                &audio_ui,
+            );
         });
         gpu.egui_state
             .handle_platform_output(&gpu.window, full_output.platform_output);

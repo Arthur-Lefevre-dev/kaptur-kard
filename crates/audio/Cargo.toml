@@ -3,10 +3,18 @@ name = "audio"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Audio capture / playback stubs for CaptureView"
+description = "Audio capture / playback for CaptureView (cpal + rubato + ringbuf)"
 rust-version.workspace = true
 
 [dependencies]
+cpal = { workspace = true }
+rubato = { workspace = true }
+ringbuf = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
+parking_lot = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+# none
