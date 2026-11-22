@@ -2,6 +2,7 @@
 
 pub mod color;
 pub mod deinterlace;
+pub mod dlss;
 pub mod gpu;
 pub mod interpolate;
 pub mod pipeline;
@@ -14,6 +15,7 @@ pub use color::{
     ColorRangeMode,
 };
 pub use deinterlace::{DeinterlaceEngine, DeinterlaceMode};
+pub use dlss::{DlssAvailability, DlssEngine, DlssStatus, STREAMLINE_DOC_VERSION};
 pub use gpu::GpuContext;
 pub use pipeline::VideoPipeline;
 pub use interpolate::{

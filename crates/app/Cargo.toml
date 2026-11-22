@@ -14,6 +14,8 @@ path = "src/main.rs"
 default = []
 # Optional DirectShow scaffolding (capture crate). Does not change the default MF path.
 directshow = ["capture/directshow"]
+# Optional NVIDIA Streamline / DLSS probe — see docs/DLSS.md (SDK not vendored).
+dlss = ["render/dlss"]
 
 [dependencies]
 capture = { workspace = true, features = ["mock"] }

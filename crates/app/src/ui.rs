@@ -267,6 +267,12 @@ pub struct EffectsUiState {
     pub deinterlace_active: bool,
     /// auto | on | off
     pub vsync_mode: String,
+    /// Mode C — DLSS available for native evaluate (rare until DXGI hook).
+    pub dlss_ok: bool,
+    /// i18n key explaining why Mode C falls back / is limited.
+    pub dlss_reason_key: String,
+    /// Mode C selected but running NIS fallback.
+    pub dlss_fallback_nis: bool,
 }
 
 impl Default for EffectsUiState {
@@ -288,6 +294,9 @@ impl Default for EffectsUiState {
             source_interlaced: false,
             deinterlace_active: false,
             vsync_mode: "auto".into(),
+            dlss_ok: false,
+            dlss_reason_key: String::new(),
+            dlss_fallback_nis: false,
         }
     }
 }
@@ -945,7 +954,7 @@ fn draw_effects_tab(ui: &mut egui::Ui, input: &DrawInput<'_>, actions: &mut UiAc
     ui.label(i18n.t("why_fsr_body"));
     ui.add_space(8.0);
 
-    // Mode A/B stay selectable at native res — RCAS / NIS sharpen still apply.
+    // Mode A/B/C stay selectable at native res — RCAS / NIS sharpen still apply.
     let blocked = !fx.compute_ok;
     let reason = if !fx.compute_ok {
         i18n.t("effect_reason_no_compute")
@@ -962,6 +971,7 @@ fn draw_effects_tab(ui: &mut egui::Ui, input: &DrawInput<'_>, actions: &mut UiAc
                 ("off", "effect_off"),
                 ("fsr1", "effect_fsr"),
                 ("nis", "effect_nis"),
+                ("dlss", "effect_dlss"),
             ] {
                 let selected = fx.mode == id;
                 if ui.selectable_label(selected, i18n.t(key)).clicked() {
@@ -974,6 +984,17 @@ fn draw_effects_tab(ui: &mut egui::Ui, input: &DrawInput<'_>, actions: &mut UiAc
         ui.small(format!("{}: {}", i18n.t("label_unavailable"), reason));
     } else if fx.native_res && fx.mode != "off" {
         ui.small(i18n.t("tip_native_sharpen"));
+    }
+    if fx.mode == "dlss" {
+        ui.label(RichText::new(i18n.t("tip_dlss")).small().italics());
+        if fx.dlss_fallback_nis || !fx.dlss_ok {
+            let key = if fx.dlss_reason_key.is_empty() {
+                "effect_reason_dlss_fallback"
+            } else {
+                fx.dlss_reason_key.as_str()
+            };
+            ui.small(format!("{}: {}", i18n.t("label_dlss_status"), i18n.t(key)));
+        }
     }
     ui.label(RichText::new(i18n.t("tip_upscale")).small().italics());
     ui.add_space(8.0);

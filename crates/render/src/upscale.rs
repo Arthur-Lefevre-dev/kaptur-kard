@@ -1,13 +1,15 @@
-//! FSR 1 (EASU+RCAS) and NIS upscaling via WGSL compute.
+//! FSR 1 (EASU+RCAS), NIS, and DLSS (Streamline) upscaling.
 //!
 //! Runs after color conversion, before present. Textures are reused across frames.
 //! Shader ports: see `licenses/AMD-FSR1-MIT.txt` and `licenses/NVIDIA-NIS-MIT.txt`.
+//! DLSS / Streamline: see `docs/DLSS.md` (SDK not vendored; Mode C falls back to NIS).
 
 use std::time::Instant;
 
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
+use crate::dlss::{DlssAvailability, DlssEngine, DlssStatus};
 use crate::pipeline::VideoPipeline;
 use crate::present::{compute_letterbox, LetterboxUniforms};
 
@@ -21,6 +23,8 @@ pub enum UpscaleMode {
     Off,
     Fsr1,
     Nis,
+    /// Mode C — NVIDIA DLSS via Streamline/NGX when available; otherwise NIS fallback.
+    Dlss,
 }
 
 impl UpscaleMode {
@@ -29,6 +33,7 @@ impl UpscaleMode {
             Self::Off => "off",
             Self::Fsr1 => "fsr1",
             Self::Nis => "nis",
+            Self::Dlss => "dlss",
         }
     }
 
@@ -36,6 +41,7 @@ impl UpscaleMode {
         match s {
             "fsr1" | "Fsr1" | "FSR1" => Self::Fsr1,
             "nis" | "Nis" | "NIS" => Self::Nis,
+            "dlss" | "Dlss" | "DLSS" | "dlss5" | "DLSS5" => Self::Dlss,
             _ => Self::Off,
         }
     }
@@ -62,6 +68,9 @@ pub struct UpscaleStatus {
     pub backend: String,
     pub last_gpu_ms: f32,
     pub over_budget_streak: u32,
+    pub dlss: DlssStatus,
+    /// True when Mode C is active but evaluating via NIS (SDK/GPU/hook unavailable).
+    pub dlss_fallback_nis: bool,
 }
 
 #[repr(C)]
@@ -156,6 +165,7 @@ pub struct UpscaleEngine {
     cached_present_bg: Option<(u64, wgpu::BindGroup)>,
     /// Rate-limit "RCAS/NIS ran" tracing to ~1 Hz while Mode A/B is active.
     last_sharpen_log: Instant,
+    dlss: DlssEngine,
 }
 
 impl UpscaleEngine {
@@ -483,10 +493,14 @@ impl UpscaleEngine {
             cached_nis_bg: None,
             cached_present_bg: None,
             last_sharpen_log: Instant::now() - std::time::Duration::from_secs(2),
+            dlss: DlssEngine::new(adapter, backend),
         }
     }
 
     pub fn status(&self) -> UpscaleStatus {
+        let dlss = self.dlss.status();
+        let dlss_fallback_nis =
+            self.mode == UpscaleMode::Dlss && dlss.availability.uses_nis_fallback();
         UpscaleStatus {
             mode: self.mode,
             sharpness: self.sharpness,
@@ -496,7 +510,13 @@ impl UpscaleEngine {
             backend: self.backend.clone(),
             last_gpu_ms: self.last_gpu_ms,
             over_budget_streak: self.over_budget_streak,
+            dlss,
+            dlss_fallback_nis,
         }
+    }
+
+    pub fn dlss_availability(&self) -> DlssAvailability {
+        self.dlss.availability()
     }
 
     pub fn set_mode(&mut self, mode: UpscaleMode) {
@@ -598,6 +618,13 @@ impl UpscaleEngine {
             UpscaleMode::Nis => {
                 self.dispatch_nis(device, queue, encoder, &sample, true, cw, ch, out_w, out_h);
             }
+            UpscaleMode::Dlss => {
+                // Native Streamline evaluate when Ready; otherwise graceful NIS fallback.
+                if self.dlss.can_evaluate() {
+                    tracing::warn!("DLSS Ready path has no wgpu native hook yet; using NIS");
+                }
+                self.dispatch_nis(device, queue, encoder, &sample, true, cw, ch, out_w, out_h);
+            }
             UpscaleMode::Off => return false,
         }
 
@@ -642,6 +669,14 @@ impl UpscaleEngine {
                 );
             }
             UpscaleMode::Nis => {
+                self.dispatch_nis(
+                    device, queue, encoder, &sample, stable_src, src_w, src_h, out_w, out_h,
+                );
+            }
+            UpscaleMode::Dlss => {
+                if self.dlss.can_evaluate() {
+                    tracing::warn!("DLSS Ready path has no wgpu native hook yet; using NIS");
+                }
                 self.dispatch_nis(
                     device, queue, encoder, &sample, stable_src, src_w, src_h, out_w, out_h,
                 );
@@ -1378,7 +1413,10 @@ mod tests {
     fn mode_roundtrip() {
         assert_eq!(UpscaleMode::from_str_lossy("fsr1"), UpscaleMode::Fsr1);
         assert_eq!(UpscaleMode::from_str_lossy("nis"), UpscaleMode::Nis);
+        assert_eq!(UpscaleMode::from_str_lossy("dlss"), UpscaleMode::Dlss);
+        assert_eq!(UpscaleMode::from_str_lossy("dlss5"), UpscaleMode::Dlss);
         assert_eq!(UpscaleMode::from_str_lossy("nope"), UpscaleMode::Off);
+        assert_eq!(UpscaleMode::Dlss.as_str(), "dlss");
     }
 
     #[test]

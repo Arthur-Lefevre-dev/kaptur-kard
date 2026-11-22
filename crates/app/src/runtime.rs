@@ -1403,6 +1403,9 @@ impl App {
             self.effects_ui.last_gpu_ms = st.last_gpu_ms.max(gpu.interpolate.last_gpu_ms);
             self.effects_ui.vendor = st.vendor;
             self.effects_ui.backend = st.backend;
+            self.effects_ui.dlss_ok = st.dlss.availability.can_evaluate();
+            self.effects_ui.dlss_reason_key = st.dlss.availability.as_reason_key().into();
+            self.effects_ui.dlss_fallback_nis = st.dlss_fallback_nis;
             let ist = gpu.interpolate.status();
             self.effects_ui.interp_mode = ist.mode.as_str().into();
             self.effects_ui.interp_compute_ok = ist.compute_ok;

@@ -1,0 +1,12 @@
+NVIDIA Streamline / DLSS (NGX) binaries are NOT redistributed in this repository.
+
+To enable Mode C probing (`--features dlss`), download the Streamline SDK release
+zip from https://github.com/NVIDIA-RTX/Streamline/releases and accept the NVIDIA
+RTX SDKs license:
+
+  https://github.com/NVIDIA/DLSS/blob/main/LICENSE.txt
+
+Set STREAMLINE_SDK_PATH to the unpacked folder. See docs/DLSS.md.
+
+Streamline header sources on GitHub are MIT-licensed; signed NGX/DLSS DLLs remain
+under the NVIDIA RTX SDKs license and must be obtained by the integrator.
