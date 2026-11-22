@@ -976,9 +976,10 @@ fn draw_effects_tab(ui: &mut egui::Ui, input: &DrawInput<'_>, actions: &mut UiAc
     };
 
     ui.label(i18n.t("label_upscale_mode"));
-    // Mode C (DLSS 5) is always listed — even on AMD — but greyed when the
-    // RTX + BYO runtime path is not ready so Arthur still sees the option.
-    ui.horizontal(|ui| {
+    // Mode A/B on the first row; Mode C always on its own row so a long FR label
+    // never clips off the panel. When unavailable we paint a muted chip ourselves
+    // (egui add_enabled can be nearly invisible on dark themes).
+    ui.horizontal_wrapped(|ui| {
         for (id, key) in [
             ("off", "effect_off"),
             ("fsr1", "effect_fsr"),
@@ -991,14 +992,22 @@ fn draw_effects_tab(ui: &mut egui::Ui, input: &DrawInput<'_>, actions: &mut UiAc
                 }
             });
         }
-        {
+    });
+    ui.horizontal(|ui| {
+        let label = i18n.t("effect_dlss");
+        if !blocked && fx.dlss_ok {
             let selected = fx.mode == "dlss";
-            let dlss_enabled = !blocked && fx.dlss_ok;
-            ui.add_enabled_ui(dlss_enabled, |ui| {
-                if ui.selectable_label(selected, i18n.t("effect_dlss")).clicked() {
-                    actions.upscale_mode = Some("dlss");
-                }
-            });
+            if ui.selectable_label(selected, label).clicked() {
+                actions.upscale_mode = Some("dlss");
+            }
+        } else {
+            // Always visible greyed Mode C — not egui-disabled (too faint on AMD dark UI).
+            let chip = format!("{} · {}", label, i18n.t("label_unavailable"));
+            ui.label(
+                RichText::new(chip)
+                    .color(ui.visuals().weak_text_color())
+                    .strong(),
+            );
         }
     });
     if blocked || fx.auto_disabled {
@@ -1015,14 +1024,9 @@ fn draw_effects_tab(ui: &mut egui::Ui, input: &DrawInput<'_>, actions: &mut UiAc
         } else {
             fx.dlss_reason_key.as_str()
         };
-        let style = if fx.dlss_ok {
-            RichText::new(format!("{}: {}", i18n.t("label_dlss_status"), i18n.t(key))).small()
-        } else {
-            RichText::new(format!("{}: {}", i18n.t("label_dlss_status"), i18n.t(key)))
-                .small()
-                .weak()
-        };
-        ui.label(style);
+        ui.label(
+            RichText::new(format!("{}: {}", i18n.t("label_dlss_status"), i18n.t(key))).small(),
+        );
     }
     if fx.mode == "dlss" && fx.dlss_ok {
         ui.label(RichText::new(i18n.t("tip_dlss")).small().italics());
@@ -1035,12 +1039,7 @@ fn draw_effects_tab(ui: &mut egui::Ui, input: &DrawInput<'_>, actions: &mut UiAc
         }
         ui.label(RichText::new(i18n.t("tip_dlss_boost")).small().italics());
     } else if !fx.dlss_ok {
-        ui.label(
-            RichText::new(i18n.t("tip_dlss_greyed"))
-                .small()
-                .italics()
-                .weak(),
-        );
+        ui.label(RichText::new(i18n.t("tip_dlss_greyed")).small().italics());
     }
     ui.label(RichText::new(i18n.t("tip_upscale")).small().italics());
     ui.add_space(8.0);

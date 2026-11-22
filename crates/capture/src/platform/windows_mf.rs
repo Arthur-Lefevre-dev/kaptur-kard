@@ -30,7 +30,7 @@ use crate::format::{looks_interlaced, PixelFormat, Rational};
 use crate::labels::{device_capture_score_for, device_sort_key, is_virtual_camera};
 use crate::pool::BufferPool;
 use crate::source::{
-    frame_channel, CaptureError, FrameReceiver, FrameSender, StreamHealth, StreamStatus,
+    frame_channel, CaptureError, FrameReceiver, FrameSender, FrameWake, StreamHealth, StreamStatus,
     VideoFrame, VideoSource,
 };
 
@@ -717,6 +717,10 @@ impl MfVideoSource {
 impl VideoSource for MfVideoSource {
     fn info(&self) -> &DeviceInfo {
         &self.info
+    }
+
+    fn set_frame_wake(&mut self, wake: FrameWake) {
+        self.sender.set_wake(wake);
     }
 
     fn start(&mut self, selected: &FormatDesc) -> Result<(), CaptureError> {

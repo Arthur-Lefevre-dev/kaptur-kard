@@ -754,8 +754,9 @@ impl UpscaleEngine {
         match enhance_rgba8_with_nr(device, queue, &mut self.dlss, &src_tex, &dst_tex, width, height)
         {
             Ok(true) => {
-                if self.last_sharpen_log.elapsed().as_millis() > 1000 {
-                    tracing::info!(width, height, "DLSS 5 NR (feature 18) enhanced frame");
+                // Debug only — INFO once/sec hitch the UI thread (same issue as RCAS).
+                if self.last_sharpen_log.elapsed().as_secs_f32() >= 5.0 {
+                    tracing::debug!(width, height, "DLSS 5 NR (feature 18) enhanced frame");
                     self.last_sharpen_log = Instant::now();
                 }
                 true
@@ -1161,9 +1162,10 @@ impl UpscaleEngine {
             }
         }
         // Present always samples rgba_dst (RCAS output) — never the pre-sharpen src.
-        if self.last_sharpen_log.elapsed().as_secs_f32() >= 1.0 {
+        // Debug only — INFO once/sec on the UI thread hitch 1% lows (Arthur: ~25 fps).
+        if self.last_sharpen_log.elapsed().as_secs_f32() >= 5.0 {
             self.last_sharpen_log = Instant::now();
-            tracing::info!(
+            tracing::debug!(
                 mode = "fsr1",
                 sharpness = self.sharpness,
                 con = con_x,
@@ -1281,9 +1283,9 @@ impl UpscaleEngine {
             cpass.set_bind_group(0, &bg, &[]);
             cpass.dispatch_workgroups((out_w + 7) / 8, (out_h + 7) / 8, 1);
         }
-        if self.last_sharpen_log.elapsed().as_secs_f32() >= 1.0 {
+        if self.last_sharpen_log.elapsed().as_secs_f32() >= 5.0 {
             self.last_sharpen_log = Instant::now();
-            tracing::info!(
+            tracing::debug!(
                 mode = "nis",
                 sharpness = self.sharpness,
                 sharp_param = sharp,
