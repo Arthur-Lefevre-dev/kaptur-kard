@@ -1426,6 +1426,15 @@ fn draw_launch_tips(
     let text = Color32::from_rgba_unmultiplied(235, 238, 245, (255.0 * a) as u8);
     let muted = Color32::from_rgba_unmultiplied(180, 186, 198, (220.0 * a) as u8);
 
+    let rows = [
+        ("launch_tips_key_f1", "launch_tips_desc_f1"),
+        ("launch_tips_key_f2", "launch_tips_desc_f2"),
+        ("launch_tips_key_f11", "launch_tips_desc_f11"),
+        ("launch_tips_key_esc", "launch_tips_desc_esc"),
+        ("launch_tips_key_pin", "launch_tips_desc_pin"),
+        ("launch_tips_key_mouse", "launch_tips_desc_mouse"),
+    ];
+
     egui::Area::new(egui::Id::new("launch_tips"))
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .order(egui::Order::Foreground)
@@ -1433,13 +1442,13 @@ fn draw_launch_tips(
             let frame = egui::Frame::NONE
                 .fill(fill)
                 .corner_radius(egui::CornerRadius::same(10))
-                .inner_margin(egui::Margin::symmetric(18, 14))
+                .inner_margin(egui::Margin::symmetric(20, 16))
                 .stroke(egui::Stroke::new(
                     1.0_f32,
                     Color32::from_rgba_unmultiplied(80, 90, 110, (140.0 * a) as u8),
                 ));
             frame.show(ui, |ui| {
-                ui.set_min_width(320.0);
+                ui.set_min_width(360.0);
                 ui.horizontal(|ui| {
                     if let Some(tex) = logo {
                         ui.add(
@@ -1448,25 +1457,88 @@ fn draw_launch_tips(
                                 .tint(Color32::from_rgba_unmultiplied(255, 255, 255, (255.0 * a) as u8)),
                         );
                     }
-                    ui.label(RichText::new(i18n.t("launch_tips_title")).strong().color(text).size(16.0));
+                    ui.label(
+                        RichText::new(i18n.t("launch_tips_title"))
+                            .strong()
+                            .color(text)
+                            .size(16.0),
+                    );
                 });
-                ui.add_space(8.0);
-                for key in [
-                    "launch_tips_f1",
-                    "launch_tips_f2",
-                    "launch_tips_f11",
-                    "launch_tips_esc",
-                    "launch_tips_pin",
-                    "launch_tips_mouse",
-                ] {
-                    ui.label(RichText::new(i18n.t(key)).color(text));
+                ui.add_space(12.0);
+                for (key_id, desc_id) in rows {
+                    draw_launch_tip_row(ui, a, &i18n.t(key_id), &i18n.t(desc_id), text);
+                    ui.add_space(6.0);
                 }
-                ui.add_space(10.0);
-                ui.label(RichText::new(i18n.t("launch_tips_hint")).small().color(muted));
                 ui.add_space(6.0);
+                ui.label(RichText::new(i18n.t("launch_tips_hint")).small().color(muted));
+                ui.add_space(8.0);
                 let _ = ui.add_enabled(a > 0.4, egui::Button::new(i18n.t("launch_tips_dismiss")));
             });
         });
+}
+
+/// Keyboard-key style chip + purpose label (matches CaptureView dark chrome).
+fn draw_launch_tip_row(ui: &mut egui::Ui, alpha: f32, key: &str, purpose: &str, text: Color32) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 12.0;
+        draw_keycap(ui, alpha, key);
+        ui.vertical(|ui| {
+            ui.add_space(4.0);
+            ui.label(RichText::new(purpose).color(text).size(14.0));
+        });
+    });
+}
+
+fn draw_keycap(ui: &mut egui::Ui, alpha: f32, label: &str) {
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let galley = ui.fonts(|f| f.layout_no_wrap(label.to_owned(), font, Color32::WHITE));
+    let pad_x = 12.0_f32;
+    let pad_y = 6.0_f32;
+    let min_w = 52.0_f32;
+    let size = egui::vec2(
+        (galley.size().x + pad_x * 2.0).max(min_w),
+        (galley.size().y + pad_y * 2.0).max(28.0),
+    );
+    let (rect, _resp) = ui.allocate_exact_size(size, Sense::hover());
+    let painter = ui.painter_at(rect);
+
+    let radius = egui::CornerRadius::same(5);
+    // Soft “raised key” stack: shadow lip → face → top highlight.
+    let shadow = Color32::from_rgba_unmultiplied(0, 0, 0, (110.0 * alpha) as u8);
+    let face = Color32::from_rgba_unmultiplied(36, 42, 54, (235.0 * alpha) as u8);
+    let edge = Color32::from_rgba_unmultiplied(120, 135, 160, (200.0 * alpha) as u8);
+    let label_c = Color32::from_rgba_unmultiplied(245, 248, 255, (255.0 * alpha) as u8);
+
+    let lip = rect.translate(egui::vec2(0.0, 2.0));
+    painter.rect_filled(lip, radius, shadow);
+    painter.rect_filled(rect, radius, face);
+    painter.rect_stroke(
+        rect,
+        radius,
+        egui::Stroke::new(1.0_f32, edge),
+        egui::StrokeKind::Inside,
+    );
+    // Subtle top sheen.
+    let sheen = egui::Rect::from_min_max(
+        rect.left_top() + egui::vec2(2.0, 2.0),
+        egui::pos2(rect.right() - 2.0, rect.top() + 5.0),
+    );
+    painter.rect_filled(
+        sheen,
+        egui::CornerRadius {
+            nw: 3,
+            ne: 3,
+            sw: 0,
+            se: 0,
+        },
+        Color32::from_rgba_unmultiplied(255, 255, 255, (22.0 * alpha) as u8),
+    );
+
+    let text_pos = egui::pos2(
+        rect.center().x - galley.size().x * 0.5,
+        rect.center().y - galley.size().y * 0.5 - 0.5,
+    );
+    painter.galley(text_pos, galley, label_c);
 }
 
 fn draw_wizard(

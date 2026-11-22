@@ -99,7 +99,8 @@ mod tests {
         assert_eq!(i18n.t("btn_pin"), "Épingler");
         assert!(i18n.t("hint_f2_metrics").contains("F2"));
         assert_eq!(i18n.t("launch_tips_title"), "Raccourcis");
-        assert!(i18n.t("launch_tips_f1").contains("F1"));
+        assert_eq!(i18n.t("launch_tips_key_f1"), "F1");
+        assert!(i18n.t("launch_tips_desc_f1").contains("Réglages"));
         assert_eq!(i18n.t("label_language"), "Langue");
     }
 
@@ -109,7 +110,8 @@ mod tests {
         assert_eq!(i18n.lang(), Lang::En);
         assert_eq!(i18n.t("toolbar_fullscreen"), "Full screen");
         assert_eq!(i18n.t("launch_tips_title"), "Shortcuts");
-        assert!(i18n.t("launch_tips_f2").contains("F2"));
+        assert_eq!(i18n.t("launch_tips_key_f2"), "F2");
+        assert!(i18n.t("launch_tips_desc_f2").contains("Metrics"));
         assert_eq!(i18n.t("label_language"), "Language");
         assert_eq!(Lang::from_pref(""), Lang::En);
         assert_eq!(Lang::from_pref("fr"), Lang::Fr);

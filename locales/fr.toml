@@ -24,14 +24,20 @@ tip_pin_window = "Épingler pour fixer la fenêtre. Sinon, glissez la barre de t
 hint_f2_metrics = "F2 : mesures · F1 : réglages"
 btn_source_auto = "Automatique (recommandé)"
 
-# Brief launch overlay — keyboard shortcuts
+# Brief launch overlay — keyboard shortcuts (keycap + purpose)
 launch_tips_title = "Raccourcis"
-launch_tips_f1 = "F1 — menu Réglages"
-launch_tips_f2 = "F2 — mesures (simple / détail / off)"
-launch_tips_f11 = "F11 — plein écran"
-launch_tips_esc = "Échap — fermer le menu / quitter le plein écran"
-launch_tips_pin = "Épingler — fige la position des fenêtres"
-launch_tips_mouse = "Souris — affiche la barre Image / Son / Effets / Infos"
+launch_tips_key_f1 = "F1"
+launch_tips_desc_f1 = "Menu Réglages"
+launch_tips_key_f2 = "F2"
+launch_tips_desc_f2 = "Mesures (simple / détail / off)"
+launch_tips_key_f11 = "F11"
+launch_tips_desc_f11 = "Plein écran"
+launch_tips_key_esc = "Échap"
+launch_tips_desc_esc = "Fermer le menu / quitter le plein écran"
+launch_tips_key_pin = "Pin"
+launch_tips_desc_pin = "Figer la position des fenêtres"
+launch_tips_key_mouse = "Souris"
+launch_tips_desc_mouse = "Afficher la barre Image / Son / Effets / Infos"
 launch_tips_dismiss = "Compris"
 launch_tips_hint = "Cliquez ou appuyez sur Échap pour fermer"
 
