@@ -96,6 +96,9 @@ mod tests {
         assert_eq!(i18n.t("label_display_fps_limit"), "Limite FPS écran");
         assert_eq!(i18n.t("label_vsync"), "VSync");
         assert_eq!(i18n.t("vsync_off"), "Désactivé");
+        assert_eq!(i18n.t("label_hdr"), "Sortie HDR");
+        assert_eq!(i18n.t("hdr_off"), "Désactivé");
+        assert!(i18n.t("vrr_status_capable").contains("VRR"));
         assert_eq!(i18n.t("btn_pin"), "Épingler");
         assert!(i18n.t("hint_f2_metrics").contains("F2"));
         assert!(i18n.t("tip_dlss_greyed").contains("Grisé"));

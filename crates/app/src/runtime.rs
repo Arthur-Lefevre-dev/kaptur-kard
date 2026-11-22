@@ -22,9 +22,10 @@ use metrics::{sample_process, SharedMetrics};
 use render::pipeline::VideoPipeline;
 use render::upload::upload_frame;
 use render::{
-    is_native_or_downscale, resolve_color_convert, ColorMatrixMode, ColorRangeMode,
-    DeinterlaceEngine, DeinterlaceMode, DlssGMultiplier, InterpBlockReason, InterpMode,
-    InterpolateEngine, UpscaleBlockReason, UpscaleEngine, UpscaleMode,
+    is_native_or_downscale, pick_present_mode, pick_surface_format, resolve_color_convert,
+    ColorMatrixMode, ColorRangeMode, DeinterlaceEngine, DeinterlaceMode, DlssGMultiplier,
+    InterpBlockReason, InterpMode, InterpolateEngine, PresentCaps, UpscaleBlockReason,
+    UpscaleEngine, UpscaleMode,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -39,6 +40,7 @@ pub enum UserEvent {
 }
 
 use crate::discord_presence::{resolve_app_id, DiscordPresence};
+use crate::display_caps::OsDisplayCaps;
 use crate::i18n::{I18n, Lang};
 use crate::prefs::{
     load_audio_prefs, load_ui_prefs, save_audio_prefs, save_ui_prefs, AudioPrefs, UiPrefs,
@@ -144,6 +146,8 @@ struct GpuState {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
+    adapter: wgpu::Adapter,
+    backend: wgpu::Backend,
     config: wgpu::SurfaceConfiguration,
     pipeline: VideoPipeline,
     upscale: UpscaleEngine,
@@ -154,6 +158,7 @@ struct GpuState {
     egui_state: EguiWinitState,
     egui_ctx: egui::Context,
     adapter_name: String,
+    present_caps: PresentCaps,
 }
 
 /// Presence-only check interval. Full MF probe runs only when the id set changes.
@@ -219,6 +224,9 @@ pub struct App {
     /// Brief shortcuts overlay after the wizard (or immediately if wizard already done).
     launch_tips_started: Option<Instant>,
     launch_tips_dismissed: bool,
+    /// Cached Windows HDR / DXGI tearing probe (refreshed ~1 Hz).
+    os_display_caps: OsDisplayCaps,
+    last_display_caps_at: Instant,
 }
 
 impl Default for App {
@@ -422,6 +430,7 @@ impl Default for App {
                 deinterlace_mode: ui_prefs.deinterlace_mode.clone(),
                 source_interlaced: format.interlaced,
                 vsync_mode: normalize_vsync_mode(&ui_prefs.vsync_mode),
+                hdr_output: ui_prefs.hdr_output,
                 dlss_boost: ui_prefs.dlss_boost,
                 dlssg_multiplier: ui_prefs.dlssg_multiplier.clone(),
                 ..EffectsUiState::default()
@@ -456,6 +465,10 @@ impl Default for App {
             proxy: None,
             launch_tips_started: None,
             launch_tips_dismissed: false,
+            os_display_caps: OsDisplayCaps::default(),
+            last_display_caps_at: Instant::now()
+                .checked_sub(Duration::from_secs(2))
+                .unwrap_or_else(Instant::now),
         }
     }
 }
@@ -537,7 +550,10 @@ impl ApplicationHandler<UserEvent> for App {
                 .expect("create window"),
         );
 
-        let mut gpu = pollster::block_on(init_gpu(window.clone())).expect("init gpu");
+        self.refresh_os_display_caps(true);
+        let prefer_hdr = self.want_hdr_swapchain();
+        let mut gpu =
+            pollster::block_on(init_gpu(window.clone(), prefer_hdr)).expect("init gpu");
         // Respect OS DPI / egui style scaling.
         let scale = window.scale_factor() as f32;
         gpu.egui_ctx.set_pixels_per_point(scale);
@@ -560,9 +576,11 @@ impl ApplicationHandler<UserEvent> for App {
         self.effects_ui.backend = gpu.upscale.backend.clone();
         self.effects_ui.compute_ok = gpu.upscale.compute_ok;
         self.effects_ui.interp_compute_ok = gpu.interpolate.compute_ok;
+        self.effects_ui.hdr_output = self.ui_prefs.hdr_output;
         self.gpu = Some(gpu);
         self.apply_color_convert();
         self.apply_present_mode_for_profile();
+        self.sync_present_overlay();
 
         if let Err(e) = self.open_and_start(self.selection.device_idx, self.current_format.clone()) {
             tracing::error!(error = %e, "failed to start capture; falling back to mock");
@@ -751,6 +769,9 @@ impl App {
     /// Quality/Economy → VSync. Framegen x2 forces NoVsync under Auto (needs >monitor
     /// refresh when the panel is 60 Hz — same idea as Lossless Scaling).
     /// Explicit on/off overrides the profile.
+    ///
+    /// NoVsync path prefers Immediate (DXGI allow-tearing / VRR) then Mailbox —
+    /// capture_wake + display FPS limit still pace presents.
     fn apply_present_mode_for_profile(&mut self) {
         let Some(gpu) = self.gpu.as_mut() else {
             return;
@@ -767,19 +788,134 @@ impl App {
             // Auto: NoVsync for Game/Auto profiles, or whenever framegen needs 2× presents.
             _ => !(profile_low_latency || framegen),
         };
-        let want = if use_vsync {
-            wgpu::PresentMode::AutoVsync
-        } else {
-            wgpu::PresentMode::AutoNoVsync
-        };
+        let caps = gpu.surface.get_capabilities(&gpu.adapter);
+        let want = pick_present_mode(use_vsync, &caps);
         let latency = if use_vsync { 2 } else { 1 };
         if gpu.config.present_mode == want && gpu.config.desired_maximum_frame_latency == latency {
+            gpu.present_caps = PresentCaps::from_surface(&caps, want, gpu.config.format);
             return;
         }
         gpu.config.present_mode = want;
         gpu.config.desired_maximum_frame_latency = latency;
         gpu.surface.configure(&gpu.device, &gpu.config);
-        tracing::info!(?want, latency, vsync = %mode, "present mode updated");
+        gpu.present_caps = PresentCaps::from_surface(&caps, want, gpu.config.format);
+        tracing::info!(
+            ?want,
+            latency,
+            vsync = %mode,
+            tearing = gpu.present_caps.tearing_supported,
+            "present mode updated"
+        );
+    }
+
+    fn want_hdr_swapchain(&self) -> bool {
+        self.ui_prefs.hdr_output && self.os_display_caps.hdr_enabled
+    }
+
+    fn refresh_os_display_caps(&mut self, force: bool) {
+        if !force && self.last_display_caps_at.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        self.os_display_caps = OsDisplayCaps::probe();
+        self.last_display_caps_at = Instant::now();
+        // Merge DXGI factory tearing with surface Immediate when we already have GPU.
+        if let Some(gpu) = self.gpu.as_ref() {
+            if gpu.present_caps.tearing_supported {
+                self.os_display_caps.tearing_supported = true;
+            }
+        }
+    }
+
+    fn sync_present_overlay(&mut self) {
+        self.refresh_os_display_caps(false);
+        self.overlay.hdr_output = self.ui_prefs.hdr_output;
+        self.overlay.hdr_supported = self.os_display_caps.hdr_supported;
+        self.overlay.hdr_enabled = self.os_display_caps.hdr_enabled;
+        self.effects_ui.hdr_output = self.ui_prefs.hdr_output;
+        if let Some(gpu) = self.gpu.as_ref() {
+            self.overlay.hdr_active = gpu.present_caps.hdr_active;
+            self.overlay.vrr_capable =
+                gpu.present_caps.tearing_supported || self.os_display_caps.tearing_supported;
+            self.overlay.present_mode = gpu.present_caps.present_mode.clone();
+            self.overlay.surface_format = gpu.present_caps.surface_format.clone();
+        } else {
+            self.overlay.hdr_active = false;
+            self.overlay.vrr_capable = self.os_display_caps.tearing_supported;
+        }
+    }
+
+    /// Reconfigure surface format for HDR on/off without recreating the device.
+    fn apply_hdr_output(&mut self) {
+        let prefer = self.want_hdr_swapchain();
+        let os_hdr = self.os_display_caps.hdr_enabled;
+        let mode = UpscaleMode::from_str_lossy(&self.effects_ui.mode);
+        let sharpness = self.effects_ui.sharpness;
+        let dlss_boost = self.effects_ui.dlss_boost;
+        let dlssg = DlssGMultiplier::from_str_lossy(&self.effects_ui.dlssg_multiplier);
+        let interp = InterpMode::from_str_lossy(&self.effects_ui.interp_mode);
+        let blur = self.effects_ui.interp_motion_blur;
+
+        let mut rebuilt_meta: Option<(String, String, bool, bool)> = None;
+        let rebuilt = {
+            let Some(gpu) = self.gpu.as_mut() else {
+                return;
+            };
+            let caps = gpu.surface.get_capabilities(&gpu.adapter);
+            let format = pick_surface_format(&caps, prefer);
+            if format == gpu.config.format {
+                gpu.present_caps =
+                    PresentCaps::from_surface(&caps, gpu.config.present_mode, format);
+                false
+            } else {
+                tracing::info!(
+                    ?format,
+                    prefer_hdr = prefer,
+                    os_hdr,
+                    "reconfiguring surface for HDR/SDR"
+                );
+                gpu.config.format = format;
+                gpu.surface.configure(&gpu.device, &gpu.config);
+                gpu.pipeline = VideoPipeline::new(&gpu.device, format);
+                gpu.upscale = UpscaleEngine::new(
+                    &gpu.device,
+                    &gpu.queue,
+                    format,
+                    &gpu.adapter,
+                    gpu.backend,
+                );
+                gpu.interpolate = InterpolateEngine::new(&gpu.device, format, &gpu.adapter);
+                gpu.egui_renderer =
+                    egui_wgpu::Renderer::new(&gpu.device, format, None, 1, false);
+                gpu.upscale.set_mode(mode);
+                gpu.upscale.set_sharpness(sharpness);
+                gpu.upscale.dlss.set_boost(dlss_boost);
+                gpu.upscale.dlss.set_fg_multiplier(dlssg);
+                gpu.interpolate.set_mode(interp);
+                gpu.interpolate.set_motion_blur(blur);
+                rebuilt_meta = Some((
+                    gpu.upscale.vendor.clone(),
+                    gpu.upscale.backend.clone(),
+                    gpu.upscale.compute_ok,
+                    gpu.interpolate.compute_ok,
+                ));
+                gpu.present_caps =
+                    PresentCaps::from_surface(&caps, gpu.config.present_mode, format);
+                true
+            }
+        };
+
+        if let Some((vendor, backend, compute_ok, interp_ok)) = rebuilt_meta {
+            self.effects_ui.vendor = vendor;
+            self.effects_ui.backend = backend;
+            self.effects_ui.compute_ok = compute_ok;
+            self.effects_ui.interp_compute_ok = interp_ok;
+        }
+        if rebuilt {
+            self.logo_tex = None; // egui renderer rebuilt — drop stale texture handle
+            self.apply_color_convert();
+            self.apply_present_mode_for_profile();
+        }
+        self.sync_present_overlay();
     }
 
     fn capture_err_status(&self, e: &CaptureError) -> String {
@@ -1492,6 +1628,14 @@ impl App {
             self.effects_ui.vsync_mode = mode.clone();
             self.overlay.vsync_mode = mode;
             self.apply_present_mode_for_profile();
+            self.sync_present_overlay();
+            self.persist_ui_prefs();
+        }
+        if let Some(on) = actions.hdr_output_changed {
+            self.ui_prefs.hdr_output = on;
+            self.effects_ui.hdr_output = on;
+            self.refresh_os_display_caps(true);
+            self.apply_hdr_output();
             self.persist_ui_prefs();
         }
         if let Some(on) = actions.discord_presence_changed {
@@ -1576,6 +1720,7 @@ impl App {
         self.ui_prefs.interp_motion_blur = self.effects_ui.interp_motion_blur;
         self.ui_prefs.deinterlace_mode = self.effects_ui.deinterlace_mode.clone();
         self.ui_prefs.vsync_mode = normalize_vsync_mode(&self.effects_ui.vsync_mode);
+        self.ui_prefs.hdr_output = self.effects_ui.hdr_output;
         // Debounce disk writes — sync save on every slider tick froze the picture.
         self.prefs_dirty = true;
         self.prefs_dirty_at = Instant::now();
@@ -1603,6 +1748,7 @@ impl App {
             self.ui_prefs.interp_motion_blur = self.effects_ui.interp_motion_blur;
             self.ui_prefs.deinterlace_mode = self.effects_ui.deinterlace_mode.clone();
             self.ui_prefs.vsync_mode = normalize_vsync_mode(&self.effects_ui.vsync_mode);
+            self.ui_prefs.hdr_output = self.effects_ui.hdr_output;
         }
         save_ui_prefs(&self.ui_prefs);
         self.prefs_dirty = false;
@@ -1654,9 +1800,11 @@ impl App {
             self.effects_ui.source_interlaced = gpu.deinterlace.source_interlaced;
             self.effects_ui.deinterlace_active = gpu.deinterlace.should_run();
             self.effects_ui.vsync_mode = normalize_vsync_mode(&self.ui_prefs.vsync_mode);
+            self.effects_ui.hdr_output = self.ui_prefs.hdr_output;
         } else {
             self.effects_ui.native_res = native;
             self.effects_ui.vsync_mode = normalize_vsync_mode(&self.ui_prefs.vsync_mode);
+            self.effects_ui.hdr_output = self.ui_prefs.hdr_output;
         }
     }
 
@@ -1684,7 +1832,7 @@ impl App {
              device={}\n\
              format={}x{} {:?} @ {:?}\n\
              audio_in={} audio_out={}\n\
-             fps={:.1} capture_fps={:.1} frame_gen_fps={:.1} display_limit={} vsync={} pipeline_delay_ms={:.1}\n\
+             fps={:.1} capture_fps={:.1} frame_gen_fps={:.1} display_limit={} vsync={} present={} hdr_out={} hdr_active={} vrr={} pipeline_delay_ms={:.1}\n\
              dropped={} 1%low={:.1} gpu={} backend={}\n\
              log_level={} log_file={}\n\
              -- support events --\n{}\n\
@@ -1704,6 +1852,10 @@ impl App {
             self.overlay.frame_gen_fps,
             self.ui_prefs.display_fps_limit,
             self.ui_prefs.vsync_mode,
+            self.overlay.present_mode,
+            self.ui_prefs.hdr_output,
+            self.overlay.hdr_active,
+            self.overlay.vrr_capable,
             self.overlay.pipeline_delay_ms,
             self.overlay.dropped_frames,
             self.overlay.one_percent_low_fps,
@@ -1898,6 +2050,16 @@ impl App {
         }
         self.overlay.display_fps_limit = self.ui_prefs.display_fps_limit;
         self.overlay.vsync_mode = normalize_vsync_mode(&self.ui_prefs.vsync_mode);
+        self.sync_present_overlay();
+        // If OS HDR flipped while we prefer HDR, rebuild the swapchain format once.
+        if let Some(gpu) = self.gpu.as_ref() {
+            let prefer = self.want_hdr_swapchain();
+            let active = gpu.present_caps.hdr_active;
+            let can_hdr = gpu.present_caps.hdr_format_supported;
+            if (prefer && can_hdr && !active) || (!prefer && active) {
+                self.apply_hdr_output();
+            }
+        }
         self.overlay.discord_presence = self.ui_prefs.discord_presence;
         self.overlay.discord_app_id = self.ui_prefs.discord_app_id.clone();
         self.overlay.discord_active = self.discord.is_active();
@@ -2475,8 +2637,9 @@ fn pick_adapter(
     None
 }
 
-async fn init_gpu(window: Arc<Window>) -> anyhow::Result<GpuState> {
+async fn init_gpu(window: Arc<Window>, prefer_hdr: bool) -> anyhow::Result<GpuState> {
     // With --features dlss prefer DX12 (NGX NR/FG host); else PRIMARY (DX12/VK/GL).
+    // DX12 is also preferred for reliable VRR (ALLOW_TEARING) and scRGB HDR.
     let backends = render::preferred_backends();
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
         backends,
@@ -2515,7 +2678,7 @@ async fn init_gpu(window: Arc<Window>) -> anyhow::Result<GpuState> {
     }
     if matches!(backend, wgpu::Backend::Vulkan) {
         tracing::warn!(
-            "Vulkan selected — overlay layers may spam logs; DX12 is preferred on Windows"
+            "Vulkan selected — overlay layers may spam logs; DX12 is preferred on Windows for VRR/HDR"
         );
     }
 
@@ -2532,29 +2695,34 @@ async fn init_gpu(window: Arc<Window>) -> anyhow::Result<GpuState> {
         .await?;
 
     let caps = surface.get_capabilities(&adapter);
-    // Prefer non-sRGB for video: YUV→RGB yields display-referred R'G'B'. Writing that
-    // into an sRGB target (GPU assumes linear) lifts midtones and looks washed out.
-    let format = caps
-        .formats
-        .iter()
-        .copied()
-        .find(|f| !f.is_srgb())
-        .or_else(|| caps.formats.iter().copied().find(|f| f.is_srgb()))
-        .unwrap_or(caps.formats[0]);
-    tracing::info!(?format, srgb = format.is_srgb(), "surface format selected");
+    // HDR: RGBA16F → scRGB on DX12 when OS Advanced Color is on. Else non-sRGB 8-bit
+    // for video (YUV→RGB is display-referred; sRGB targets wash out midtones).
+    let format = pick_surface_format(&caps, prefer_hdr);
+    tracing::info!(
+        ?format,
+        srgb = format.is_srgb(),
+        prefer_hdr,
+        tearing = caps
+            .present_modes
+            .iter()
+            .any(|m| *m == wgpu::PresentMode::Immediate),
+        "surface format selected"
+    );
 
     let size = window.inner_size();
+    let present_mode = pick_present_mode(true, &caps);
     let config = wgpu::SurfaceConfiguration {
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
         format,
         width: size.width.max(1),
         height: size.height.max(1),
-        present_mode: wgpu::PresentMode::AutoVsync,
+        present_mode,
         alpha_mode: caps.alpha_modes[0],
         view_formats: vec![],
         desired_maximum_frame_latency: 2,
     };
     surface.configure(&device, &config);
+    let present_caps = PresentCaps::from_surface(&caps, present_mode, format);
 
     let pipeline = VideoPipeline::new(&device, format);
     let upscale = UpscaleEngine::new(&device, &queue, format, &adapter, backend);
@@ -2576,6 +2744,8 @@ async fn init_gpu(window: Arc<Window>) -> anyhow::Result<GpuState> {
         surface,
         device,
         queue,
+        adapter,
+        backend,
         config,
         pipeline,
         upscale,
@@ -2586,5 +2756,6 @@ async fn init_gpu(window: Arc<Window>) -> anyhow::Result<GpuState> {
         egui_state,
         egui_ctx,
         adapter_name,
+        present_caps,
     })
 }

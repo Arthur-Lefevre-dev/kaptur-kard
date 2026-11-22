@@ -15,6 +15,7 @@ Desktop preview app for generic UVC / capture-card sources. Product / window nam
 | macOS AVFoundation | **Stub** — `cfg(macos)` scaffolding; compile on Apple hosts |
 | Hot-plug (~2 s poll) | **Done** — reconnect last settings by device id |
 | Frame interp / FSR1 / NIS / audio / metrics | **Done** (steps c–g) |
+| VRR (G-Sync / FreeSync) + HDR output | **Done** — Immediate/Mailbox present, scRGB when Windows HDR on — [docs/VRR-HDR.md](./docs/VRR-HDR.md) |
 | DLSS 5 NR Mode C + DLSS-G probe | **Wired / FG pending present hook** — BYO DLLs, RTX path kept for future users; AMD refuses cleanly — [docs/DLSS.md](./docs/DLSS.md) |
 
 ## Platform matrix

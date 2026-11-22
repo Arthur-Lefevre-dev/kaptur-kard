@@ -44,5 +44,13 @@ arboard = { version = "3" }
 discord-rich-presence = "1.1.0"
 image = { version = "0.25", default-features = false, features = ["png"] }
 
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Devices_Display",
+    "Win32_Foundation",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Gdi",
+] }
+
 [build-dependencies]
 winres = "0.1"
