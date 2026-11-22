@@ -23,10 +23,60 @@ pub enum CaptureError {
     Unsupported(String),
     #[error("device open failed: {0}")]
     DeviceOpen(String),
+    /// Device is held by another process or HW MFT cannot start streaming.
+    #[error("device busy or hardware streaming failed: {0}")]
+    DeviceBusy(String),
     #[error("media type negotiation failed: {0}")]
     Negotiate(String),
     #[error(transparent)]
     Other(#[from] Box<dyn std::error::Error + Send + Sync>),
+}
+
+/// Live capture health reported by the platform worker (polled by the UI).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum StreamHealth {
+    /// Receiving frames (or not yet started).
+    Ok = 0,
+    /// Opened but no samples yet (true HDMI black / no input).
+    WaitingForSignal = 1,
+    /// Hardware MFT / exclusive access failure — another app may hold the card.
+    DeviceBusy = 2,
+    /// Other streaming error.
+    StreamError = 3,
+}
+
+impl StreamHealth {
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::WaitingForSignal,
+            2 => Self::DeviceBusy,
+            3 => Self::StreamError,
+            _ => Self::Ok,
+        }
+    }
+}
+
+/// Shared status updated by the capture thread.
+#[derive(Clone, Debug, Default)]
+pub struct StreamStatus {
+    health: Arc<AtomicU64>,
+}
+
+impl StreamStatus {
+    pub fn new() -> Self {
+        Self {
+            health: Arc::new(AtomicU64::new(u64::from(StreamHealth::Ok as u8))),
+        }
+    }
+
+    pub fn set(&self, health: StreamHealth) {
+        self.health.store(u64::from(health as u8), Ordering::SeqCst);
+    }
+
+    pub fn get(&self) -> StreamHealth {
+        StreamHealth::from_u8(self.health.load(Ordering::Relaxed) as u8)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -119,6 +169,10 @@ pub trait VideoSource: Send {
     fn stop(&mut self) -> Result<(), CaptureError>;
     /// Non-blocking poll handle into the capture thread queue.
     fn receiver(&self) -> FrameReceiver;
+    /// Live health (busy / waiting / ok). Default is always Ok.
+    fn stream_status(&self) -> StreamStatus {
+        StreamStatus::new()
+    }
 }
 
 #[cfg(test)]
@@ -126,6 +180,19 @@ mod tests {
     use super::*;
     use crate::format::PixelFormat;
     use crate::pool::BufferPool;
+
+    #[test]
+    fn stream_health_roundtrip_and_busy_distinct() {
+        let status = StreamStatus::new();
+        assert_eq!(status.get(), StreamHealth::Ok);
+        status.set(StreamHealth::WaitingForSignal);
+        assert_eq!(status.get(), StreamHealth::WaitingForSignal);
+        status.set(StreamHealth::DeviceBusy);
+        assert_eq!(status.get(), StreamHealth::DeviceBusy);
+        status.set(StreamHealth::StreamError);
+        assert_eq!(status.get(), StreamHealth::StreamError);
+        assert_ne!(StreamHealth::DeviceBusy, StreamHealth::WaitingForSignal);
+    }
 
     #[test]
     fn drop_oldest_increments_counter() {

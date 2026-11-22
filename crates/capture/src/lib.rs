@@ -26,8 +26,8 @@ pub use labels::{
 };
 pub use pool::{BufferPool, PooledBytes};
 pub use source::{
-    CaptureError, FrameReceiver, FrameSender, TryRecvError, VideoFrame, VideoSource,
-    FRAME_CHANNEL_DEPTH,
+    CaptureError, FrameReceiver, FrameSender, StreamHealth, StreamStatus, TryRecvError,
+    VideoFrame, VideoSource, FRAME_CHANNEL_DEPTH,
 };
 
 #[cfg(feature = "mock")]

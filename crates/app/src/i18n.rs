@@ -83,6 +83,8 @@ mod tests {
         let i18n = I18n::with_lang(Lang::Fr);
         assert_eq!(i18n.t("toolbar_image"), "Image");
         assert!(i18n.t("why_fsr_body").contains("retard"));
+        assert!(i18n.t("err_device_busy").contains("autre application"));
+        assert_eq!(i18n.t("label_device_busy"), "Carte de capture indisponible");
     }
 
     #[test]

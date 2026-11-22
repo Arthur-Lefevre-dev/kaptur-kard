@@ -9,8 +9,8 @@ use audio::{
     AudioEngineConfig, NONE_INPUT_ID,
 };
 use capture::{
-    hz_label, modes, CaptureMode, DeviceInfo, FormatDesc, FrameReceiver, MockVideoSource,
-    PixelFormat, Rational, VideoFrame, VideoSource,
+    hz_label, modes, CaptureError, CaptureMode, DeviceInfo, FormatDesc, FrameReceiver,
+    MockVideoSource, PixelFormat, Rational, StreamHealth, StreamStatus, VideoFrame, VideoSource,
 };
 use egui_wgpu::ScreenDescriptor;
 use egui_winit::State as EguiWinitState;
@@ -93,6 +93,18 @@ impl ActiveSource {
             Self::V4l2(s) => s.receiver(),
             #[cfg(target_os = "macos")]
             Self::Avf(s) => s.receiver(),
+        }
+    }
+
+    fn stream_status(&self) -> StreamStatus {
+        match self {
+            Self::Mock(s) => s.stream_status(),
+            #[cfg(windows)]
+            Self::Mf(s) => s.stream_status(),
+            #[cfg(target_os = "linux")]
+            Self::V4l2(s) => s.stream_status(),
+            #[cfg(target_os = "macos")]
+            Self::Avf(s) => s.stream_status(),
         }
     }
 }
@@ -392,7 +404,8 @@ impl ApplicationHandler for App {
 
         if let Err(e) = self.open_and_start(self.selection.device_idx, self.current_format.clone()) {
             tracing::error!(error = %e, "failed to start capture; falling back to mock");
-            self.push_support(format!("start failed: {e}"));
+            let busy = matches!(e, CaptureError::DeviceBusy(_));
+            self.apply_capture_err(&e);
             self.selection.device_idx = 0;
             let fmt = self.devices[0].formats[0].clone();
             self.current_format = fmt.clone();
@@ -400,7 +413,13 @@ impl ApplicationHandler for App {
             self.selection.height = fmt.height;
             self.selection.rate = fmt.frame_rates[0];
             let _ = self.open_and_start(0, fmt);
-            self.overlay.status = self.i18n.t("err_device_start");
+            // Keep the human busy message after mock fallback so Arthur knows why NZXT failed.
+            if busy {
+                self.overlay.status = self.i18n.t("err_device_busy");
+                self.overlay.device_busy = true;
+            } else {
+                self.overlay.status = self.i18n.t("err_device_start");
+            }
         }
 
         self.restart_audio();
@@ -463,11 +482,24 @@ impl App {
         self.running = false;
     }
 
+    fn capture_err_status(&self, e: &CaptureError) -> String {
+        match e {
+            CaptureError::DeviceBusy(_) => self.i18n.t("err_device_busy"),
+            _ => self.i18n.t("err_device_start"),
+        }
+    }
+
+    fn apply_capture_err(&mut self, e: &CaptureError) {
+        self.overlay.status = self.capture_err_status(e);
+        self.overlay.device_busy = matches!(e, CaptureError::DeviceBusy(_));
+        self.push_support(format!("capture error: {e}"));
+    }
+
     fn open_and_start(
         &mut self,
         device_idx: usize,
         format: FormatDesc,
-    ) -> Result<(), capture::CaptureError> {
+    ) -> Result<(), CaptureError> {
         self.stop_source();
         let info = self.devices[device_idx].clone();
         let mut source = match info.backend {
@@ -479,12 +511,13 @@ impl App {
             #[cfg(target_os = "macos")]
             "avf" => ActiveSource::Avf(capture::AvfVideoSource::open(info.clone())?),
             other => {
-                return Err(capture::CaptureError::Unsupported(format!(
+                return Err(CaptureError::Unsupported(format!(
                     "backend '{other}' not available on this OS"
                 )));
             }
         };
         source.start(&format)?;
+        self.overlay.device_busy = false;
         if info.backend != "mock" {
             self.device_settings
                 .insert(info.id.as_str().to_string(), format.clone());
@@ -679,7 +712,12 @@ impl App {
             Err(e) => {
                 tracing::warn!(error = %e, "format change failed; restoring previous");
                 let _ = self.open_and_start(device_idx, previous);
-                self.overlay.status = on_fail_msg.to_string();
+                self.overlay.status = if matches!(e, CaptureError::DeviceBusy(_)) {
+                    self.i18n.t("err_device_busy")
+                } else {
+                    on_fail_msg.to_string()
+                };
+                self.overlay.device_busy = matches!(e, CaptureError::DeviceBusy(_));
                 false
             }
         }
@@ -880,11 +918,11 @@ impl App {
         if actions.retry {
             let fmt = self.current_format.clone();
             let idx = self.selection.device_idx;
-            let msg = self.i18n.t("err_device_start");
-            let _ = self.open_and_start(idx, fmt).map_err(|e| {
-                self.overlay.status = msg;
-                self.push_support(format!("retry failed: {e}"));
-            });
+            if let Err(e) = self.open_and_start(idx, fmt) {
+                self.apply_capture_err(&e);
+            } else {
+                self.overlay.status.clear();
+            }
             self.restart_audio();
         }
         if actions.copy_support {
@@ -1141,12 +1179,28 @@ impl App {
             }
         }
 
-        let no_signal = self.last_frame_at.elapsed() > Duration::from_secs(1);
+        let stream_health = self
+            .source
+            .as_ref()
+            .map(|s| s.stream_status().get())
+            .unwrap_or(StreamHealth::Ok);
+        let device_busy = matches!(
+            stream_health,
+            StreamHealth::DeviceBusy | StreamHealth::StreamError
+        );
+        // True HDMI black / no input: do not conflate with HW busy (OBS, etc.).
+        let no_signal = !device_busy && self.last_frame_at.elapsed() > Duration::from_secs(1);
         let soft_black = self
             .black_since
             .map(|t| t.elapsed() > Duration::from_secs(3))
             .unwrap_or(false)
-            && !no_signal;
+            && !no_signal
+            && !device_busy;
+        if device_busy {
+            self.overlay.status = self.i18n.t("err_device_busy");
+        } else if self.overlay.status == self.i18n.t("err_device_busy") {
+            self.overlay.status.clear();
+        }
 
         self.frames_in_window += 1;
         let elapsed = self.fps_window_start.elapsed().as_secs_f32();
@@ -1218,6 +1272,7 @@ impl App {
             hz_label(rate)
         );
         self.overlay.no_signal = no_signal;
+        self.overlay.device_busy = device_busy;
         self.overlay.soft_black = soft_black;
         self.overlay.level = self.audio.meter().take_peak();
         self.overlay.audio_notice = self.audio.status().notice.clone();

@@ -70,6 +70,8 @@ pub struct OverlayState {
     pub frame_h: u32,
     pub status: String,
     pub no_signal: bool,
+    /// Device held by another app / MF HW MFT failed (distinct from HDMI no-signal).
+    pub device_busy: bool,
     pub soft_black: bool,
     pub audio_notice: String,
     pub level: f32,
@@ -100,6 +102,7 @@ impl Default for OverlayState {
             frame_h: 0,
             status: String::new(),
             no_signal: false,
+            device_busy: false,
             soft_black: false,
             audio_notice: String::new(),
             level: 0.0,
@@ -320,6 +323,7 @@ pub fn draw_ui(ctx: &Context, input: DrawInput<'_>) -> UiActions {
 
     // Status toasts / signal hints (non-blocking).
     if input.overlay.no_signal
+        || input.overlay.device_busy
         || input.overlay.soft_black
         || !input.overlay.status.is_empty()
         || !input.overlay.toast.is_empty()
@@ -333,12 +337,21 @@ pub fn draw_ui(ctx: &Context, input: DrawInput<'_>) -> UiActions {
                     .fill(Color32::from_rgba_unmultiplied(0, 0, 0, 170))
                     .inner_margin(egui::Margin::symmetric(14, 8))
                     .show(ui, |ui| {
-                        if input.overlay.no_signal {
+                        if input.overlay.device_busy {
+                            ui.colored_label(
+                                Color32::from_rgb(255, 160, 80),
+                                i18n.t("label_device_busy"),
+                            );
+                            ui.label(RichText::new(i18n.t("hint_device_busy")).small());
+                            if ui.button(i18n.t("btn_retry")).clicked() {
+                                actions.retry = true;
+                            }
+                        } else if input.overlay.no_signal {
                             ui.colored_label(Color32::LIGHT_RED, i18n.t("label_no_signal"));
                         } else if input.overlay.soft_black {
                             ui.colored_label(Color32::LIGHT_GRAY, i18n.t("label_soft_black"));
                         }
-                        if !input.overlay.status.is_empty() {
+                        if !input.overlay.status.is_empty() && !input.overlay.device_busy {
                             ui.colored_label(Color32::from_rgb(255, 200, 120), &input.overlay.status);
                             if ui.button(i18n.t("btn_retry")).clicked() {
                                 actions.retry = true;

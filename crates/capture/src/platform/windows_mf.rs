@@ -14,9 +14,11 @@ use windows::Win32::Media::MediaFoundation::{
     MFVideoFormat_ARGB32, MFVideoFormat_MJPG, MFVideoFormat_NV12, MFVideoFormat_RGB32,
     MFVideoFormat_YUY2, MFSTARTUP_FULL, MF_API_VERSION, MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME,
     MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE, MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID,
-    MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
-    MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_SOURCE_READER_FIRST_VIDEO_STREAM,
-    MF_VERSION,
+    MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK, MF_E_HW_MFT_FAILED_START_STREAMING,
+    MF_E_VIDEO_RECORDING_DEVICE_INVALIDATED, MF_E_VIDEO_RECORDING_DEVICE_PREEMPTED, MF_LOW_LATENCY,
+    MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE,
+    MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, MF_SOURCE_READER_DISABLE_DXVA,
+    MF_SOURCE_READER_FIRST_VIDEO_STREAM, MF_VERSION,
 };
 use windows::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, COINIT_MULTITHREADED};
 
@@ -25,8 +27,18 @@ use crate::format::{looks_interlaced, PixelFormat, Rational};
 use crate::labels::{device_capture_score_for, device_sort_key, is_virtual_camera};
 use crate::pool::BufferPool;
 use crate::source::{
-    frame_channel, CaptureError, FrameReceiver, FrameSender, VideoFrame, VideoSource,
+    frame_channel, CaptureError, FrameReceiver, FrameSender, StreamHealth, StreamStatus,
+    VideoFrame, VideoSource,
 };
+
+/// MF_E_HW_MFT_FAILED_START_STREAMING (0xC00D3704) and related busy/preempt codes.
+fn is_hw_stream_failure(e: &windows::core::Error) -> bool {
+    let code = e.code();
+    code == MF_E_HW_MFT_FAILED_START_STREAMING
+        || code == MF_E_VIDEO_RECORDING_DEVICE_PREEMPTED
+        || code == MF_E_VIDEO_RECORDING_DEVICE_INVALIDATED
+        || code.0 as u32 == 0xC00D3704
+}
 
 static MF_START: Once = Once::new();
 static MF_START_OK: AtomicBool = AtomicBool::new(false);
@@ -245,7 +257,10 @@ fn create_attributes(size: u32) -> Result<IMFAttributes, CaptureError> {
     }
 }
 
-fn open_reader_from_symlink(symlink: &str) -> Result<(IMFMediaSource, IMFSourceReader), CaptureError> {
+fn open_reader_from_symlink(
+    symlink: &str,
+    software_decode: bool,
+) -> Result<(IMFMediaSource, IMFSourceReader), CaptureError> {
     ensure_mf()?;
     unsafe {
         let attrs = create_attributes(2)?;
@@ -264,10 +279,33 @@ fn open_reader_from_symlink(symlink: &str) -> Result<(IMFMediaSource, IMFSourceR
             )
             .map_err(|e| CaptureError::DeviceOpen(format!("SetString symlink: {e}")))?;
 
-        let source: IMFMediaSource = MFCreateDeviceSource(&attrs)
-            .map_err(|e| CaptureError::DeviceOpen(format!("MFCreateDeviceSource: {e}")))?;
-        let reader = MFCreateSourceReaderFromMediaSource(&source, None::<&IMFAttributes>)
-            .map_err(|e| CaptureError::DeviceOpen(format!("SourceReader: {e}")))?;
+        let source: IMFMediaSource = MFCreateDeviceSource(&attrs).map_err(|e| {
+            if is_hw_stream_failure(&e) {
+                CaptureError::DeviceBusy(format!("MFCreateDeviceSource: {e}"))
+            } else {
+                CaptureError::DeviceOpen(format!("MFCreateDeviceSource: {e}"))
+            }
+        })?;
+
+        // Prefer a software / non-DXVA reader so we avoid HW MFT start failures when
+        // another app (OBS, NZXT CAM, browser) already holds GPU/decoder resources.
+        let reader_attrs = create_attributes(4)?;
+        let _ = reader_attrs.SetUINT32(&MF_SOURCE_READER_DISABLE_DXVA, 1);
+        let _ = reader_attrs.SetUINT32(&MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, 0);
+        let _ = reader_attrs.SetUINT32(&MF_LOW_LATENCY, 1);
+        if software_decode {
+            debug!("opening MF source reader with software-decode attributes");
+        }
+
+        let reader = MFCreateSourceReaderFromMediaSource(&source, Some(&reader_attrs)).map_err(
+            |e| {
+                if is_hw_stream_failure(&e) {
+                    CaptureError::DeviceBusy(format!("SourceReader: {e}"))
+                } else {
+                    CaptureError::DeviceOpen(format!("SourceReader: {e}"))
+                }
+            },
+        )?;
         reader
             .SetStreamSelection(MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32, true)
             .map_err(|e| CaptureError::DeviceOpen(format!("SetStreamSelection: {e}")))?;
@@ -323,7 +361,7 @@ pub fn enumerate_devices() -> Result<Vec<DeviceInfo>, CaptureError> {
                     warn!(%name, "MF device has empty symbolic link; listing without modes");
                     (Vec::new(), Some("no symbolic link".into()))
                 } else {
-                    match open_reader_from_symlink(&symlink) {
+                    match open_reader_from_symlink(&symlink, true) {
                         Ok((source, reader)) => {
                             let formats = enumerate_native_types(&reader).unwrap_or_default();
                             let _ = source.Shutdown();
@@ -384,58 +422,71 @@ pub fn enumerate_devices() -> Result<Vec<DeviceInfo>, CaptureError> {
     })
 }
 
-fn configure_media_type(reader: &IMFSourceReader, selected: &FormatDesc) -> Result<PixelFormat, CaptureError> {
+fn find_native_index(
+    reader: &IMFSourceReader,
+    width: u32,
+    height: u32,
+    pixel_format: PixelFormat,
+    target_rate: Rational,
+) -> Option<u32> {
+    let Some(target_guid) = pixel_format_to_guid(pixel_format) else {
+        return None;
+    };
     let stream = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32;
-    let target_rate = selected
-        .frame_rates
-        .first()
-        .copied()
-        .unwrap_or(Rational::new(60, 1));
-    let target_guid = pixel_format_to_guid(selected.pixel_format).ok_or_else(|| {
-        CaptureError::UnsupportedFormat(format!("{:?}", selected.pixel_format))
-    })?;
-
-    // Find matching native type index.
-    let mut matched_index = None;
     for index in 0..512u32 {
         let mt = unsafe { reader.GetNativeMediaType(stream, index) };
         let mt = match mt {
             Ok(mt) => mt,
             Err(_) => break,
         };
-        let Ok(subtype) = subtype_of(&mt) else { continue };
-        let Ok((w, h)) = frame_size_of(&mt) else { continue };
-        let Ok(rate) = frame_rate_of(&mt) else { continue };
-        if w == selected.width
-            && h == selected.height
+        let Ok(subtype) = subtype_of(&mt) else {
+            continue;
+        };
+        let Ok((w, h)) = frame_size_of(&mt) else {
+            continue;
+        };
+        let Ok(rate) = frame_rate_of(&mt) else {
+            continue;
+        };
+        if w == width
+            && h == height
             && subtype == target_guid
             && (rate.as_f64() - target_rate.as_f64()).abs() < 0.05
         {
-            matched_index = Some(index);
-            break;
+            return Some(index);
         }
     }
+    None
+}
 
-    let index = matched_index.ok_or_else(|| {
-        CaptureError::Negotiate(format!(
-            "no native type for {}x{} {:?} @ {:.2} fps",
-            selected.width,
-            selected.height,
-            selected.pixel_format,
-            target_rate.as_f64()
-        ))
-    })?;
-
+fn apply_native_type(
+    reader: &IMFSourceReader,
+    index: u32,
+    selected: &FormatDesc,
+    native_pixel: PixelFormat,
+) -> Result<PixelFormat, CaptureError> {
+    let stream = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32;
+    let target_rate = selected
+        .frame_rates
+        .first()
+        .copied()
+        .unwrap_or(Rational::new(60, 1));
     unsafe {
         let native = reader
             .GetNativeMediaType(stream, index)
             .map_err(|e| CaptureError::Negotiate(format!("GetNativeMediaType: {e}")))?;
         reader
             .SetCurrentMediaType(stream, None, &native)
-            .map_err(|e| CaptureError::Negotiate(format!("SetCurrentMediaType native: {e}")))?;
+            .map_err(|e| {
+                if is_hw_stream_failure(&e) {
+                    CaptureError::DeviceBusy(format!("SetCurrentMediaType: {e}"))
+                } else {
+                    CaptureError::Negotiate(format!("SetCurrentMediaType native: {e}"))
+                }
+            })?;
 
-        // For MJPEG (and as a safety net), request NV12 output so MF inserts a decoder / converter.
-        let delivered = if selected.pixel_format == PixelFormat::Mjpeg {
+        // For MJPEG, request NV12 (software decoder) so we avoid HW MFT paths.
+        if native_pixel == PixelFormat::Mjpeg {
             let out = MFCreateMediaType()
                 .map_err(|e| CaptureError::Negotiate(format!("MFCreateMediaType: {e}")))?;
             out.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)
@@ -453,7 +504,7 @@ fn configure_media_type(reader: &IMFSourceReader, selected: &FormatDesc) -> Resu
             )
             .map_err(|e| CaptureError::Negotiate(format!("FRAME_RATE: {e}")))?;
             match reader.SetCurrentMediaType(stream, None, &out) {
-                Ok(()) => PixelFormat::Nv12,
+                Ok(()) => return Ok(PixelFormat::Nv12),
                 Err(e) => {
                     warn!(error = %e, "NV12 output for MJPEG failed; trying RGB32");
                     out.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_RGB32)
@@ -461,15 +512,69 @@ fn configure_media_type(reader: &IMFSourceReader, selected: &FormatDesc) -> Resu
                     reader
                         .SetCurrentMediaType(stream, None, &out)
                         .map_err(|e| CaptureError::Negotiate(format!("Set RGB32 output: {e}")))?;
-                    PixelFormat::Bgra8
+                    return Ok(PixelFormat::Bgra8);
                 }
             }
-        } else {
-            selected.pixel_format
-        };
-
-        Ok(delivered)
+        }
+        Ok(native_pixel)
     }
+}
+
+fn configure_media_type(
+    reader: &IMFSourceReader,
+    selected: &FormatDesc,
+) -> Result<PixelFormat, CaptureError> {
+    let target_rate = selected
+        .frame_rates
+        .first()
+        .copied()
+        .unwrap_or(Rational::new(60, 1));
+
+    // Prefer the selected subtype, then fall back to uncompressed YUY2 / NV12 / MJPEG
+    // at the same resolution — helps when the HW path for NV12 is broken.
+    let candidates = [
+        selected.pixel_format,
+        PixelFormat::Yuy2,
+        PixelFormat::Nv12,
+        PixelFormat::Mjpeg,
+        PixelFormat::Bgra8,
+    ];
+    let mut tried = Vec::new();
+    for fmt in candidates {
+        if tried.contains(&fmt) {
+            continue;
+        }
+        tried.push(fmt);
+        if let Some(index) =
+            find_native_index(reader, selected.width, selected.height, fmt, target_rate)
+        {
+            match apply_native_type(reader, index, selected, fmt) {
+                Ok(delivered) => {
+                    if fmt != selected.pixel_format {
+                        info!(
+                            requested = ?selected.pixel_format,
+                            delivered = ?delivered,
+                            native = ?fmt,
+                            "MF media type fallback applied"
+                        );
+                    }
+                    return Ok(delivered);
+                }
+                Err(e) => {
+                    warn!(?fmt, error = %e, "MF SetCurrentMediaType candidate failed");
+                }
+            }
+        }
+    }
+
+    Err(CaptureError::Negotiate(format!(
+        "no native type for {}x{} {:?} @ {:.2} fps (tried {:?})",
+        selected.width,
+        selected.height,
+        selected.pixel_format,
+        target_rate.as_f64(),
+        tried
+    )))
 }
 
 fn plane_size(fmt: PixelFormat, width: u32, height: u32) -> usize {
@@ -523,6 +628,7 @@ pub struct MfVideoSource {
     running: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
     pool: Arc<BufferPool>,
+    status: StreamStatus,
 }
 
 impl MfVideoSource {
@@ -546,6 +652,7 @@ impl MfVideoSource {
             running: Arc::new(AtomicBool::new(false)),
             worker: None,
             pool: BufferPool::new(),
+            status: StreamStatus::new(),
         })
     }
 }
@@ -560,17 +667,25 @@ impl VideoSource for MfVideoSource {
             return Err(CaptureError::AlreadyRunning);
         }
 
-        // COM/MF interfaces are apartment-affine; open the reader on the capture thread.
-        let (ready_tx, ready_rx) = crossbeam_channel::bounded::<Result<PixelFormat, String>>(1);
+        // Ensure any previous worker is fully joined before starting again.
+        if let Some(handle) = self.worker.take() {
+            self.running.store(false, Ordering::SeqCst);
+            let _ = handle.join();
+        }
+
+        let (ready_tx, ready_rx) =
+            crossbeam_channel::bounded::<Result<PixelFormat, CaptureError>>(1);
         let symlink = self.symlink.clone();
         let selected = selected.clone();
         let width = selected.width;
         let height = selected.height;
 
+        self.status.set(StreamHealth::WaitingForSignal);
         self.running.store(true, Ordering::SeqCst);
         let running = Arc::clone(&self.running);
         let sender = self.sender.clone();
         let pool = Arc::clone(&self.pool);
+        let status = self.status.clone();
         let device_name = self.info.display_name.clone();
 
         self.worker = Some(
@@ -578,11 +693,24 @@ impl VideoSource for MfVideoSource {
                 .name("mf-capture".into())
                 .spawn(move || {
                     co_init_mta();
-                    let opened = (|| -> Result<(IMFMediaSource, IMFSourceReader, PixelFormat), CaptureError> {
-                        let (source, reader) = open_reader_from_symlink(&symlink)?;
+
+                    let open_and_configure = |software: bool| {
+                        let (source, reader) = open_reader_from_symlink(&symlink, software)?;
                         let delivered = configure_media_type(&reader, &selected)?;
-                        Ok((source, reader, delivered))
-                    })();
+                        Ok::<_, CaptureError>((source, reader, delivered))
+                    };
+
+                    // Always try software-friendly attributes first; fall back once.
+                    let opened = match open_and_configure(true) {
+                        Ok(v) => Ok(v),
+                        Err(e) => {
+                            warn!(
+                                error = %e,
+                                "MF software-path open failed; retrying once"
+                            );
+                            open_and_configure(false)
+                        }
+                    };
 
                     let (source, reader, delivered) = match opened {
                         Ok(v) => {
@@ -590,7 +718,12 @@ impl VideoSource for MfVideoSource {
                             v
                         }
                         Err(e) => {
-                            let _ = ready_tx.send(Err(e.to_string()));
+                            if matches!(e, CaptureError::DeviceBusy(_)) {
+                                status.set(StreamHealth::DeviceBusy);
+                            } else {
+                                status.set(StreamHealth::StreamError);
+                            }
+                            let _ = ready_tx.send(Err(e));
                             running.store(false, Ordering::SeqCst);
                             return;
                         }
@@ -606,6 +739,12 @@ impl VideoSource for MfVideoSource {
 
                     let expected = plane_size(delivered, width, height);
                     let stream = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32;
+                    let mut consecutive_fail = 0u32;
+                    let mut last_warn = Instant::now()
+                        .checked_sub(std::time::Duration::from_secs(10))
+                        .unwrap_or_else(Instant::now);
+                    let mut got_frame = false;
+
                     while running.load(Ordering::Relaxed) {
                         let mut flags = 0u32;
                         let mut timestamp = 0i64;
@@ -621,16 +760,51 @@ impl VideoSource for MfVideoSource {
                             )
                         };
                         if let Err(e) = result {
-                            warn!(error = %e, "ReadSample failed");
-                            thread::sleep(std::time::Duration::from_millis(5));
+                            consecutive_fail = consecutive_fail.saturating_add(1);
+                            let hw = is_hw_stream_failure(&e);
+                            if hw {
+                                status.set(StreamHealth::DeviceBusy);
+                            } else if !got_frame {
+                                status.set(StreamHealth::WaitingForSignal);
+                            } else {
+                                status.set(StreamHealth::StreamError);
+                            }
+
+                            // Rate-limit WARN spam (Arthur's PowerShell flood).
+                            if last_warn.elapsed() >= std::time::Duration::from_secs(2) {
+                                warn!(
+                                    error = %e,
+                                    consecutive = consecutive_fail,
+                                    hw_mft = hw,
+                                    "ReadSample failed"
+                                );
+                                last_warn = Instant::now();
+                            }
+
+                            // Back off harder on HW MFT / busy so we don't spin the CPU.
+                            let sleep_ms = if hw {
+                                (50u64 * consecutive_fail as u64).min(500)
+                            } else {
+                                (5u64 * consecutive_fail as u64).min(100)
+                            };
+                            thread::sleep(std::time::Duration::from_millis(sleep_ms));
                             continue;
                         }
+
+                        consecutive_fail = 0;
                         if sample.is_none() {
+                            if !got_frame {
+                                status.set(StreamHealth::WaitingForSignal);
+                            }
                             continue;
                         }
-                        let Some(sample) = sample else { continue };
+                        let Some(sample) = sample else {
+                            continue;
+                        };
                         match copy_sample_to_pool(&sample, &pool, expected) {
                             Ok(data) => {
+                                got_frame = true;
+                                status.set(StreamHealth::Ok);
                                 let frame = VideoFrame {
                                     captured_at: Instant::now(),
                                     width,
@@ -642,10 +816,17 @@ impl VideoSource for MfVideoSource {
                                     break;
                                 }
                             }
-                            Err(e) => warn!(error = %e, "sample copy failed"),
+                            Err(e) => {
+                                if last_warn.elapsed() >= std::time::Duration::from_secs(2) {
+                                    warn!(error = %e, "sample copy failed");
+                                    last_warn = Instant::now();
+                                }
+                            }
                         }
                     }
                     let _ = unsafe { source.Shutdown() };
+                    // Drop reader before leaving the MTA thread so COM releases cleanly.
+                    drop(reader);
                     debug!("MF capture thread exit");
                 })
                 .map_err(|e| CaptureError::Other(Box::new(e)))?,
@@ -658,7 +839,7 @@ impl VideoSource for MfVideoSource {
                 if let Some(handle) = self.worker.take() {
                     let _ = handle.join();
                 }
-                Err(CaptureError::DeviceOpen(e))
+                Err(e)
             }
             Err(_) => {
                 self.running.store(false, Ordering::SeqCst);
@@ -674,17 +855,26 @@ impl VideoSource for MfVideoSource {
 
     fn stop(&mut self) -> Result<(), CaptureError> {
         if !self.running.swap(false, Ordering::SeqCst) {
+            // Still join a leftover worker if any.
+            if let Some(handle) = self.worker.take() {
+                let _ = handle.join();
+            }
             return Err(CaptureError::NotRunning);
         }
         if let Some(handle) = self.worker.take() {
             let _ = handle.join();
         }
+        self.status.set(StreamHealth::Ok);
         info!("MF capture stopped");
         Ok(())
     }
 
     fn receiver(&self) -> FrameReceiver {
         self.receiver.clone()
+    }
+
+    fn stream_status(&self) -> StreamStatus {
+        self.status.clone()
     }
 }
 
