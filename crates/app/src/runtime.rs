@@ -13,7 +13,7 @@ use audio::{
     AudioEngineConfig, NONE_INPUT_ID,
 };
 use capture::{
-    hz_label, modes, CaptureError, CaptureMode, DeviceInfo, FormatDesc, FrameReceiver,
+    hz_label, modes, CaptureError, CaptureMode, DeviceInfo, FormatDesc, FrameReceiver, FrameWake,
     MockVideoSource, PixelFormat, Rational, StreamHealth, StreamStatus, VideoFrame, VideoSource,
 };
 use egui_wgpu::ScreenDescriptor;
@@ -29,8 +29,14 @@ use render::{
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::WindowEvent;
-use winit::event_loop::{ActiveEventLoop, ControlFlow};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy};
 use winit::window::{Window, WindowId};
+
+/// Wakes the UI when the capture thread queues a frame (capture-driven present).
+#[derive(Debug, Clone, Copy)]
+pub enum UserEvent {
+    FrameReady,
+}
 
 use crate::discord_presence::{resolve_app_id, DiscordPresence};
 use crate::i18n::I18n;
@@ -70,6 +76,18 @@ impl ActiveSource {
             Self::V4l2(s) => s.info(),
             #[cfg(target_os = "macos")]
             Self::Avf(s) => s.info(),
+        }
+    }
+
+    fn set_frame_wake(&mut self, wake: FrameWake) {
+        match self {
+            Self::Mock(s) => s.set_frame_wake(wake),
+            #[cfg(windows)]
+            Self::Mf(s) => s.set_frame_wake(wake),
+            #[cfg(target_os = "linux")]
+            Self::V4l2(s) => s.set_frame_wake(wake),
+            #[cfg(target_os = "macos")]
+            Self::Avf(s) => s.set_frame_wake(wake),
         }
     }
 
@@ -196,6 +214,8 @@ pub struct App {
     discord: DiscordPresence,
     last_discord_push: Instant,
     logo_tex: Option<egui::TextureHandle>,
+    /// Wakes `about_to_wait` / redraw when capture queues a frame.
+    proxy: Option<EventLoopProxy<UserEvent>>,
 }
 
 impl Default for App {
@@ -427,11 +447,54 @@ impl Default for App {
                 .checked_sub(Duration::from_secs(60))
                 .unwrap_or_else(Instant::now),
             logo_tex: None,
+            proxy: None,
         }
     }
 }
 
-impl ApplicationHandler for App {
+impl App {
+    pub fn with_proxy(proxy: EventLoopProxy<UserEvent>) -> Self {
+        let mut app = Self::default();
+        app.proxy = Some(proxy);
+        app
+    }
+}
+
+impl ApplicationHandler<UserEvent> for App {
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
+        match event {
+            UserEvent::FrameReady => {
+                // Present as soon as a capture frame lands (min gap avoids double-present).
+                let period = Duration::from_secs_f64(1.0 / self.target_display_hz());
+                let now = Instant::now();
+                let since = self
+                    .last_present_at
+                    .map(|t| now.duration_since(t))
+                    .unwrap_or(Duration::from_secs(1));
+                let framegen = self.framegen_wants_2x();
+                let min_gap = Duration::from_millis(1);
+                let due = if framegen {
+                    // Keep Mid/Curr on the 2× deadline grid.
+                    now + Duration::from_millis(1) >= self.next_present_at
+                } else {
+                    since >= min_gap
+                };
+                if due {
+                    if let Some(gpu) = self.gpu.as_ref() {
+                        gpu.window.request_redraw();
+                    }
+                } else if !framegen {
+                    // Too soon after last present — schedule the remainder of the period.
+                    self.next_present_at = self
+                        .last_present_at
+                        .unwrap_or(now)
+                        .checked_add(period)
+                        .unwrap_or(now);
+                }
+            }
+        }
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.gpu.is_some() {
             return;
@@ -544,9 +607,8 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        // Absolute deadline pacing (not "now + remaining"): late OS wakes used to
-        // slip the phase → average ~59 fps and a capture↔present latency sawtooth.
-        let period = Duration::from_secs_f64(1.0 / self.target_display_hz());
+        // Capture-driven (no framegen): FrameReady wakes us when a frame is queued.
+        // Framegen: absolute 2× deadline so Mid then Curr each get a present.
         let now = Instant::now();
         let framegen = self.framegen_wants_2x();
         let pending = self
@@ -559,10 +621,9 @@ impl ApplicationHandler for App {
             .map(|t| now.duration_since(t))
             .unwrap_or(Duration::from_secs(1));
 
-        // Without framegen: present on capture (stable latency) within the rate cap.
-        // With framegen: free-run at 2× so Mid then Curr both get a swapchain present.
-        let min_capture_gap = Duration::from_secs_f64(period.as_secs_f64() * 0.92);
-        let capture_due = !framegen && pending && since_present >= min_capture_gap;
+        // Min gap ~1ms (not 0.92×period): old gate still aged frames on the bus → sawtooth.
+        let min_gap = Duration::from_millis(1);
+        let capture_due = !framegen && pending && since_present >= min_gap;
         let due = now >= self.next_present_at || capture_due;
         let until_due = self.next_present_at.saturating_duration_since(now);
 
@@ -580,7 +641,7 @@ impl ApplicationHandler for App {
             event_loop.set_control_flow(ControlFlow::Wait);
             return;
         }
-        // Wake on the absolute deadline (stable period), not Instant::now()+slack.
+        // Without framegen, FrameReady is the primary wake; deadline is a stall fallback.
         let wake_at = self.next_present_at;
         event_loop.set_control_flow(ControlFlow::WaitUntil(wake_at));
     }
@@ -712,6 +773,12 @@ impl App {
                     )));
                 }
             };
+            // Wake UI on each queued frame so presents follow capture (kills latency sawtooth).
+            if let Some(proxy) = self.proxy.clone() {
+                source.set_frame_wake(Arc::new(move || {
+                    let _ = proxy.send_event(UserEvent::FrameReady);
+                }));
+            }
             source.start(&format)?;
             Ok(source)
         })();
@@ -1589,19 +1656,19 @@ impl App {
             .last_present_at
             .map(|t| now.duration_since(t))
             .unwrap_or(Duration::from_secs(1));
-        let min_capture_gap = Duration::from_secs_f64(period.as_secs_f64() * 0.92);
-        let capture_due = !framegen && pending && since_present >= min_capture_gap;
+        let min_gap = Duration::from_millis(1);
+        let capture_due = !framegen && pending && since_present >= min_gap;
         // Hard drop surplus RedrawRequested (egui may queue many under NoVsync).
         if !capture_due && now + Duration::from_micros(500) < self.next_present_at {
             return;
         }
-        // Advance absolute phase by exactly one period (catch-up capped to avoid storms).
-        if capture_due && now < self.next_present_at {
+        // Capture-driven: snap phase to the capture clock so latency stays flat.
+        // Framegen: advance absolute 2× grid (catch-up capped).
+        if capture_due || (!framegen && pending) {
             self.next_present_at = now + period;
         } else {
             self.next_present_at += period;
             if self.next_present_at + period < now {
-                // Fell behind by >1 frame — resync rather than bursting.
                 self.next_present_at = now + period;
             }
         }
@@ -1802,8 +1869,8 @@ impl App {
         // Pipeline delay = capture Instant → this present, only on a fresh upload.
         // Present-only / Mid→Curr ticks keep the last reading (no sawtooth from aging).
         let mut latency_ns = self.metrics.last_latency_ns.load(Ordering::Relaxed);
-        if let Some(frame) = latest {
-            // Measure after pacing wait, right before GPU work — reflects true display lag.
+        if let Some(ref frame) = latest {
+            // With capture-driven wake, this stays ~GPU path (few ms), not 2→16 phase walk.
             latency_ns = frame.captured_at.elapsed().as_nanos() as u64;
             if upload_frame(&gpu.device, &gpu.queue, &mut gpu.pipeline, &frame) {
                 let rate = self
