@@ -39,7 +39,7 @@ serde = { version = "1", features = ["derive"] }
 toml = { version = "0.8" }
 sys-locale = { version = "0.3" }
 tracing = { version = "0.1" }
-tracing-subscriber = { version = "0.3", features = ["env-filter", "reload"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = { version = "0.2" }
 
 # Concurrency / misc
