@@ -33,6 +33,14 @@ impl Default for AudioPrefs {
 pub struct UiPrefs {
     pub wizard_done: bool,
     pub wizard_step: u8,
+    #[serde(default)]
+    pub upscale_mode: String,
+    #[serde(default = "default_sharpness")]
+    pub sharpness: f32,
+}
+
+fn default_sharpness() -> f32 {
+    0.4
 }
 
 impl Default for UiPrefs {
@@ -40,6 +48,8 @@ impl Default for UiPrefs {
         Self {
             wizard_done: false,
             wizard_step: 0,
+            upscale_mode: "off".into(),
+            sharpness: 0.4,
         }
     }
 }

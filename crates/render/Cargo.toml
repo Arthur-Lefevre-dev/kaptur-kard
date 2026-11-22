@@ -7,7 +7,7 @@ description = "wgpu video present pipeline for CaptureView"
 rust-version.workspace = true
 
 [features]
-default = []
+default = ["upscale"]
 interpolate = []
 upscale = []
 

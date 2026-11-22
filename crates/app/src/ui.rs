@@ -192,6 +192,35 @@ pub struct UiActions {
     pub cycle_metrics: bool,
     pub lag_test_start: bool,
     pub lag_test_stop: bool,
+    pub upscale_mode: Option<&'static str>,
+    pub sharpness_changed: Option<f32>,
+}
+
+#[derive(Clone, Debug)]
+pub struct EffectsUiState {
+    pub mode: String,
+    pub sharpness: f32,
+    pub compute_ok: bool,
+    pub native_res: bool,
+    pub auto_disabled: bool,
+    pub last_gpu_ms: f32,
+    pub vendor: String,
+    pub backend: String,
+}
+
+impl Default for EffectsUiState {
+    fn default() -> Self {
+        Self {
+            mode: "off".into(),
+            sharpness: 0.4,
+            compute_ok: true,
+            native_res: false,
+            auto_disabled: false,
+            last_gpu_ms: 0.0,
+            vendor: String::new(),
+            backend: String::new(),
+        }
+    }
 }
 
 pub struct DrawInput<'a> {
@@ -205,6 +234,7 @@ pub struct DrawInput<'a> {
     pub outputs: &'a [AudioDeviceInfo],
     pub audio: &'a AudioUiState,
     pub chrome: &'a UiChrome,
+    pub effects: &'a EffectsUiState,
 }
 
 pub fn draw_ui(ctx: &Context, input: DrawInput<'_>) -> UiActions {
@@ -400,7 +430,7 @@ fn draw_settings(ctx: &Context, input: &DrawInput<'_>, actions: &mut UiActions) 
             match input.chrome.settings_tab {
                 SettingsTab::Image => draw_image_tab(ui, input, actions),
                 SettingsTab::Sound => draw_sound_tab(ui, input, actions),
-                SettingsTab::Effects => draw_effects_tab(ui, input),
+                SettingsTab::Effects => draw_effects_tab(ui, input, actions),
                 SettingsTab::Info => draw_info_tab(ui, input, actions),
             }
 
@@ -705,30 +735,93 @@ fn draw_sound_tab(ui: &mut egui::Ui, input: &DrawInput<'_>, actions: &mut UiActi
     });
 }
 
-fn draw_effects_tab(ui: &mut egui::Ui, input: &DrawInput<'_>) {
+fn draw_effects_tab(ui: &mut egui::Ui, input: &DrawInput<'_>, actions: &mut UiActions) {
     let i18n = input.i18n;
+    let fx = input.effects;
     ui.label(RichText::new(i18n.t("label_why_fsr")).strong());
     ui.label(i18n.t("why_fsr_body"));
-    ui.add_space(10.0);
+    ui.add_space(8.0);
 
-    for (name_key, tip_key) in [
-        ("effect_fsr", "tip_fsr"),
-        ("effect_nis", "tip_nis"),
-        ("effect_interp", "tip_interp"),
-    ] {
-        ui.add_enabled_ui(false, |ui| {
-            ui.horizontal(|ui| {
-                ui.checkbox(&mut false, i18n.t(name_key));
-                ui.weak(format!("— {}", i18n.t("label_soon")));
-            });
+    let blocked = !fx.compute_ok || fx.native_res;
+    let reason = if !fx.compute_ok {
+        i18n.t("effect_reason_no_compute")
+    } else if fx.native_res {
+        i18n.t("effect_reason_native")
+    } else if fx.auto_disabled {
+        i18n.t("effect_reason_budget")
+    } else {
+        String::new()
+    };
+
+    ui.label(i18n.t("label_upscale_mode"));
+    ui.add_enabled_ui(!blocked, |ui| {
+        ui.horizontal(|ui| {
+            for (id, key) in [
+                ("off", "effect_off"),
+                ("fsr1", "effect_fsr"),
+                ("nis", "effect_nis"),
+            ] {
+                let selected = fx.mode == id;
+                if ui.selectable_label(selected, i18n.t(key)).clicked() {
+                    actions.upscale_mode = Some(id);
+                }
+            }
         });
+    });
+    if blocked || fx.auto_disabled {
+        ui.small(format!("{}: {}", i18n.t("label_unavailable"), reason));
+    }
+    ui.label(RichText::new(i18n.t("tip_upscale")).small().italics());
+    ui.add_space(8.0);
+
+    option_block(
+        ui,
+        i18n,
+        &i18n.t("label_sharpness"),
+        &i18n.t("explain_sharpness"),
+        &i18n.t("tip_sharpness"),
+        Impact::Light,
+        Impact::Light,
+        |ui| {
+            let mut s = fx.sharpness;
+            if ui
+                .add_enabled(!blocked, egui::Slider::new(&mut s, 0.0..=1.0))
+                .changed()
+            {
+                actions.sharpness_changed = Some(s);
+            }
+        },
+    );
+
+    ui.add_space(8.0);
+    // Interpolation remains stubbed for step g.
+    ui.add_enabled_ui(false, |ui| {
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut false, i18n.t("effect_interp"));
+            ui.weak(format!("— {}", i18n.t("label_soon")));
+        });
+    });
+    ui.small(format!(
+        "{}: {}",
+        i18n.t("label_unavailable"),
+        i18n.t("effect_reason_soon")
+    ));
+    ui.label(RichText::new(i18n.t("tip_interp")).small().italics());
+
+    ui.add_space(10.0);
+    ui.separator();
+    ui.small(format!(
+        "{}: {} · {}",
+        i18n.t("label_gpu"),
+        fx.vendor,
+        fx.backend
+    ));
+    if fx.last_gpu_ms > 0.0 {
         ui.small(format!(
-            "{}: {}",
-            i18n.t("label_unavailable"),
-            i18n.t("effect_reason_soon")
+            "{}: {:.1} ms",
+            i18n.t("label_effect_cost"),
+            fx.last_gpu_ms
         ));
-        ui.label(RichText::new(i18n.t(tip_key)).small().italics());
-        ui.add_space(6.0);
     }
 }
 

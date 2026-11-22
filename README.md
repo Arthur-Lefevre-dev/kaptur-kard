@@ -4,13 +4,13 @@ Desktop preview app for generic UVC / capture-card sources. Product name **Captu
 
 ## Status
 
-**Step (e)** — metrics simple / detailed.
+**Step (f)** — FSR 1 / NIS upscaling.
 
-- Full-frame video with floating toolbar (Image / Son / Effets / Infos / Plein écran)
-- **F2** cycles metrics overlay: Simple (FPS + display delay) → Detailed (frame-time graph, 1% low, drops, capture vs display FPS, CPU/RAM, GPU, active format) → Off
-- Display delay = capture timestamp → present (not true input lag — software cannot measure controller/HDMI/panel lag)
-- Infos tab shows the same live metrics + optional **manual lag test** (screen flash + stopwatch)
-- i18n FR/EN via `sys-locale` + `locales/{fr,en}.toml`
+- Effets: **Off** / **Mode A (FSR 1)** / **Mode B (NIS)** + sharpness; target = on-screen content size
+- Greyed when already native resolution or GPU lacks compute (`get_downlevel_capabilities`)
+- Auto-disable if frame time repeatedly exceeds budget (~20 ms × 45 frames)
+- Adapter vendor/backend logged at startup (DX12/Vulkan preferred; GL noted as fallback)
+- Licenses: `licenses/AMD-FSR1-MIT.txt`, `licenses/NVIDIA-NIS-MIT.txt`
 
 ## Build & run
 
@@ -21,17 +21,14 @@ cargo build --release -p captureview
 cargo test --workspace
 ```
 
-Ideal path: launch → card selected automatically (Auto) → picture fills the window. Press **F2** for metrics.
-
-### Manual lag test (helper only)
-
-In **Infos**: **Démarrer le flash** whites the window briefly; stop the timer when you see the flash. This is a human stopwatch, not a hardware lag measurement. Real input lag requires external tools (high-speed camera, Leo Bodnar, etc.).
+Ideal path: launch → Auto card → full-frame video. Open **Effets** to pick FSR 1 or NIS when the capture is below screen resolution.
 
 ## Out of scope (later)
 
-- Real FSR / NIS / interpolation shaders
+- Optical-flow interpolation (step g)
+- DLSS / FSR 2 / FSR 3
 - Linux / macOS
 
 ## Licence
 
-MIT — see [LICENSE](./LICENSE).
+MIT — see [LICENSE](./LICENSE). Third-party shader ports: see `licenses/`.

@@ -11,3 +11,6 @@ pub mod upscale;
 
 pub use gpu::GpuContext;
 pub use pipeline::VideoPipeline;
+pub use upscale::{
+    target_size, UpscaleBlockReason, UpscaleEngine, UpscaleMode, UpscaleStatus,
+};

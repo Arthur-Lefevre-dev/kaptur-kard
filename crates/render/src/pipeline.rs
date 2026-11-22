@@ -294,6 +294,49 @@ impl VideoPipeline {
             pass.draw(0..3, 0..1);
         }
     }
+
+    pub fn bind_group_ref(&self) -> Option<&wgpu::BindGroup> {
+        self.bind_group.as_ref()
+    }
+
+    /// Full-bleed UV mapping for offscreen color convert (no letterbox).
+    pub fn write_identity_params(&self, queue: &wgpu::Queue) {
+        queue.write_buffer(
+            &self.params_buf,
+            0,
+            bytemuck::bytes_of(&ParamsGpu {
+                scale_offset: [1.0, 1.0, 0.0, 0.0],
+                format_pad: [self.mode as u32, 0, 0, 0],
+            }),
+        );
+    }
+
+    /// Bind entries mirroring the video group (for a convert pipeline with the same layout).
+    pub fn convert_bind_entries(&self) -> [wgpu::BindGroupEntry<'_>; 4] {
+        let primary = self
+            .primary_view
+            .as_ref()
+            .expect("primary view for convert");
+        let uv = self.uv_view.as_ref().unwrap_or(&self.dummy_uv_view);
+        [
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(primary),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(uv),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::Sampler(&self.sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: self.params_buf.as_entire_binding(),
+            },
+        ]
+    }
 }
 
 fn texture_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {

@@ -16,6 +16,7 @@ use egui_winit::State as EguiWinitState;
 use metrics::{sample_process, SharedMetrics};
 use render::pipeline::VideoPipeline;
 use render::upload::upload_frame;
+use render::{target_size, UpscaleBlockReason, UpscaleEngine, UpscaleMode};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::WindowEvent;
@@ -26,7 +27,9 @@ use crate::i18n::I18n;
 use crate::prefs::{
     load_audio_prefs, load_ui_prefs, save_audio_prefs, save_ui_prefs, AudioPrefs, UiPrefs,
 };
-use crate::ui::{self, AudioUiState, MetricsMode, OverlayState, UiChrome, UiSelection};
+use crate::ui::{
+    self, AudioUiState, EffectsUiState, MetricsMode, OverlayState, UiChrome, UiSelection,
+};
 
 enum ActiveSource {
     Mock(MockVideoSource),
@@ -74,6 +77,7 @@ struct GpuState {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     pipeline: VideoPipeline,
+    upscale: UpscaleEngine,
     window: Arc<Window>,
     egui_renderer: egui_wgpu::Renderer,
     egui_state: EguiWinitState,
@@ -101,6 +105,7 @@ pub struct App {
     audio_inputs: Vec<AudioDeviceInfo>,
     audio_outputs: Vec<AudioDeviceInfo>,
     audio_ui: AudioUiState,
+    effects_ui: EffectsUiState,
     i18n: I18n,
     chrome: UiChrome,
     ui_prefs: UiPrefs,
@@ -209,6 +214,11 @@ impl Default for App {
             audio_inputs,
             audio_outputs,
             audio_ui,
+            effects_ui: EffectsUiState {
+                mode: ui_prefs.upscale_mode.clone(),
+                sharpness: ui_prefs.sharpness.clamp(0.0, 1.0),
+                ..EffectsUiState::default()
+            },
             i18n,
             chrome,
             ui_prefs,
@@ -238,10 +248,16 @@ impl ApplicationHandler for App {
                 .expect("create window"),
         );
 
-        let gpu = pollster::block_on(init_gpu(window.clone())).expect("init gpu");
+        let mut gpu = pollster::block_on(init_gpu(window.clone())).expect("init gpu");
         // Respect OS DPI / egui style scaling.
         let scale = window.scale_factor() as f32;
         gpu.egui_ctx.set_pixels_per_point(scale);
+        gpu.upscale
+            .set_mode(UpscaleMode::from_str_lossy(&self.effects_ui.mode));
+        gpu.upscale.set_sharpness(self.effects_ui.sharpness);
+        self.effects_ui.vendor = gpu.upscale.vendor.clone();
+        self.effects_ui.backend = gpu.upscale.backend.clone();
+        self.effects_ui.compute_ok = gpu.upscale.compute_ok;
         self.gpu = Some(gpu);
 
         if let Err(e) = self.open_and_start(self.selection.device_idx, self.current_format.clone()) {
@@ -540,6 +556,13 @@ impl App {
         }
         if actions.reset_auto {
             self.reset_to_auto();
+            self.effects_ui.mode = "off".into();
+            self.effects_ui.sharpness = 0.4;
+            if let Some(gpu) = self.gpu.as_mut() {
+                gpu.upscale.set_mode(UpscaleMode::Off);
+                gpu.upscale.set_sharpness(0.4);
+            }
+            self.persist_ui_prefs();
         }
         if actions.retry {
             let fmt = self.current_format.clone();
@@ -586,11 +609,57 @@ impl App {
             self.overlay.lag_test_running = false;
             self.lag_flash_until = None;
         }
+        if let Some(mode) = actions.upscale_mode {
+            self.effects_ui.mode = mode.to_string();
+            self.ui_prefs.upscale_mode = mode.to_string();
+            if let Some(gpu) = self.gpu.as_mut() {
+                gpu.upscale.set_mode(UpscaleMode::from_str_lossy(mode));
+            }
+            self.persist_ui_prefs();
+        }
+        if let Some(s) = actions.sharpness_changed {
+            self.effects_ui.sharpness = s;
+            self.ui_prefs.sharpness = s;
+            if let Some(gpu) = self.gpu.as_mut() {
+                gpu.upscale.set_sharpness(s);
+            }
+            self.persist_ui_prefs();
+        }
     }
 
     fn persist_ui_prefs(&mut self) {
         self.ui_prefs.wizard_step = self.chrome.wizard_step;
+        self.ui_prefs.upscale_mode = self.effects_ui.mode.clone();
+        self.ui_prefs.sharpness = self.effects_ui.sharpness;
         save_ui_prefs(&self.ui_prefs);
+    }
+
+    fn sync_effects_ui(&mut self) {
+        let (cw, ch) = self
+            .gpu
+            .as_ref()
+            .map(|g| g.pipeline.content_size)
+            .unwrap_or((0, 0));
+        let (vw, vh) = self
+            .gpu
+            .as_ref()
+            .map(|g| (g.config.width, g.config.height))
+            .unwrap_or((1, 1));
+        let (tw, th) = target_size(cw, ch, vw, vh);
+        let native = cw > 0 && ch > 0 && cw >= tw && ch >= th;
+        if let Some(gpu) = self.gpu.as_ref() {
+            let st = gpu.upscale.status();
+            self.effects_ui.mode = st.mode.as_str().into();
+            self.effects_ui.sharpness = st.sharpness;
+            self.effects_ui.compute_ok = st.compute_ok;
+            self.effects_ui.native_res = native;
+            self.effects_ui.auto_disabled = st.block == UpscaleBlockReason::AutoDisabled;
+            self.effects_ui.last_gpu_ms = st.last_gpu_ms;
+            self.effects_ui.vendor = st.vendor;
+            self.effects_ui.backend = st.backend;
+        } else {
+            self.effects_ui.native_res = native;
+        }
     }
 
     fn push_support(&mut self, line: String) {
@@ -809,6 +878,8 @@ impl App {
         let audio_ui = self.audio_ui.clone();
         let chrome = self.chrome.clone();
         let i18n = self.i18n.clone();
+        self.sync_effects_ui();
+        let effects = self.effects_ui.clone();
         // Video presents every tick; egui widgets only draw when chrome/overlay is active.
 
         let mut actions = ui::UiActions::default();
@@ -827,6 +898,8 @@ impl App {
                     .unwrap_or(0);
                 self.last_present_at = Some(now);
                 self.metrics.record_present(latency_ns, frame_time_ns);
+                let frame_ms = frame_time_ns as f32 / 1_000_000.0;
+                let _ = gpu.upscale.observe_frame_ms(frame_ms);
             }
         }
 
@@ -863,6 +936,7 @@ impl App {
                     outputs: &outputs,
                     audio: &audio_ui,
                     chrome: &chrome,
+                    effects: &effects,
                 },
             );
         });
@@ -910,7 +984,20 @@ impl App {
                 label: Some("frame-encoder"),
             });
 
-        {
+        let mut used_upscale = false;
+        if !no_signal {
+            used_upscale = gpu.upscale.encode(
+                &gpu.device,
+                &gpu.queue,
+                &mut encoder,
+                &gpu.pipeline,
+                &view,
+                gpu.config.width,
+                gpu.config.height,
+                clear,
+            );
+        }
+        if !used_upscale {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("video-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -966,6 +1053,16 @@ impl App {
         }
 
         // GPU borrow ended with the block above; safe to restart capture from UI.
+        let was_auto = self
+            .gpu
+            .as_ref()
+            .map(|g| g.upscale.status().block == UpscaleBlockReason::AutoDisabled)
+            .unwrap_or(false);
+        if was_auto && self.effects_ui.mode != "off" {
+            self.effects_ui.mode = "off".into();
+            self.show_toast(self.i18n.t("msg_upscale_off_budget"));
+            self.persist_ui_prefs();
+        }
         self.apply_ui_actions(actions);
     }
 }
@@ -1011,7 +1108,20 @@ async fn init_gpu(window: Arc<Window>) -> anyhow::Result<GpuState> {
         })
         .await
         .ok_or_else(|| anyhow::anyhow!("no suitable GPU adapter"))?;
-    let adapter_name = adapter.get_info().name;
+    let adapter_info = adapter.get_info();
+    let adapter_name = adapter_info.name.clone();
+    let backend = adapter_info.backend;
+    tracing::info!(
+        gpu = %adapter_name,
+        backend = ?backend,
+        vendor = adapter_info.vendor,
+        "GPU adapter selected (DX12/Vulkan preferred; GL is a fallback path)"
+    );
+    if matches!(backend, wgpu::Backend::Gl) {
+        tracing::warn!(
+            "running on OpenGL — FSR/NIS compute may be limited; prefer DX12 or Vulkan"
+        );
+    }
 
     let (device, queue) = adapter
         .request_device(
@@ -1047,6 +1157,7 @@ async fn init_gpu(window: Arc<Window>) -> anyhow::Result<GpuState> {
     surface.configure(&device, &config);
 
     let pipeline = VideoPipeline::new(&device, format);
+    let upscale = UpscaleEngine::new(&device, &queue, format, &adapter, backend);
 
     let egui_ctx = egui::Context::default();
     let egui_state = EguiWinitState::new(
@@ -1065,6 +1176,7 @@ async fn init_gpu(window: Arc<Window>) -> anyhow::Result<GpuState> {
         queue,
         config,
         pipeline,
+        upscale,
         window,
         egui_renderer,
         egui_state,
