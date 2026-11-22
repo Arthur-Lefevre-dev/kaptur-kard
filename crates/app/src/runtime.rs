@@ -1,6 +1,5 @@
 //! winit + wgpu + egui runtime with Mock and Media Foundation sources.
 
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -9,12 +8,12 @@ use audio::{
     AudioEngineConfig, NONE_INPUT_ID,
 };
 use capture::{
-    modes, CaptureMode, DeviceInfo, FormatDesc, FrameReceiver, MockVideoSource, PixelFormat,
-    Rational, VideoFrame, VideoSource,
+    hz_label, modes, CaptureMode, DeviceInfo, FormatDesc, FrameReceiver, MockVideoSource,
+    PixelFormat, Rational, VideoFrame, VideoSource,
 };
 use egui_wgpu::ScreenDescriptor;
 use egui_winit::State as EguiWinitState;
-use metrics::SharedMetrics;
+use metrics::{sample_process, SharedMetrics};
 use render::pipeline::VideoPipeline;
 use render::upload::upload_frame;
 use winit::application::ApplicationHandler;
@@ -27,7 +26,7 @@ use crate::i18n::I18n;
 use crate::prefs::{
     load_audio_prefs, load_ui_prefs, save_audio_prefs, save_ui_prefs, AudioPrefs, UiPrefs,
 };
-use crate::ui::{self, AudioUiState, OverlayState, UiChrome, UiSelection};
+use crate::ui::{self, AudioUiState, MetricsMode, OverlayState, UiChrome, UiSelection};
 
 enum ActiveSource {
     Mock(MockVideoSource),
@@ -79,6 +78,7 @@ struct GpuState {
     egui_renderer: egui_wgpu::Renderer,
     egui_state: EguiWinitState,
     egui_ctx: egui::Context,
+    adapter_name: String,
 }
 
 pub struct App {
@@ -91,7 +91,10 @@ pub struct App {
     overlay: OverlayState,
     fps_window_start: Instant,
     frames_in_window: u32,
+    captures_in_window: u32,
     last_frame_at: Instant,
+    last_present_at: Option<Instant>,
+    last_channel_drops: u64,
     black_since: Option<Instant>,
     running: bool,
     audio: AudioEngine,
@@ -104,6 +107,9 @@ pub struct App {
     last_pointer_at: Instant,
     toast_until: Option<Instant>,
     support_log: Vec<String>,
+    process_sample_at: Instant,
+    lag_test_started: Option<Instant>,
+    lag_flash_until: Option<Instant>,
 }
 
 impl Default for App {
@@ -193,7 +199,10 @@ impl Default for App {
             overlay: OverlayState::default(),
             fps_window_start: Instant::now(),
             frames_in_window: 0,
+            captures_in_window: 0,
             last_frame_at: Instant::now(),
+            last_present_at: None,
+            last_channel_drops: 0,
             black_since: None,
             running: false,
             audio: AudioEngine::new(),
@@ -206,6 +215,9 @@ impl Default for App {
             last_pointer_at: Instant::now(),
             toast_until: None,
             support_log: Vec::new(),
+            process_sample_at: Instant::now(),
+            lag_test_started: None,
+            lag_flash_until: None,
         }
     }
 }
@@ -555,6 +567,25 @@ impl App {
             self.ui_prefs.wizard_done = true;
             self.persist_ui_prefs();
         }
+        if actions.cycle_metrics {
+            self.overlay.metrics_mode = self.overlay.metrics_mode.next();
+            // Keep toolbar visible briefly so the user sees the mode change.
+            self.chrome.toolbar_visible = true;
+            self.last_pointer_at = Instant::now();
+        }
+        if actions.lag_test_start {
+            self.lag_test_started = Some(Instant::now());
+            self.lag_flash_until = Some(Instant::now() + Duration::from_millis(80));
+            self.overlay.lag_test_running = true;
+            self.overlay.lag_test_ms = 0.0;
+        }
+        if actions.lag_test_stop {
+            if let Some(start) = self.lag_test_started.take() {
+                self.overlay.lag_test_ms = start.elapsed().as_secs_f32() * 1000.0;
+            }
+            self.overlay.lag_test_running = false;
+            self.lag_flash_until = None;
+        }
     }
 
     fn persist_ui_prefs(&mut self) {
@@ -576,7 +607,8 @@ impl App {
              device={}\n\
              format={}x{} {:?} @ {:?}\n\
              audio_in={} audio_out={}\n\
-             fps={:.1} delay_est_ms={:.0}\n\
+             fps={:.1} capture_fps={:.1} pipeline_delay_ms={:.1}\n\
+             dropped={} 1%low={:.1} gpu={}\n\
              -- log --\n{}\n",
             self.i18n.lang(),
             self.overlay.label,
@@ -587,7 +619,11 @@ impl App {
             self.audio_ui.input_id,
             self.audio_ui.output_id,
             self.overlay.fps,
-            self.overlay.estimated_delay_ms,
+            self.overlay.capture_fps,
+            self.overlay.pipeline_delay_ms,
+            self.overlay.dropped_frames,
+            self.overlay.one_percent_low_fps,
+            self.overlay.gpu_name,
             self.support_log.join("\n")
         );
         match arboard::Clipboard::new().and_then(|mut c| c.set_text(report)) {
@@ -635,15 +671,25 @@ impl App {
     fn redraw(&mut self) {
         // Drain frames before borrowing GPU exclusively for UI state updates.
         let mut latest: Option<VideoFrame> = None;
+        let mut drained = 0u64;
         if let Some(source) = self.source.as_ref() {
             let rx = source.receiver();
             while let Ok(frame) = rx.try_recv() {
-                self.metrics
-                    .frames_captured
-                    .fetch_add(1, Ordering::Relaxed);
+                self.metrics.record_capture();
+                drained += 1;
                 latest = Some(frame);
             }
+            let drops = rx.dropped_count();
+            if drops > self.last_channel_drops {
+                self.metrics
+                    .record_drop(drops - self.last_channel_drops);
+                self.last_channel_drops = drops;
+            }
         }
+        if drained > 1 {
+            self.metrics.record_coalesced(drained - 1);
+        }
+        self.captures_in_window += drained as u32;
 
         if let Some(ref frame) = latest {
             self.last_frame_at = Instant::now();
@@ -665,9 +711,45 @@ impl App {
         let elapsed = self.fps_window_start.elapsed().as_secs_f32();
         if elapsed >= 0.5 {
             self.overlay.fps = self.frames_in_window as f32 / elapsed;
+            self.overlay.capture_fps = self.captures_in_window as f32 / elapsed;
             self.frames_in_window = 0;
+            self.captures_in_window = 0;
             self.fps_window_start = Instant::now();
         }
+
+        // Refresh process CPU/RAM ~2 Hz (UI thread only).
+        if self.process_sample_at.elapsed() >= Duration::from_millis(500) {
+            let sample = sample_process();
+            self.overlay.ram_mb = sample.rss_bytes as f32 / (1024.0 * 1024.0);
+            self.overlay.cpu_one_core = sample.cpu_one_core;
+            self.process_sample_at = Instant::now();
+        }
+
+        if let Some(start) = self.lag_test_started {
+            self.overlay.lag_test_ms = start.elapsed().as_secs_f32() * 1000.0;
+        }
+        self.overlay.lag_flash = self
+            .lag_flash_until
+            .map(|t| Instant::now() < t)
+            .unwrap_or(false);
+        if self.overlay.lag_flash == false {
+            if let Some(until) = self.lag_flash_until {
+                if Instant::now() >= until {
+                    self.lag_flash_until = None;
+                }
+            }
+        }
+
+        let snap = self.metrics.snapshot();
+        self.overlay.pipeline_delay_ms = snap.last_latency_ms;
+        self.overlay.one_percent_low_fps = snap.one_percent_low_fps;
+        self.overlay.dropped_frames = snap.frames_dropped;
+        self.overlay.frame_times_ms = snap
+            .frame_times_ns
+            .iter()
+            .map(|ns| *ns as f32 / 1_000_000.0)
+            .collect();
+
         self.overlay.frame_w = self.current_format.width;
         self.overlay.frame_h = self.current_format.height;
         self.overlay.label = self
@@ -675,11 +757,28 @@ impl App {
             .as_ref()
             .map(|s| s.info().display_name.clone())
             .unwrap_or_else(|| "—".into());
+        self.overlay.mode_label = match self.selection.mode {
+            CaptureMode::Auto => self.i18n.t("label_mode_auto"),
+            CaptureMode::Game => self.i18n.t("label_mode_game"),
+            CaptureMode::Quality => self.i18n.t("label_mode_quality"),
+            CaptureMode::Economy => self.i18n.t("label_mode_economy"),
+        };
+        let rate = self
+            .current_format
+            .frame_rates
+            .first()
+            .copied()
+            .unwrap_or(self.selection.rate);
+        self.overlay.format_label = format!(
+            "{}×{} {:?} @ {}",
+            self.current_format.width,
+            self.current_format.height,
+            self.current_format.pixel_format,
+            hz_label(rate)
+        );
         self.overlay.no_signal = no_signal;
         self.overlay.soft_black = soft_black;
         self.overlay.level = self.audio.meter().take_peak();
-        self.overlay.estimated_delay_ms =
-            self.audio_ui.buffer_ms + self.audio_ui.delay_ms + 16.0;
         self.overlay.audio_notice = self.audio.status().notice.clone();
         if let Some(until) = self.toast_until {
             if Instant::now() > until {
@@ -687,9 +786,15 @@ impl App {
                 self.toast_until = None;
             }
         }
-        // Hide floating toolbar after 3s without pointer motion (unless settings open).
+        if self.overlay.gpu_name.is_empty() {
+            if let Some(gpu) = self.gpu.as_ref() {
+                self.overlay.gpu_name = gpu.adapter_name.clone();
+            }
+        }
+        // Hide floating toolbar after 3s without pointer motion (unless settings/metrics open).
         if !self.chrome.settings_open
             && !self.chrome.wizard_open
+            && self.overlay.metrics_mode == MetricsMode::Off
             && self.last_pointer_at.elapsed() > Duration::from_secs(3)
         {
             self.chrome.toolbar_visible = false;
@@ -704,6 +809,7 @@ impl App {
         let audio_ui = self.audio_ui.clone();
         let chrome = self.chrome.clone();
         let i18n = self.i18n.clone();
+        // Video presents every tick; egui widgets only draw when chrome/overlay is active.
 
         let mut actions = ui::UiActions::default();
         {
@@ -712,10 +818,15 @@ impl App {
         };
 
         if let Some(frame) = latest {
+            let latency_ns = frame.captured_at.elapsed().as_nanos() as u64;
             if upload_frame(&gpu.device, &gpu.queue, &mut gpu.pipeline, &frame) {
-                self.metrics
-                    .frames_presented
-                    .fetch_add(1, Ordering::Relaxed);
+                let now = Instant::now();
+                let frame_time_ns = self
+                    .last_present_at
+                    .map(|t| now.duration_since(t).as_nanos() as u64)
+                    .unwrap_or(0);
+                self.last_present_at = Some(now);
+                self.metrics.record_present(latency_ns, frame_time_ns);
             }
         }
 
@@ -770,7 +881,14 @@ impl App {
                 .update_texture(&gpu.device, &gpu.queue, *id, delta);
         }
 
-        let clear = if no_signal || soft_black {
+        let clear = if overlay.lag_flash {
+            wgpu::Color {
+                r: 1.0,
+                g: 1.0,
+                b: 1.0,
+                a: 1.0,
+            }
+        } else if no_signal || soft_black {
             wgpu::Color {
                 r: 0.0,
                 g: 0.0,
@@ -893,6 +1011,7 @@ async fn init_gpu(window: Arc<Window>) -> anyhow::Result<GpuState> {
         })
         .await
         .ok_or_else(|| anyhow::anyhow!("no suitable GPU adapter"))?;
+    let adapter_name = adapter.get_info().name;
 
     let (device, queue) = adapter
         .request_device(
@@ -950,5 +1069,6 @@ async fn init_gpu(window: Arc<Window>) -> anyhow::Result<GpuState> {
         egui_renderer,
         egui_state,
         egui_ctx,
+        adapter_name,
     })
 }

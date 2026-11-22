@@ -16,6 +16,25 @@ pub enum SettingsTab {
     Info,
 }
 
+/// F2 cycles: Off → Simple → Detailed → Off.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum MetricsMode {
+    #[default]
+    Off,
+    Simple,
+    Detailed,
+}
+
+impl MetricsMode {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Off => Self::Simple,
+            Self::Simple => Self::Detailed,
+            Self::Detailed => Self::Off,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Impact {
     None,
@@ -45,6 +64,7 @@ impl Impact {
 #[derive(Clone, Debug)]
 pub struct OverlayState {
     pub fps: f32,
+    pub capture_fps: f32,
     pub label: String,
     pub frame_w: u32,
     pub frame_h: u32,
@@ -54,13 +74,27 @@ pub struct OverlayState {
     pub audio_notice: String,
     pub level: f32,
     pub toast: String,
-    pub estimated_delay_ms: f32,
+    /// Display pipeline delay (capture → present), milliseconds.
+    pub pipeline_delay_ms: f32,
+    pub one_percent_low_fps: f32,
+    pub dropped_frames: u64,
+    pub frame_times_ms: Vec<f32>,
+    pub gpu_name: String,
+    pub cpu_one_core: f32,
+    pub ram_mb: f32,
+    pub mode_label: String,
+    pub format_label: String,
+    pub metrics_mode: MetricsMode,
+    pub lag_test_running: bool,
+    pub lag_test_ms: f32,
+    pub lag_flash: bool,
 }
 
 impl Default for OverlayState {
     fn default() -> Self {
         Self {
             fps: 0.0,
+            capture_fps: 0.0,
             label: String::new(),
             frame_w: 0,
             frame_h: 0,
@@ -70,7 +104,19 @@ impl Default for OverlayState {
             audio_notice: String::new(),
             level: 0.0,
             toast: String::new(),
-            estimated_delay_ms: 30.0,
+            pipeline_delay_ms: 0.0,
+            one_percent_low_fps: 0.0,
+            dropped_frames: 0,
+            frame_times_ms: Vec::new(),
+            gpu_name: String::new(),
+            cpu_one_core: 0.0,
+            ram_mb: 0.0,
+            mode_label: String::new(),
+            format_label: String::new(),
+            metrics_mode: MetricsMode::Off,
+            lag_test_running: false,
+            lag_test_ms: 0.0,
+            lag_flash: false,
         }
     }
 }
@@ -143,12 +189,16 @@ pub struct UiActions {
     pub wizard_skip: bool,
     pub wizard_finish: bool,
     pub show_toolbar: bool,
+    pub cycle_metrics: bool,
+    pub lag_test_start: bool,
+    pub lag_test_stop: bool,
 }
 
 pub struct DrawInput<'a> {
     pub i18n: &'a I18n,
     pub devices: &'a [DeviceInfo],
     pub selection: &'a UiSelection,
+    #[allow(dead_code)]
     pub current: &'a FormatDesc,
     pub overlay: &'a OverlayState,
     pub inputs: &'a [AudioDeviceInfo],
@@ -173,7 +223,7 @@ pub fn draw_ui(ctx: &Context, input: DrawInput<'_>) -> UiActions {
             actions.open_settings = Some(SettingsTab::Image);
         }
         if i.key_pressed(Key::F2) {
-            actions.open_settings = Some(SettingsTab::Info);
+            actions.cycle_metrics = true;
         }
         if i.key_pressed(Key::F11) {
             actions.toggle_fullscreen = true;
@@ -189,6 +239,10 @@ pub fn draw_ui(ctx: &Context, input: DrawInput<'_>) -> UiActions {
     if input.chrome.wizard_open {
         draw_wizard(ctx, i18n, input.devices, input.selection, input.outputs, input.audio, input.chrome, &mut actions);
         return actions;
+    }
+
+    if input.overlay.metrics_mode != MetricsMode::Off {
+        draw_metrics_overlay(ctx, i18n, input.overlay);
     }
 
     if input.chrome.toolbar_visible {
@@ -681,20 +735,132 @@ fn draw_effects_tab(ui: &mut egui::Ui, input: &DrawInput<'_>) {
 fn draw_info_tab(ui: &mut egui::Ui, input: &DrawInput<'_>, actions: &mut UiActions) {
     let i18n = input.i18n;
     let o = input.overlay;
-    ui.label(format!("{}: {:.0}", i18n.t("label_fps"), o.fps));
-    ui.label(format!(
-        "{}: ~{:.0} ms",
-        i18n.t("label_latency"),
-        o.estimated_delay_ms
-    ));
-    ui.label(format!("{}×{} · {}", o.frame_w, o.frame_h, o.label));
-    ui.label(format!("{:?}", input.current.pixel_format));
+    ui.label(RichText::new(i18n.t("metrics_disclaimer")).small().weak());
+    ui.add_space(4.0);
+    draw_metrics_body(ui, i18n, o, true);
+    ui.add_space(8.0);
+    ui.separator();
+    ui.label(i18n.t("lag_test_title"));
+    ui.label(RichText::new(i18n.t("lag_test_body")).small());
+    ui.horizontal(|ui| {
+        if !o.lag_test_running {
+            if ui.button(i18n.t("btn_lag_start")).clicked() {
+                actions.lag_test_start = true;
+            }
+        } else {
+            ui.label(format!(
+                "{}: {:.0} ms",
+                i18n.t("label_lag_timer"),
+                o.lag_test_ms
+            ));
+            if ui.button(i18n.t("btn_lag_stop")).clicked() {
+                actions.lag_test_stop = true;
+            }
+        }
+    });
     ui.add_space(8.0);
     if ui.button(i18n.t("btn_copy_support")).clicked() {
         actions.copy_support = true;
     }
     if ui.button(i18n.t("btn_retry")).clicked() {
         actions.retry = true;
+    }
+}
+
+fn draw_metrics_overlay(ctx: &Context, i18n: &I18n, overlay: &OverlayState) {
+    egui::Area::new(egui::Id::new("metrics_overlay"))
+        .anchor(egui::Align2::LEFT_TOP, [12.0, 12.0])
+        .order(egui::Order::Foreground)
+        .show(ctx, |ui| {
+            egui::Frame::NONE
+                .fill(Color32::from_rgba_unmultiplied(12, 14, 18, 200))
+                .corner_radius(egui::CornerRadius::same(8))
+                .inner_margin(egui::Margin::symmetric(10, 10))
+                .show(ui, |ui| {
+                    let detailed = overlay.metrics_mode == MetricsMode::Detailed;
+                    let title = if detailed {
+                        i18n.t("metrics_detailed")
+                    } else {
+                        i18n.t("metrics_simple")
+                    };
+                    ui.label(RichText::new(title).strong());
+                    draw_metrics_body(ui, i18n, overlay, detailed);
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(i18n.t("metrics_disclaimer"))
+                            .small()
+                            .weak(),
+                    );
+                });
+        });
+}
+
+fn draw_metrics_body(ui: &mut egui::Ui, i18n: &I18n, o: &OverlayState, detailed: bool) {
+    ui.label(format!(
+        "{}: {:.0}  ·  {}: {:.0} ms",
+        i18n.t("label_fps"),
+        o.fps,
+        i18n.t("label_pipeline_delay"),
+        o.pipeline_delay_ms
+    ));
+    if !detailed {
+        return;
+    }
+    ui.label(format!(
+        "{}: {:.0}  ·  {}: {:.0}",
+        i18n.t("label_capture_fps"),
+        o.capture_fps,
+        i18n.t("label_display_fps"),
+        o.fps
+    ));
+    ui.label(format!(
+        "{}: {:.0}  ·  {}: {}",
+        i18n.t("label_one_percent_low"),
+        o.one_percent_low_fps,
+        i18n.t("label_dropped"),
+        o.dropped_frames
+    ));
+    ui.label(format!(
+        "{}: {:.0}%  ·  {}: {:.0} Mo",
+        i18n.t("label_cpu"),
+        o.cpu_one_core * 100.0,
+        i18n.t("label_ram"),
+        o.ram_mb
+    ));
+    ui.label(format!("{}: {}", i18n.t("label_gpu"), o.gpu_name));
+    ui.label(format!("{}: {}", i18n.t("label_active_mode"), o.mode_label));
+    ui.label(format!("{}: {}", i18n.t("label_active_format"), o.format_label));
+    ui.add_space(4.0);
+    ui.label(i18n.t("label_frame_graph"));
+    let times = &o.frame_times_ms;
+    if times.is_empty() {
+        ui.weak("—");
+    } else {
+        let max_ms = times.iter().copied().fold(1.0f32, f32::max).max(20.0);
+        let (rect, _resp) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width().min(280.0), 48.0),
+            Sense::hover(),
+        );
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 2.0, Color32::from_rgb(24, 28, 34));
+        let n = times.len().max(1) as f32;
+        for (i, &ms) in times.iter().enumerate() {
+            let x0 = rect.left() + rect.width() * (i as f32 / n);
+            let x1 = rect.left() + rect.width() * ((i as f32 + 1.0) / n);
+            let h = (ms / max_ms).clamp(0.0, 1.0) * rect.height();
+            let bar = egui::Rect::from_min_max(
+                egui::pos2(x0, rect.bottom() - h),
+                egui::pos2(x1.max(x0 + 1.0), rect.bottom()),
+            );
+            let color = if ms > 25.0 {
+                Color32::from_rgb(220, 100, 90)
+            } else if ms > 18.0 {
+                Color32::from_rgb(220, 180, 80)
+            } else {
+                Color32::from_rgb(90, 180, 140)
+            };
+            painter.rect_filled(bar, 0.0, color);
+        }
     }
 }
 

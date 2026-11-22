@@ -544,7 +544,6 @@ impl VideoSource for MfVideoSource {
                     );
 
                     let expected = plane_size(delivered, width, height);
-                    let start = Instant::now();
                     let stream = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32;
                     while running.load(Ordering::Relaxed) {
                         let mut flags = 0u32;
@@ -572,7 +571,7 @@ impl VideoSource for MfVideoSource {
                         match copy_sample_to_pool(&sample, &pool, expected) {
                             Ok(data) => {
                                 let frame = VideoFrame {
-                                    timestamp_ns: start.elapsed().as_nanos() as u64,
+                                    captured_at: Instant::now(),
                                     width,
                                     height,
                                     pixel_format: delivered,

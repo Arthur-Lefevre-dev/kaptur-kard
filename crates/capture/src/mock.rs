@@ -119,8 +119,9 @@ impl VideoSource for MockVideoSource {
 
                         let idx = frame_index.fetch_add(1, Ordering::Relaxed);
                         let data = render_mock_frame(&pool, width, height, idx);
+                        let _ = start; // period pacing uses `next`; Instant on the frame is absolute.
                         let frame = VideoFrame {
-                            timestamp_ns: start.elapsed().as_nanos() as u64,
+                            captured_at: Instant::now(),
                             width,
                             height,
                             pixel_format: PixelFormat::Bgra8,

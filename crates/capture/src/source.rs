@@ -1,4 +1,6 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError as CrossbeamTryRecv};
 use thiserror::Error;
@@ -29,7 +31,8 @@ pub enum CaptureError {
 
 #[derive(Clone, Debug)]
 pub struct VideoFrame {
-    pub timestamp_ns: u64,
+    /// Capture-side Instant used for display-pipeline delay (→ present).
+    pub captured_at: Instant,
     pub width: u32,
     pub height: u32,
     pub pixel_format: crate::format::PixelFormat,
@@ -41,6 +44,7 @@ pub struct VideoFrame {
 #[derive(Clone)]
 pub struct FrameReceiver {
     inner: Receiver<VideoFrame>,
+    drops: Arc<AtomicU64>,
 }
 
 impl FrameReceiver {
@@ -50,6 +54,11 @@ impl FrameReceiver {
             Err(CrossbeamTryRecv::Empty) => Err(TryRecvError::Empty),
             Err(CrossbeamTryRecv::Disconnected) => Err(TryRecvError::Disconnected),
         }
+    }
+
+    /// Frames discarded by drop-oldest on the producer side.
+    pub fn dropped_count(&self) -> u64 {
+        self.drops.load(Ordering::Relaxed)
     }
 }
 
@@ -65,19 +74,27 @@ pub struct FrameSender {
     tx: Sender<VideoFrame>,
     /// Extra receiver used only to drain the oldest slot under pressure.
     drain: Receiver<VideoFrame>,
+    drops: Arc<AtomicU64>,
 }
 
 impl FrameSender {
+    /// Returns true if the frame was accepted (possibly after dropping oldest).
     pub fn send_drop_oldest(&self, frame: VideoFrame) -> bool {
         match self.tx.try_send(frame) {
             Ok(()) => true,
             Err(crossbeam_channel::TrySendError::Full(frame)) => {
                 // Drop oldest, then push the newest frame.
-                let _ = self.drain.try_recv();
+                if self.drain.try_recv().is_ok() {
+                    self.drops.fetch_add(1, Ordering::Relaxed);
+                }
                 self.tx.try_send(frame).is_ok()
             }
             Err(crossbeam_channel::TrySendError::Disconnected(_)) => false,
         }
+    }
+
+    pub fn dropped_count(&self) -> u64 {
+        self.drops.load(Ordering::Relaxed)
     }
 }
 
@@ -85,9 +102,14 @@ impl FrameSender {
 pub fn frame_channel() -> (FrameSender, FrameReceiver) {
     let (tx, rx) = bounded(FRAME_CHANNEL_DEPTH);
     let drain = rx.clone();
+    let drops = Arc::new(AtomicU64::new(0));
     (
-        FrameSender { tx, drain },
-        FrameReceiver { inner: rx },
+        FrameSender {
+            tx,
+            drain,
+            drops: drops.clone(),
+        },
+        FrameReceiver { inner: rx, drops },
     )
 }
 
@@ -97,4 +119,35 @@ pub trait VideoSource: Send {
     fn stop(&mut self) -> Result<(), CaptureError>;
     /// Non-blocking poll handle into the capture thread queue.
     fn receiver(&self) -> FrameReceiver;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::format::PixelFormat;
+    use crate::pool::BufferPool;
+
+    #[test]
+    fn drop_oldest_increments_counter() {
+        let (tx, rx) = frame_channel();
+        let pool = BufferPool::new();
+        for _ in 0..(FRAME_CHANNEL_DEPTH + 3) {
+            let data = pool.take(16).into_arc();
+            let frame = VideoFrame {
+                captured_at: Instant::now(),
+                width: 2,
+                height: 2,
+                pixel_format: PixelFormat::Bgra8,
+                data,
+            };
+            assert!(tx.send_drop_oldest(frame));
+        }
+        assert!(rx.dropped_count() >= 3);
+        // Receiver can still drain remaining slots.
+        let mut n = 0;
+        while rx.try_recv().is_ok() {
+            n += 1;
+        }
+        assert_eq!(n, FRAME_CHANNEL_DEPTH);
+    }
 }
