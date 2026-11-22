@@ -23,12 +23,20 @@ static LOG_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
 const TAIL_BYTES: u64 = 24 * 1024;
 const KEEP_LOG_FILES: usize = 14;
 
+/// Default filter: app level + mute Vulkan loader / OBS-Overwolf layer spam.
+fn build_filter(level: &str) -> EnvFilter {
+    let directive = format!(
+        "{level},wgpu_hal::vulkan::instance=error,wgpu_hal::vulkan::conv=warn,naga=warn,wgpu_core=warn"
+    );
+    EnvFilter::try_new(&directive).unwrap_or_else(|_| EnvFilter::new(level))
+}
+
 /// Install stderr + daily file layers. Safe to call once at process start.
 pub fn init() {
     let prefs_level = normalize_level(&load_ui_prefs().log_level);
     let filter = match EnvFilter::try_from_default_env() {
         Ok(f) => f,
-        Err(_) => EnvFilter::new(prefs_level),
+        Err(_) => build_filter(prefs_level),
     };
 
     let (filter_layer, handle) = reload::Layer::new(filter);
@@ -94,9 +102,10 @@ pub fn set_level(level: &str) -> bool {
     };
     let filter = if std::env::var_os("RUST_LOG").is_some() {
         // Prefer live RUST_LOG string if the user set it; else prefs level.
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(normalize_level(level)))
+        EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| build_filter(normalize_level(level)))
     } else {
-        EnvFilter::new(normalize_level(level))
+        build_filter(normalize_level(level))
     };
     match handle.reload(filter) {
         Ok(()) => {

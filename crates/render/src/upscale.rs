@@ -836,9 +836,12 @@ impl UpscaleEngine {
 
         // UI 0=soft … 1=sharp → AMD RCAS stops (0=sharpest). Map into ~0..2 stops.
         // con.x = exp2(-stops); con.y = CaptureView gain (≥1) for visible A/B.
-        let stops = (1.0 - self.sharpness) * 2.0;
+        // Map UI into fewer AMD stops so mid Netteté (0.6) already bites.
+        // UI 0 → 2.0 stops, UI 1 → 0 stops (max).
+        let stops = (1.0 - self.sharpness) * 1.5;
         let con_x = (-stops).exp2();
-        let gain = 1.0 + self.sharpness * self.sharpness * 0.85;
+        // Extra gain so Off↔Mode A is obvious even at ~0.6 on soft HDMI.
+        let gain = 1.0 + self.sharpness * 1.15;
         let rcas_con = RcasGpu {
             con: [con_x, gain, 0.0, 0.0],
             size: [out_w as f32, out_h as f32, 0.0, 0.0],
@@ -1177,21 +1180,22 @@ mod tests {
     fn rcas_con_stronger_when_ui_sharpness_higher() {
         // UI 1 = sharpest → stops 0 → con 1; UI 0 = soft → smaller con.
         let con = |s: f32| {
-            let stops = (1.0 - s) * 2.0;
+            let stops = (1.0 - s) * 1.5;
             (-stops).exp2()
         };
         assert!((con(1.0) - 1.0).abs() < 1e-5);
         assert!(con(1.0) > con(0.5));
         assert!(con(0.5) > con(0.0));
+        // Mid Netteté must stay strong enough to see vs Off.
+        assert!(con(0.6) > 0.5);
     }
 
     #[test]
     fn rcas_gain_ramps_with_sharpness() {
-        // CaptureView gain makes Netteté 0.7–1 visibly stronger than mid.
-        let gain = |s: f32| 1.0 + s * s * 0.85;
+        let gain = |s: f32| 1.0 + s * 1.15;
         assert!((gain(0.0) - 1.0).abs() < 1e-5);
-        assert!(gain(1.0) > gain(0.7));
-        assert!(gain(0.7) > gain(0.4));
+        assert!(gain(1.0) > gain(0.6));
+        assert!(gain(0.6) > 1.5);
     }
 
     #[test]

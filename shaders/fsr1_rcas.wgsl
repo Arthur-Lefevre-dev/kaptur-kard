@@ -98,12 +98,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         (lobe * b.b + lobe * d.b + lobe * f.b + lobe * hp.b + e.b) * rcp_l,
     );
 
-    // Extra high-frequency unsharp at high UI sharpness so A/B is obvious on
-    // soft HDMI captures (RCAS alone can still look subtle on already-sharp 1:1).
-    let usm_w = clamp((params.con.x - 0.35) * 1.4, 0.0, 1.0) * (gain - 1.0 + params.con.x);
-    if (usm_w > 0.001) {
+    // Extra high-frequency unsharp so Off↔Mode A is obvious on soft HDMI
+    // (RCAS alone can look subtle at 1:1). Strength tracks con.x + gain.
+    let usm_w = clamp(params.con.x * (0.45 + 0.55 * (gain - 1.0)), 0.0, 1.35);
+    if (usm_w > 0.02) {
         let blur = (b + d + f + hp) * 0.25;
-        outc = clamp(outc + (e - blur) * (0.55 * usm_w), vec3<f32>(0.0), vec3<f32>(1.0));
+        outc = clamp(outc + (e - blur) * (0.75 * usm_w), vec3<f32>(0.0), vec3<f32>(1.0));
     } else {
         outc = clamp(outc, vec3<f32>(0.0), vec3<f32>(1.0));
     }
