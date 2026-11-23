@@ -11,8 +11,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use capture::{PixelFormat, PooledBytes, VideoFrame};
 
 use crate::pixel_convert::{
-    downsample_bgra, downsample_nv12, frame_to_bgra_scaled, nv12_to_bgra_scaled, stored_size,
-    yuy2_to_bgra,
+    bgra_to_rgba_thumb, downsample_bgra, downsample_nv12, frame_to_bgra_scaled, nv12_to_bgra_scaled,
+    stored_size, yuy2_to_bgra,
 };
 use crate::prefs::app_data_dir;
 
@@ -24,6 +24,23 @@ const MAX_STORE_WIDTH: u32 = 1920;
 const ENCODE_CRF: &str = "18";
 /// MJPEG fallback quality (1–100).
 const MJPEG_QUALITY: u8 = 95;
+/// Target sample rate for the ring (~20 fps). Capture may be 60/120; encode uses this cadence.
+const SAMPLE_GAP_MS: u64 = 50;
+/// Toast / list thumbnail max width.
+const THUMB_MAX_W: u32 = 160;
+
+/// Hide console windows for helper processes (ffmpeg / where) under `windows_subsystem = "windows"`.
+#[cfg(windows)]
+fn silence_window(cmd: &mut Command) -> &mut Command {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    cmd.creation_flags(CREATE_NO_WINDOW)
+}
+
+#[cfg(not(windows))]
+fn silence_window(cmd: &mut Command) -> &mut Command {
+    cmd
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StoredFormat {
@@ -47,6 +64,18 @@ pub struct ClipEntry {
     pub path: PathBuf,
     pub size_bytes: u64,
     pub is_dir: bool,
+    /// First-frame JPEG next to the clip (`clip-….jpg`), when present.
+    pub thumb_path: Option<PathBuf>,
+}
+
+/// Result of a background clip encode (path + metadata for UI).
+#[derive(Clone, Debug)]
+pub struct EncodeOutcome {
+    pub path: PathBuf,
+    pub thumb_path: Option<PathBuf>,
+    /// Frame rate written into the container (buffer sample rate, not capture FPS).
+    pub encode_fps: f32,
+    pub frame_count: usize,
 }
 
 pub struct ReplayBuffer {
@@ -68,7 +97,7 @@ impl Default for ReplayBuffer {
             bytes: 0,
             last_push: Instant::now() - Duration::from_secs(1),
             // ~20 fps sample — enough for a clip, cheap on the capture path.
-            min_gap: Duration::from_millis(50),
+            min_gap: Duration::from_millis(SAMPLE_GAP_MS),
         }
     }
 }
@@ -96,6 +125,31 @@ impl ReplayBuffer {
 
     pub fn frame_count(&self) -> usize {
         self.frames.len()
+    }
+
+    /// Target sample rate for the ring (~20). Capture source FPS is independent.
+    pub fn sample_fps_target(&self) -> f32 {
+        1000.0 / self.min_gap.as_millis().max(1) as f32
+    }
+
+    /// Measured spacing of frames currently in the ring (encode uses this).
+    pub fn buffer_sample_fps(&self) -> f32 {
+        if self.frames.len() < 2 {
+            return self.sample_fps_target();
+        }
+        let first = self.frames.front().unwrap();
+        let last = self.frames.back().unwrap();
+        let dt = last.at.duration_since(first.at);
+        if dt.as_secs_f32() <= 0.001 {
+            return self.sample_fps_target();
+        }
+        ((self.frames.len() - 1) as f32 / dt.as_secs_f32()).clamp(10.0, 60.0)
+    }
+
+    pub fn time_range(&self) -> Option<(Instant, Instant)> {
+        let first = self.frames.front()?;
+        let last = self.frames.back()?;
+        Some((first.at, last.at))
     }
 
     pub fn clear(&mut self) {
@@ -146,26 +200,31 @@ impl ReplayBuffer {
 
     /// Clone buffered frames for a background encode (Arc pixel data — cheap).
     /// Does not block present/capture; caller must encode off the UI thread.
-    pub fn snapshot_for_encode(&self) -> Result<ReplaySnapshot, String> {
+    pub fn snapshot_for_encode(
+        &self,
+        audio: Option<audio::AudioClipSnapshot>,
+    ) -> Result<ReplaySnapshot, String> {
         if self.frames.is_empty() {
             return Err("replay buffer empty".into());
         }
         Ok(ReplaySnapshot {
             frames: self.frames.iter().cloned().collect(),
+            audio,
         })
     }
 
     /// Encode buffered frames to a video file under `%APPDATA%/CaptureView/clips/`.
     /// Prefers ffmpeg H.264 `.mp4`; falls back to in-process MJPEG `.avi`.
     /// Prefer [`Self::snapshot_for_encode`] + [`ReplaySnapshot::encode`] on a worker.
-    pub fn save_clip(&self) -> Result<PathBuf, String> {
-        self.snapshot_for_encode()?.encode()
+    pub fn save_clip(&self) -> Result<EncodeOutcome, String> {
+        self.snapshot_for_encode(None)?.encode()
     }
 }
 
 /// Owned ring snapshot for off-thread encode (keeps UI / present free).
 pub struct ReplaySnapshot {
     frames: Vec<StoredFrame>,
+    audio: Option<audio::AudioClipSnapshot>,
 }
 
 impl ReplaySnapshot {
@@ -173,13 +232,27 @@ impl ReplaySnapshot {
         self.frames.len()
     }
 
+    pub fn encode_fps_estimate(&self) -> f32 {
+        estimate_fps_slice(&self.frames).clamp(10.0, 60.0)
+    }
+
+    /// First buffered frame as a small RGBA thumb for the clip toast / list.
+    pub fn first_frame_thumb_rgba(&self) -> Option<(u32, u32, Vec<u8>)> {
+        let frame = self.frames.first()?;
+        let bgra = stored_to_bgra(frame)?;
+        bgra_to_rgba_thumb(&bgra, frame.width, frame.height, THUMB_MAX_W)
+    }
+
     /// Encode to `%APPDATA%/CaptureView/clips/` — safe to call from a background thread.
-    pub fn encode(self) -> Result<PathBuf, String> {
-        encode_frames(&self.frames)
+    pub fn encode(self) -> Result<EncodeOutcome, String> {
+        encode_frames(&self.frames, self.audio.as_ref())
     }
 }
 
-fn encode_frames(frames: &[StoredFrame]) -> Result<PathBuf, String> {
+fn encode_frames(
+    frames: &[StoredFrame],
+    audio: Option<&audio::AudioClipSnapshot>,
+) -> Result<EncodeOutcome, String> {
     if frames.is_empty() {
         return Err("replay buffer empty".into());
     }
@@ -193,6 +266,7 @@ fn encode_frames(frames: &[StoredFrame]) -> Result<PathBuf, String> {
     let w = frames[0].width;
     let h = frames[0].height;
     let fps = estimate_fps_slice(frames).clamp(10.0, 60.0);
+    let frame_count = frames.len();
 
     // Materialize BGRA once (encode path only — not on the capture hot path).
     let mut bgra_frames: Vec<Vec<u8>> = Vec::with_capacity(frames.len());
@@ -201,10 +275,19 @@ fn encode_frames(frames: &[StoredFrame]) -> Result<PathBuf, String> {
         bgra_frames.push(bgra);
     }
 
+    let thumb_path = write_clip_thumb(&root, stamp, w, h, &bgra_frames[0]);
+
     let mp4 = root.join(format!("clip-{stamp}.mp4"));
     if let Some(ffmpeg) = find_ffmpeg() {
-        match encode_mp4_ffmpeg(&ffmpeg, &mp4, w, h, fps, &bgra_frames) {
-            Ok(()) => return Ok(mp4),
+        match encode_mp4_ffmpeg(&ffmpeg, &mp4, w, h, fps, &bgra_frames, audio) {
+            Ok(()) => {
+                return Ok(EncodeOutcome {
+                    path: mp4,
+                    thumb_path,
+                    encode_fps: fps,
+                    frame_count,
+                });
+            }
             Err(e) => {
                 tracing::warn!(error = %e, "ffmpeg encode failed; falling back to MJPEG AVI");
                 let _ = fs::remove_file(&mp4);
@@ -216,7 +299,30 @@ fn encode_frames(frames: &[StoredFrame]) -> Result<PathBuf, String> {
 
     let avi = root.join(format!("clip-{stamp}.avi"));
     encode_mjpeg_avi(&avi, w, h, fps, &bgra_frames)?;
-    Ok(avi)
+    Ok(EncodeOutcome {
+        path: avi,
+        thumb_path,
+        encode_fps: fps,
+        frame_count,
+    })
+}
+
+fn write_clip_thumb(
+    root: &Path,
+    stamp: u64,
+    w: u32,
+    h: u32,
+    bgra: &[u8],
+) -> Option<PathBuf> {
+    let (tw, th, rgba) = bgra_to_rgba_thumb(bgra, w, h, THUMB_MAX_W)?;
+    let path = root.join(format!("clip-{stamp}.jpg"));
+    let mut jpeg = Vec::new();
+    let mut cursor = std::io::Cursor::new(&mut jpeg);
+    let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut cursor, 85);
+    enc.encode(&rgba, tw, th, image::ExtendedColorType::Rgba8)
+        .ok()?;
+    fs::write(&path, jpeg).ok()?;
+    Some(path)
 }
 
 pub fn clips_dir() -> Option<PathBuf> {
@@ -297,15 +403,49 @@ pub fn list_clips() -> Vec<ClipEntry> {
             .as_ref()
             .and_then(|m| m.modified().ok())
             .unwrap_or(SystemTime::UNIX_EPOCH);
-        out.push((modified, ClipEntry {
-            name,
-            path,
-            size_bytes,
-            is_dir,
-        }));
+        let thumb_path = if is_file {
+            companion_thumb_path(&path).filter(|p| p.is_file())
+        } else if is_dir {
+            // Legacy PNG sequence: use first frame_*.png if present.
+            first_png_in_dir(&path)
+        } else {
+            None
+        };
+        out.push((
+            modified,
+            ClipEntry {
+                name,
+                path,
+                size_bytes,
+                is_dir,
+                thumb_path,
+            },
+        ));
     }
     out.sort_by(|a, b| b.0.cmp(&a.0));
     out.into_iter().map(|(_, e)| e).collect()
+}
+
+fn companion_thumb_path(video: &Path) -> Option<PathBuf> {
+    let stem = video.file_stem()?.to_str()?;
+    let parent = video.parent()?;
+    Some(parent.join(format!("{stem}.jpg")))
+}
+
+fn first_png_in_dir(dir: &Path) -> Option<PathBuf> {
+    let mut pngs: Vec<PathBuf> = fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.eq_ignore_ascii_case("png"))
+                .unwrap_or(false)
+        })
+        .collect();
+    pngs.sort();
+    pngs.into_iter().next()
 }
 
 pub fn delete_clip(path: &Path) -> Result<(), String> {
@@ -316,6 +456,9 @@ pub fn delete_clip(path: &Path) -> Result<(), String> {
     let canon = path.canonicalize().map_err(|e| e.to_string())?;
     if !canon.starts_with(&canon_root) {
         return Err("path outside clips dir".into());
+    }
+    if let Some(thumb) = companion_thumb_path(&canon) {
+        let _ = fs::remove_file(thumb);
     }
     if canon.is_dir() {
         fs::remove_dir_all(&canon).map_err(|e| e.to_string())
@@ -337,7 +480,9 @@ pub fn play_clip(path: &Path) {
     }
     #[cfg(windows)]
     {
-        let _ = Command::new("cmd")
+        let mut cmd = Command::new("cmd");
+        silence_window(&mut cmd);
+        let _ = cmd
             .args(["/C", "start", "", &path.to_string_lossy()])
             .spawn();
     }
@@ -469,10 +614,9 @@ fn find_ffmpeg() -> Option<PathBuf> {
 fn which_ffmpeg() -> Result<PathBuf, ()> {
     #[cfg(windows)]
     {
-        let out = Command::new("where")
-            .arg("ffmpeg")
-            .output()
-            .map_err(|_| ())?;
+        let mut cmd = Command::new("where");
+        silence_window(&mut cmd);
+        let out = cmd.arg("ffmpeg").output().map_err(|_| ())?;
         if !out.status.success() {
             return Err(());
         }
@@ -510,6 +654,26 @@ fn which_ffmpeg() -> Result<PathBuf, ()> {
     }
 }
 
+fn write_temp_pcm_f32le(audio: &audio::AudioClipSnapshot) -> Result<PathBuf, String> {
+    if audio.samples.is_empty() || audio.sample_rate == 0 {
+        return Err("empty audio".into());
+    }
+    let root = clips_dir().ok_or_else(|| "no app data dir".to_string())?;
+    let path = root.join(format!(
+        ".clip-audio-{}.f32le",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
+    ));
+    let mut bytes = Vec::with_capacity(audio.samples.len() * 4);
+    for s in &audio.samples {
+        bytes.extend_from_slice(&s.to_le_bytes());
+    }
+    fs::write(&path, bytes).map_err(|e| e.to_string())?;
+    Ok(path)
+}
+
 fn encode_mp4_ffmpeg(
     ffmpeg: &Path,
     out: &Path,
@@ -517,33 +681,69 @@ fn encode_mp4_ffmpeg(
     h: u32,
     fps: f32,
     frames: &[Vec<u8>],
+    audio: Option<&audio::AudioClipSnapshot>,
 ) -> Result<(), String> {
-    let mut child = Command::new(ffmpeg)
-        .args([
-            "-y",
-            "-f",
-            "rawvideo",
-            "-pix_fmt",
-            "bgra",
-            "-s",
-            &format!("{w}x{h}"),
-            "-r",
-            &format!("{fps:.3}"),
-            "-i",
-            "pipe:0",
-            "-an",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "faster",
-            "-crf",
-            ENCODE_CRF,
-            "-pix_fmt",
-            "yuv420p",
-            "-movflags",
-            "+faststart",
-            out.to_str().ok_or("bad out path")?,
-        ])
+    let audio_path = audio
+        .filter(|a| a.samples.len() >= 64)
+        .and_then(|a| write_temp_pcm_f32le(a).ok());
+    let audio_rate = audio.map(|a| a.sample_rate).unwrap_or(48_000);
+
+    let mut args: Vec<String> = vec![
+        "-y".into(),
+        "-f".into(),
+        "rawvideo".into(),
+        "-pix_fmt".into(),
+        "bgra".into(),
+        "-s".into(),
+        format!("{w}x{h}"),
+        "-r".into(),
+        format!("{fps:.3}"),
+        "-i".into(),
+        "pipe:0".into(),
+    ];
+    if let Some(ref pcm) = audio_path {
+        args.extend([
+            "-f".into(),
+            "f32le".into(),
+            "-ar".into(),
+            audio_rate.to_string(),
+            "-ac".into(),
+            "2".into(),
+            "-i".into(),
+            pcm.to_string_lossy().into_owned(),
+        ]);
+    }
+    args.extend([
+        "-c:v".into(),
+        "libx264".into(),
+        "-preset".into(),
+        "faster".into(),
+        "-crf".into(),
+        ENCODE_CRF.into(),
+        "-pix_fmt".into(),
+        "yuv420p".into(),
+    ]);
+    if audio_path.is_some() {
+        args.extend([
+            "-c:a".into(),
+            "aac".into(),
+            "-b:a".into(),
+            "192k".into(),
+            "-shortest".into(),
+        ]);
+    } else {
+        args.push("-an".into());
+    }
+    args.extend([
+        "-movflags".into(),
+        "+faststart".into(),
+        out.to_str().ok_or("bad out path")?.into(),
+    ]);
+
+    let mut cmd = Command::new(ffmpeg);
+    silence_window(&mut cmd);
+    let mut child = cmd
+        .args(&args)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -558,6 +758,9 @@ fn encode_mp4_ffmpeg(
         let need = (w as usize).saturating_mul(h as usize).saturating_mul(4);
         for frame in frames {
             if frame.len() < need {
+                if let Some(p) = &audio_path {
+                    let _ = fs::remove_file(p);
+                }
                 return Err("bgra frame short".into());
             }
             stdin
@@ -568,6 +771,9 @@ fn encode_mp4_ffmpeg(
     let output = child
         .wait_with_output()
         .map_err(|e| format!("ffmpeg wait: {e}"))?;
+    if let Some(p) = &audio_path {
+        let _ = fs::remove_file(p);
+    }
     if !output.status.success() {
         let err = String::from_utf8_lossy(&output.stderr);
         return Err(format!(
@@ -794,10 +1000,14 @@ mod tests {
         if clips_dir().is_none() {
             return;
         }
-        let path = buf.save_clip().expect("encode");
-        assert!(path.exists());
-        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        let outcome = buf.save_clip().expect("encode");
+        assert!(outcome.path.exists());
+        let ext = outcome
+            .path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
         assert!(ext == "mp4" || ext == "avi", "got {ext}");
-        let _ = delete_clip(&path);
+        let _ = delete_clip(&outcome.path);
     }
 }

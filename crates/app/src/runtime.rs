@@ -10,7 +10,7 @@ use crossbeam_channel::{Receiver, TryRecvError};
 
 use audio::{
     list_inputs, list_outputs, suggest_input_for_video, AudioDeviceInfo, AudioEngine,
-    AudioEngineConfig, NONE_INPUT_ID,
+    AudioEngineConfig, AudioReplayTap, SharedReplayTap, NONE_INPUT_ID,
 };
 use capture::{
     hz_label, modes, CaptureError, CaptureMode, DeviceInfo, FormatDesc, FrameReceiver, FrameWake,
@@ -221,7 +221,14 @@ pub struct App {
     hotplug_rx: Option<Receiver<HotplugResult>>,
     hotplug_inflight: bool,
     /// Background clip encode result (never block UI / present on ffmpeg).
-    clip_save_rx: Option<Receiver<Result<std::path::PathBuf, String>>>,
+    clip_save_rx: Option<Receiver<Result<replay::EncodeOutcome, String>>>,
+    /// Shared PCM tap filled by the audio engine for clip mux.
+    audio_replay_tap: SharedReplayTap,
+    /// RGBA thumb shown on the top-left clip toast (cleared with the toast).
+    clip_toast_thumb: Option<(u32, u32, Vec<u8>)>,
+    clip_toast_tex: Option<egui::TextureHandle>,
+    /// Cached egui textures for Clips-tab first-frame thumbs (keyed by path).
+    clip_thumb_tex: HashMap<std::path::PathBuf, egui::TextureHandle>,
     /// Throttle expensive metrics percentile / graph copy (UI only).
     last_metrics_ui_at: Instant,
     cached_one_percent_low: f32,
@@ -419,6 +426,13 @@ impl Default for App {
         let mut replay = ReplayBuffer::default();
         replay.set_enabled(ui_prefs.replay_enabled);
         replay.set_seconds(ui_prefs.replay_seconds);
+        let audio_replay_tap = AudioReplayTap::new_shared();
+        {
+            let mut tap = audio_replay_tap.lock();
+            tap.configure(ui_prefs.replay_enabled, ui_prefs.replay_seconds, 48_000);
+        }
+        let mut audio = AudioEngine::new();
+        audio.set_replay_tap(Some(std::sync::Arc::clone(&audio_replay_tap)));
         let mut health = HealthMonitor::default();
         health.prefs = ui_prefs.health.clone();
         let mut export = FrameExport::default();
@@ -468,7 +482,7 @@ impl Default for App {
             last_channel_drops: 0,
             black_since: None,
             running: false,
-            audio: AudioEngine::new(),
+            audio,
             audio_inputs,
             audio_outputs,
             audio_ui,
@@ -500,6 +514,10 @@ impl Default for App {
             hotplug_rx: None,
             hotplug_inflight: false,
             clip_save_rx: None,
+            audio_replay_tap,
+            clip_toast_thumb: None,
+            clip_toast_tex: None,
+            clip_thumb_tex: HashMap::new(),
             last_metrics_ui_at: Instant::now()
                 .checked_sub(Duration::from_secs(1))
                 .unwrap_or_else(Instant::now),
@@ -1044,7 +1062,9 @@ impl App {
             self.effects_ui.interp_compute_ok = interp_ok;
         }
         if rebuilt {
-            self.logo_tex = None; // egui renderer rebuilt — drop stale texture handle
+            self.logo_tex = None; // egui renderer rebuilt — drop stale texture handles
+            self.clip_toast_tex = None;
+            self.clip_thumb_tex.clear();
             self.apply_color_convert();
             self.apply_present_mode_for_profile();
         }
@@ -1391,8 +1411,12 @@ impl App {
     }
 
     fn restart_audio(&mut self) {
+        // Re-attach tap before start so the new input callback captures it.
+        self.audio
+            .set_replay_tap(Some(std::sync::Arc::clone(&self.audio_replay_tap)));
         match self.audio.start(self.audio_config_from_ui()) {
             Ok(()) => {
+                self.sync_audio_replay_tap();
                 let notice = self.audio.status().notice.clone();
                 self.overlay.audio_notice = if notice.is_empty() {
                     String::new()
@@ -1869,11 +1893,13 @@ impl App {
         if let Some(on) = actions.replay_enabled_changed {
             self.ui_prefs.replay_enabled = on;
             self.replay.set_enabled(on);
+            self.sync_audio_replay_tap();
             self.persist_ui_prefs();
         }
         if let Some(secs) = actions.replay_seconds_changed {
             self.ui_prefs.replay_seconds = secs.clamp(3, 30);
             self.replay.set_seconds(self.ui_prefs.replay_seconds);
+            self.sync_audio_replay_tap();
             self.persist_ui_prefs();
         }
         if actions.save_replay_clip {
@@ -2199,41 +2225,64 @@ impl App {
         }
     }
 
+    fn sync_audio_replay_tap(&mut self) {
+        let rate = self.audio.status().output_rate.max(self.audio.status().input_rate).max(48_000);
+        self.audio_replay_tap.lock().configure(
+            self.ui_prefs.replay_enabled,
+            self.ui_prefs.replay_seconds,
+            rate,
+        );
+    }
+
     /// Snapshot ring + encode on a worker — never block UI / present / capture.
     fn save_replay_clip(&mut self) {
         if self.clip_save_rx.is_some() {
-            self.show_toast_kind(
+            self.show_clip_toast(
                 self.i18n.t("msg_replay_busy"),
                 ToastKind::Neutral,
                 Duration::from_secs(3),
+                None,
             );
             return;
         }
-        let snapshot = match self.replay.snapshot_for_encode() {
+        let audio = if let Some((from, to)) = self.replay.time_range() {
+            Some(self.audio_replay_tap.lock().snapshot_range(from, to))
+        } else {
+            Some(self.audio_replay_tap.lock().snapshot_all())
+        };
+        let snapshot = match self.replay.snapshot_for_encode(audio) {
             Ok(s) => s,
             Err(e) if e.contains("empty") => {
-                self.show_toast_kind(
+                self.show_clip_toast(
                     self.i18n.t("msg_replay_empty"),
                     ToastKind::Error,
                     Duration::from_secs(5),
+                    None,
                 );
                 return;
             }
             Err(e) => {
                 tracing::warn!(error = %e, "replay snapshot failed");
-                self.show_toast_kind(
+                self.show_clip_toast(
                     self.i18n.t("msg_replay_err"),
                     ToastKind::Error,
                     Duration::from_secs(5),
+                    None,
                 );
                 return;
             }
         };
         let frames = snapshot.frame_count();
-        self.show_toast_kind(
-            format!("{} ({frames})", self.i18n.t("msg_replay_encoding")),
+        let encode_fps = snapshot.encode_fps_estimate();
+        let thumb = snapshot.first_frame_thumb_rgba();
+        self.show_clip_toast(
+            format!(
+                "{} ({frames} · {encode_fps:.0} fps)",
+                self.i18n.t("msg_replay_encoding")
+            ),
             ToastKind::Neutral,
             Duration::from_secs(30),
+            thumb,
         );
         self.overlay.clip_encoding = true;
         let (tx, rx) = crossbeam_channel::bounded(1);
@@ -2259,28 +2308,40 @@ impl App {
                 self.clip_save_rx = None;
                 self.overlay.clip_encoding = false;
                 match result {
-                    Ok(path) => {
+                    Ok(outcome) => {
+                        let name = outcome
+                            .path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| outcome.path.display().to_string());
                         let msg = format!(
-                            "{} — {}",
+                            "{} — {name} ({:.0} fps)",
                             self.i18n.t("msg_replay_saved"),
-                            path.display()
+                            outcome.encode_fps
                         );
-                        self.show_toast_kind(msg, ToastKind::Success, Duration::from_secs(6));
+                        // Keep the first-frame thumb from encode start if still present;
+                        // otherwise try loading the written JPEG.
+                        let thumb = self.clip_toast_thumb.clone().or_else(|| {
+                            outcome.thumb_path.as_ref().and_then(|p| load_thumb_rgba(p))
+                        });
+                        self.show_clip_toast(msg, ToastKind::Success, Duration::from_secs(6), thumb);
                         self.refresh_clips_list();
                     }
                     Err(e) if e.contains("empty") => {
-                        self.show_toast_kind(
+                        self.show_clip_toast(
                             self.i18n.t("msg_replay_empty"),
                             ToastKind::Error,
                             Duration::from_secs(5),
+                            None,
                         );
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "replay save failed");
-                        self.show_toast_kind(
+                        self.show_clip_toast(
                             self.i18n.t("msg_replay_err"),
                             ToastKind::Error,
                             Duration::from_secs(5),
+                            None,
                         );
                     }
                 }
@@ -2305,12 +2366,19 @@ impl App {
         self.overlay.replay_enabled = self.ui_prefs.replay_enabled;
         self.overlay.replay_seconds = self.ui_prefs.replay_seconds;
         self.overlay.replay_frames = self.replay.frame_count() as u32;
+        self.overlay.replay_sample_fps = self.replay.sample_fps_target();
+        self.overlay.replay_buffer_fps = if self.replay.frame_count() >= 2 {
+            self.replay.buffer_sample_fps()
+        } else {
+            self.replay.sample_fps_target()
+        };
         self.overlay.clip_encoding = self.clip_save_rx.is_some();
         self.overlay.grade = self.ui_prefs.grade;
         self.overlay.cube_lut_path = self.ui_prefs.cube_lut_path.clone();
         self.overlay.health = self.health.ui.clone();
         self.overlay.health_auto_reinit = self.health.prefs.auto_reinit;
         self.overlay.health_stall_secs = self.health.prefs.stall_secs;
+        self.export.poll_spout_status();
         self.overlay.export = self.export.status.clone();
         self.overlay.spout_enabled = self.export.prefs.spout_enabled;
         self.overlay.ndi_enabled = self.export.prefs.ndi_enabled;
@@ -2506,6 +2574,24 @@ impl App {
     fn show_toast_kind(&mut self, msg: String, kind: ToastKind, dwell: Duration) {
         self.overlay.toast = msg;
         self.overlay.toast_kind = kind;
+        self.overlay.toast_clip = false;
+        self.clip_toast_thumb = None;
+        self.clip_toast_tex = None;
+        self.toast_until = Some(Instant::now() + dwell);
+    }
+
+    fn show_clip_toast(
+        &mut self,
+        msg: String,
+        kind: ToastKind,
+        dwell: Duration,
+        thumb: Option<(u32, u32, Vec<u8>)>,
+    ) {
+        self.overlay.toast = msg;
+        self.overlay.toast_kind = kind;
+        self.overlay.toast_clip = true;
+        self.clip_toast_thumb = thumb;
+        self.clip_toast_tex = None; // rebuild next frame
         self.toast_until = Some(Instant::now() + dwell);
     }
 
@@ -2640,7 +2726,7 @@ impl App {
                 frame.width,
                 frame.height,
                 frame.pixel_format,
-                frame.data.as_slice(),
+                std::sync::Arc::clone(&frame.data),
             );
             if approx_black(frame) {
                 self.black_since.get_or_insert_with(Instant::now);
@@ -2827,6 +2913,9 @@ impl App {
             if Instant::now() > until {
                 self.overlay.toast.clear();
                 self.overlay.toast_kind = ToastKind::Neutral;
+                self.overlay.toast_clip = false;
+                self.clip_toast_thumb = None;
+                self.clip_toast_tex = None;
                 self.toast_until = None;
             }
         }
@@ -2935,6 +3024,27 @@ impl App {
 
         let raw_input = gpu.egui_state.take_egui_input(&gpu.window);
         let logo = crate::brand::ensure_logo_texture(&gpu.egui_ctx, &mut self.logo_tex);
+        // Clip toast thumb (top-left) + Clips-tab first-frame textures.
+        if self.clip_toast_tex.is_none() {
+            if let Some((w, h, rgba)) = self.clip_toast_thumb.as_ref() {
+                let img = egui::ColorImage::from_rgba_unmultiplied(
+                    [*w as usize, *h as usize],
+                    rgba,
+                );
+                self.clip_toast_tex = Some(gpu.egui_ctx.load_texture(
+                    "clip-toast-thumb",
+                    img,
+                    egui::TextureOptions::LINEAR,
+                ));
+            }
+        }
+        ensure_clip_list_thumbs(
+            &gpu.egui_ctx,
+            &overlay.clips,
+            &mut self.clip_thumb_tex,
+        );
+        let clip_toast_tex = self.clip_toast_tex.clone();
+        let clip_thumbs = self.clip_thumb_tex.clone();
         let full_output = gpu.egui_ctx.run(raw_input, |ctx| {
             actions = ui::draw_ui(
                 ctx,
@@ -2951,6 +3061,8 @@ impl App {
                     effects: &effects,
                     color: &color,
                     logo: logo.clone(),
+                    clip_toast_tex: clip_toast_tex.clone(),
+                    clip_thumbs: &clip_thumbs,
                 },
             );
         });
@@ -3455,4 +3567,36 @@ async fn init_gpu(window: Arc<Window>, prefer_hdr: bool) -> anyhow::Result<GpuSt
         adapter_name,
         present_caps,
     })
+}
+
+fn load_thumb_rgba(path: &std::path::Path) -> Option<(u32, u32, Vec<u8>)> {
+    let data = std::fs::read(path).ok()?;
+    let img = image::load_from_memory(&data).ok()?.into_rgba8();
+    let (w, h) = img.dimensions();
+    Some((w, h, img.into_raw()))
+}
+
+fn ensure_clip_list_thumbs(
+    ctx: &egui::Context,
+    clips: &[replay::ClipEntry],
+    cache: &mut HashMap<std::path::PathBuf, egui::TextureHandle>,
+) {
+    let live: std::collections::HashSet<std::path::PathBuf> =
+        clips.iter().map(|c| c.path.clone()).collect();
+    cache.retain(|k, _| live.contains(k));
+    for clip in clips {
+        if cache.contains_key(&clip.path) {
+            continue;
+        }
+        let Some(thumb_path) = clip.thumb_path.as_ref() else {
+            continue;
+        };
+        let Some((w, h, rgba)) = load_thumb_rgba(thumb_path) else {
+            continue;
+        };
+        let img = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
+        let id = format!("clip-thumb-{}", clip.path.display());
+        let tex = ctx.load_texture(id, img, egui::TextureOptions::LINEAR);
+        cache.insert(clip.path.clone(), tex);
+    }
 }

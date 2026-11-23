@@ -18,6 +18,7 @@ use crate::device::{
     default_output_id, find_input_device, find_output_device, AudioError, NONE_INPUT_ID,
 };
 use crate::level::LevelMeter;
+use crate::replay_tap::SharedReplayTap;
 use crate::resample::{fold_to_stereo_interleaved, StereoResampler};
 
 const TARGET_BUFFER_MS_DEFAULT: f32 = 30.0;
@@ -75,6 +76,8 @@ pub struct AudioEngine {
     status: AudioStatus,
     meter: Arc<LevelMeter>,
     shared: Arc<SharedState>,
+    /// Optional replay PCM tap (clip mux). Pre-volume, post fold/resample.
+    replay_tap: Option<SharedReplayTap>,
     _input_stream: Option<Stream>,
     _output_stream: Option<Stream>,
     /// Kept alive so producers/consumers stay valid — held inside streams actually.
@@ -93,10 +96,20 @@ impl AudioEngine {
                 delay_frames: AtomicU32::new(0),
                 target_buffer_frames: AtomicU32::new(0),
             }),
+            replay_tap: None,
             _input_stream: None,
             _output_stream: None,
             _ring_keep: None,
         }
+    }
+
+    /// Attach a shared replay PCM tap (app owns the Arc; engine clones into the input callback).
+    pub fn set_replay_tap(&mut self, tap: Option<SharedReplayTap>) {
+        self.replay_tap = tap;
+    }
+
+    pub fn replay_tap(&self) -> Option<&SharedReplayTap> {
+        self.replay_tap.as_ref()
     }
 
     pub fn meter(&self) -> Arc<LevelMeter> {
@@ -112,7 +125,8 @@ impl AudioEngine {
     }
 
     pub fn set_volume(&mut self, volume: f32) {
-        let v = volume.clamp(0.0, 1.5);
+        // Allow mild boost (quiet cutscene dialogue on some HDMI mixes); soft-clip on output.
+        let v = volume.clamp(0.0, 2.0);
         self.config.volume = v;
         self.shared
             .volume
@@ -155,7 +169,7 @@ impl AudioEngine {
             .buffer_ms
             .clamp(TARGET_BUFFER_MS_MIN, TARGET_BUFFER_MS_MAX);
         config.delay_ms = config.delay_ms.clamp(0.0, 500.0);
-        config.volume = config.volume.clamp(0.0, 1.5);
+        config.volume = config.volume.clamp(0.0, 2.0);
         self.config = config.clone();
         self.shared
             .volume
@@ -233,6 +247,7 @@ impl AudioEngine {
         let prod_cb = Arc::clone(&prod);
         let resampler_cb = Arc::clone(&resampler);
         let pending_cb = Arc::clone(&pending_in);
+        let tap_cb = self.replay_tap.clone();
 
         let input_stream = build_input_stream(
             &input_dev,
@@ -247,6 +262,9 @@ impl AudioEngine {
                 let chunk_samples = resampler.chunk_frames() * 2;
                 while pending.len() >= chunk_samples || resampler.is_identity() {
                     if resampler.is_identity() {
+                        if let Some(tap) = tap_cb.as_ref() {
+                            tap.lock().push_stereo(&pending);
+                        }
                         let mut prod = prod_cb.lock();
                         let _ = prod.push_slice(&pending);
                         pending.clear();
@@ -255,6 +273,9 @@ impl AudioEngine {
                     let chunk: Vec<f32> = pending.drain(..chunk_samples).collect();
                     match resampler.process_interleaved(&chunk) {
                         Ok(out) if !out.is_empty() => {
+                            if let Some(tap) = tap_cb.as_ref() {
+                                tap.lock().push_stereo(&out);
+                            }
                             let mut prod = prod_cb.lock();
                             let _ = prod.push_slice(&out);
                         }
@@ -304,12 +325,18 @@ impl AudioEngine {
 
                 let muted = shared.muted.load(Ordering::Relaxed);
                 let vol = if muted { 0.0 } else { shared.volume_f32() };
-                if (vol - 1.0).abs() > 0.001 {
-                    for s in out.iter_mut() {
-                        *s = (*s * vol).clamp(-1.0, 1.0);
-                    }
-                } else if muted {
+                if muted {
                     out.fill(0.0);
+                } else if (vol - 1.0).abs() > 0.001 {
+                    // Soft clip when boosting (>1) so quiet dialogue can be lifted without hard square.
+                    for s in out.iter_mut() {
+                        let v = *s * vol;
+                        *s = if vol > 1.0 {
+                            v.tanh()
+                        } else {
+                            v.clamp(-1.0, 1.0)
+                        };
+                    }
                 }
                 meter_out.observe_interleaved_stereo(out);
             },

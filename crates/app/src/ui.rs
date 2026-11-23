@@ -135,6 +135,8 @@ pub struct OverlayState {
     pub toast: String,
     /// Visual severity for the status toast banner.
     pub toast_kind: ToastKind,
+    /// When true, toast is a clip toast (top-left + optional first-frame thumb).
+    pub toast_clip: bool,
     /// Display pipeline delay (capture → present), milliseconds.
     pub pipeline_delay_ms: f32,
     pub one_percent_low_fps: f32,
@@ -175,6 +177,10 @@ pub struct OverlayState {
     pub replay_enabled: bool,
     pub replay_seconds: u32,
     pub replay_frames: u32,
+    /// Target ring sample rate (~20). Independent of capture FPS.
+    pub replay_sample_fps: f32,
+    /// Measured buffer spacing used as encode FPS.
+    pub replay_buffer_fps: f32,
     /// Saved clips under `%APPDATA%\CaptureView\clips\`.
     pub clips: Vec<ClipEntry>,
     /// True while a background clip encode is running (disable Save / show toast).
@@ -225,6 +231,7 @@ impl Default for OverlayState {
             level: 0.0,
             toast: String::new(),
             toast_kind: ToastKind::Neutral,
+            toast_clip: false,
             pipeline_delay_ms: 0.0,
             one_percent_low_fps: 0.0,
             dropped_frames: 0,
@@ -256,6 +263,8 @@ impl Default for OverlayState {
             replay_enabled: false,
             replay_seconds: 8,
             replay_frames: 0,
+            replay_sample_fps: 20.0,
+            replay_buffer_fps: 20.0,
             clips: Vec::new(),
             clip_encoding: false,
             grade: GradePrefs::default(),
@@ -535,6 +544,10 @@ pub struct DrawInput<'a> {
     pub effects: &'a EffectsUiState,
     pub color: &'a ColorUiState,
     pub logo: Option<egui::TextureHandle>,
+    /// First-frame preview for the top-left clip toast.
+    pub clip_toast_tex: Option<egui::TextureHandle>,
+    /// Clips-tab thumbnails keyed by clip path.
+    pub clip_thumbs: &'a std::collections::HashMap<std::path::PathBuf, egui::TextureHandle>,
 }
 
 pub fn draw_ui(ctx: &Context, input: DrawInput<'_>) -> UiActions {
@@ -631,12 +644,44 @@ pub fn draw_ui(ctx: &Context, input: DrawInput<'_>) -> UiActions {
         draw_update_popup(ctx, i18n, input.overlay, input.logo.as_ref(), &mut actions);
     }
 
-    // Status toasts / signal hints (non-blocking).
+    // Clip toast: top-left of the preview, with optional first-frame thumb.
+    if !input.overlay.toast.is_empty() && input.overlay.toast_clip {
+        egui::Area::new(egui::Id::new("clip_toast"))
+            .anchor(egui::Align2::LEFT_TOP, [16.0, 16.0])
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::NONE
+                    .fill(Color32::from_rgba_unmultiplied(0, 0, 0, 190))
+                    .inner_margin(egui::Margin::symmetric(10, 8))
+                    .corner_radius(egui::CornerRadius::same(6))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            if let Some(tex) = input.clip_toast_tex.as_ref() {
+                                ui.add(
+                                    egui::Image::new(tex)
+                                        .fit_to_exact_size(egui::vec2(96.0, 54.0))
+                                        .corner_radius(4.0),
+                                );
+                                ui.add_space(8.0);
+                            }
+                            ui.vertical(|ui| {
+                                ui.colored_label(
+                                    input.overlay.toast_kind.color(),
+                                    RichText::new(&input.overlay.toast).strong(),
+                                );
+                            });
+                        });
+                    });
+            });
+    }
+
+    // Status toasts / signal hints (non-blocking). Non-clip toasts stay top-center.
+    let show_center_toast = !input.overlay.toast.is_empty() && !input.overlay.toast_clip;
     if input.overlay.no_signal
         || input.overlay.device_busy
         || input.overlay.soft_black
         || !input.overlay.status.is_empty()
-        || !input.overlay.toast.is_empty()
+        || show_center_toast
         || !input.overlay.audio_notice.is_empty()
     {
         egui::Area::new(egui::Id::new("status_banner"))
@@ -673,7 +718,7 @@ pub fn draw_ui(ctx: &Context, input: DrawInput<'_>) -> UiActions {
                                 &input.overlay.audio_notice,
                             );
                         }
-                        if !input.overlay.toast.is_empty() {
+                        if show_center_toast {
                             ui.colored_label(
                                 input.overlay.toast_kind.color(),
                                 RichText::new(&input.overlay.toast).strong(),
@@ -1145,7 +1190,8 @@ fn draw_sound_tab(ui: &mut egui::Ui, input: &DrawInput<'_>, actions: &mut UiActi
         }
         let mut vol = audio.volume;
         if ui
-            .add(egui::Slider::new(&mut vol, 0.0..=1.25).text(i18n.t("label_volume")))
+            .add(egui::Slider::new(&mut vol, 0.0..=2.0).text(i18n.t("label_volume")))
+            .on_hover_text(i18n.t("tip_volume_boost"))
             .changed()
         {
             actions.volume_changed = Some(vol);
@@ -1558,7 +1604,7 @@ fn draw_clips_tab(ui: &mut egui::Ui, input: &DrawInput<'_>, actions: &mut UiActi
             draw_replay_prefs(ui, i18n, o, actions);
             ui.add_space(8.0);
             ui.separator();
-            draw_clips_panel(ui, i18n, o, actions);
+            draw_clips_panel(ui, i18n, o, input.clip_thumbs, actions);
         });
 }
 
@@ -1970,6 +2016,20 @@ fn draw_replay_prefs(ui: &mut egui::Ui, i18n: &I18n, o: &OverlayState, actions: 
         actions.replay_seconds_changed = Some(secs);
     }
     ui.small(format!("{}: {}", i18n.t("label_replay_frames"), o.replay_frames));
+    ui.small(format!(
+        "{}: {:.0} · {}: {:.0} · {}: {:.0}",
+        i18n.t("label_replay_sample_fps"),
+        o.replay_sample_fps,
+        i18n.t("label_replay_encode_fps"),
+        o.replay_buffer_fps,
+        i18n.t("label_capture_fps"),
+        o.capture_fps
+    ));
+    ui.label(
+        RichText::new(i18n.t("tip_replay_fps"))
+            .small()
+            .italics(),
+    );
     ui.add_enabled_ui(!o.clip_encoding, |ui| {
         if ui.button(i18n.t("btn_replay_save")).clicked() {
             actions.save_replay_clip = true;
@@ -1980,7 +2040,13 @@ fn draw_replay_prefs(ui: &mut egui::Ui, i18n: &I18n, o: &OverlayState, actions: 
     }
 }
 
-fn draw_clips_panel(ui: &mut egui::Ui, i18n: &I18n, o: &OverlayState, actions: &mut UiActions) {
+fn draw_clips_panel(
+    ui: &mut egui::Ui,
+    i18n: &I18n,
+    o: &OverlayState,
+    thumbs: &std::collections::HashMap<std::path::PathBuf, egui::TextureHandle>,
+    actions: &mut UiActions,
+) {
     ui.label(RichText::new(i18n.t("section_clips")).strong());
     ui.label(RichText::new(i18n.t("tip_clips")).small().italics());
     ui.horizontal_wrapped(|ui| {
@@ -1995,7 +2061,7 @@ fn draw_clips_panel(ui: &mut egui::Ui, i18n: &I18n, o: &OverlayState, actions: &
         ui.small(i18n.t("clips_empty"));
         return;
     }
-    let list_h = 140.0_f32.min(ui.available_height().max(80.0));
+    let list_h = 200.0_f32.min(ui.available_height().max(100.0));
     egui::ScrollArea::vertical()
         .id_salt("clips_list_scroll")
         .max_height(list_h)
@@ -2003,35 +2069,54 @@ fn draw_clips_panel(ui: &mut egui::Ui, i18n: &I18n, o: &OverlayState, actions: &
         .show(ui, |ui| {
             for clip in &o.clips {
                 ui.horizontal(|ui| {
+                    if let Some(tex) = thumbs.get(&clip.path) {
+                        ui.add(
+                            egui::Image::new(tex)
+                                .fit_to_exact_size(egui::vec2(72.0, 40.0))
+                                .corner_radius(3.0),
+                        );
+                    } else {
+                        // Placeholder keeps row alignment when thumb is missing.
+                        ui.allocate_ui(egui::vec2(72.0, 40.0), |ui| {
+                            ui.centered_and_justified(|ui| {
+                                ui.label(RichText::new("·").weak());
+                            });
+                        });
+                    }
                     let size_mb = clip.size_bytes as f32 / (1024.0 * 1024.0);
                     let kind = if clip.is_dir {
                         i18n.t("clips_kind_seq")
                     } else {
                         i18n.t("clips_kind_video")
                     };
-                    ui.label(format!("{} · {kind} · {size_mb:.1} Mo", clip.name));
-                    if ui
-                        .small_button(i18n.t("btn_clips_play"))
-                        .on_hover_text(i18n.t("tip_clips_play"))
-                        .clicked()
-                    {
-                        actions.play_clip = Some(clip.path.clone());
-                    }
-                    if ui
-                        .small_button(i18n.t("btn_clips_reveal"))
-                        .on_hover_text(i18n.t("tip_clips_reveal"))
-                        .clicked()
-                    {
-                        actions.reveal_clip = Some(clip.path.clone());
-                    }
-                    if ui
-                        .small_button(i18n.t("btn_clips_delete"))
-                        .on_hover_text(i18n.t("tip_clips_delete"))
-                        .clicked()
-                    {
-                        actions.delete_clip = Some(clip.path.clone());
-                    }
+                    ui.vertical(|ui| {
+                        ui.label(format!("{} · {kind} · {size_mb:.1} Mo", clip.name));
+                        ui.horizontal(|ui| {
+                            if ui
+                                .small_button(i18n.t("btn_clips_play"))
+                                .on_hover_text(i18n.t("tip_clips_play"))
+                                .clicked()
+                            {
+                                actions.play_clip = Some(clip.path.clone());
+                            }
+                            if ui
+                                .small_button(i18n.t("btn_clips_reveal"))
+                                .on_hover_text(i18n.t("tip_clips_reveal"))
+                                .clicked()
+                            {
+                                actions.reveal_clip = Some(clip.path.clone());
+                            }
+                            if ui
+                                .small_button(i18n.t("btn_clips_delete"))
+                                .on_hover_text(i18n.t("tip_clips_delete"))
+                                .clicked()
+                            {
+                                actions.delete_clip = Some(clip.path.clone());
+                            }
+                        });
+                    });
                 });
+                ui.add_space(4.0);
             }
         });
 }

@@ -368,14 +368,14 @@ pub fn dlss_byo_dir() -> Option<PathBuf> {
 }
 
 /// Lightweight sender state with optional Spout CPU SendImage path.
+///
+/// Spout convert + SendImage run on a dedicated worker so the capture/present
+/// thread only publishes the latest `Arc` frame (no NV12→BGRA on the hot path).
 pub struct FrameExport {
     pub prefs: ExportPrefs,
     pub status: ExportStatus,
     #[cfg(windows)]
-    spout: Option<SpoutSender>,
-    /// Scratch BGRA when converting NV12/YUY2 for SendImage (avoids per-frame alloc churn).
-    #[cfg(windows)]
-    bgra_scratch: Vec<u8>,
+    spout_worker: Option<SpoutWorkerHandle>,
 }
 
 impl Default for FrameExport {
@@ -384,9 +384,7 @@ impl Default for FrameExport {
             prefs: ExportPrefs::default(),
             status: probe_export(),
             #[cfg(windows)]
-            spout: None,
-            #[cfg(windows)]
-            bgra_scratch: Vec::new(),
+            spout_worker: None,
         };
         s.sync_active_flags();
         s
@@ -404,7 +402,7 @@ impl FrameExport {
         #[cfg(windows)]
         {
             if !self.status.spout_available {
-                self.spout = None;
+                self.stop_spout_worker();
             }
         }
     }
@@ -426,26 +424,29 @@ impl FrameExport {
         }
     }
 
-    /// Ensure Spout sender is live when enabled (lazy init).
+    /// Ensure Spout worker is live when enabled (lazy init). Off by default.
     pub fn ensure_spout(&mut self) {
         #[cfg(windows)]
         {
             if !self.prefs.spout_enabled || !self.status.spout_available {
-                self.spout = None;
+                self.stop_spout_worker();
                 return;
             }
-            if self.spout.is_some() {
+            if self.spout_worker.is_some() {
+                if let Some(w) = self.spout_worker.as_ref() {
+                    w.set_name(self.prefs.spout_name.clone());
+                }
                 return;
             }
             let dll = PathBuf::from(&self.status.spout_dll_path);
             let dir = find_spout_bridge_dir(&dll);
-            match SpoutSender::open(&dir) {
-                Ok(s) => {
-                    self.spout = Some(s);
+            match SpoutWorkerHandle::start(dir, self.prefs.spout_name.clone()) {
+                Ok(w) => {
+                    self.spout_worker = Some(w);
                     self.status.spout_detail_key = "export_spout_ready".into();
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, "Spout bridge init failed");
+                    tracing::warn!(error = %e, "Spout worker init failed");
                     self.status.spout_detail_key = "export_spout_bridge_fail".into();
                     self.status.spout_active = false;
                 }
@@ -453,85 +454,275 @@ impl FrameExport {
         }
     }
 
-    /// Called each presented capture frame. Spout: CPU BGRA SendImage (converts NV12/YUY2).
+    #[cfg(windows)]
+    fn stop_spout_worker(&mut self) {
+        if let Some(w) = self.spout_worker.take() {
+            w.stop();
+        }
+        self.status.spout_sending = false;
+    }
+
+    /// Pull worker status (send/fail keys) into `self.status` without blocking.
+    pub fn poll_spout_status(&mut self) {
+        #[cfg(windows)]
+        {
+            if let Some(w) = self.spout_worker.as_ref() {
+                let st = w.snapshot_status();
+                if st.bridge_failed {
+                    self.status.spout_detail_key = "export_spout_bridge_fail".into();
+                    self.status.spout_active = false;
+                    self.status.spout_sending = false;
+                } else if st.convert_failed {
+                    self.status.spout_detail_key = "export_spout_convert_fail".into();
+                } else if st.send_failed {
+                    self.status.spout_detail_key = "export_spout_send_fail".into();
+                } else if st.unsupported_format {
+                    self.status.spout_detail_key = "export_spout_need_bgra".into();
+                } else if st.sending {
+                    self.status.spout_sending = true;
+                    self.status.spout_detail_key = "export_spout_sending".into();
+                }
+            }
+        }
+    }
+
+    /// Called each capture frame. Spout: publish latest Arc to worker (non-blocking).
     /// NDI: probe/prefs only until a BYO SDK bridge is linked.
     pub fn on_frame(
         &mut self,
         width: u32,
         height: u32,
         pixel_format: capture::PixelFormat,
-        pixels: &[u8],
+        pixels: std::sync::Arc<capture::PooledBytes>,
     ) {
         #[cfg(windows)]
         {
             if self.prefs.spout_enabled && self.status.spout_available {
                 self.ensure_spout();
-                if self.spout.is_some() && width > 0 && height > 0 {
-                    let expected = (width as usize).saturating_mul(height as usize) * 4;
-                    let converted: Option<Vec<u8>> = match pixel_format {
-                        capture::PixelFormat::Bgra8 if pixels.len() >= expected => None,
-                        capture::PixelFormat::Nv12 => {
-                            match crate::pixel_convert::nv12_to_bgra_scaled(
-                                pixels, width, height, width, height,
-                            ) {
-                                Some(bgra) => Some(bgra),
-                                None => {
-                                    self.status.spout_detail_key =
-                                        "export_spout_convert_fail".into();
-                                    return;
-                                }
-                            }
-                        }
-                        capture::PixelFormat::Yuy2 => {
-                            match crate::pixel_convert::yuy2_to_bgra(pixels, width, height) {
-                                Some(bgra) => Some(bgra),
-                                None => {
-                                    self.status.spout_detail_key =
-                                        "export_spout_convert_fail".into();
-                                    return;
-                                }
-                            }
-                        }
-                        capture::PixelFormat::Bgra8 => {
-                            self.status.spout_detail_key = "export_spout_need_bgra".into();
-                            return;
-                        }
-                        _ => {
-                            self.status.spout_detail_key = "export_spout_need_bgra".into();
-                            return;
-                        }
-                    };
-
-                    if let Some(bgra) = converted {
-                        self.bgra_scratch = bgra;
-                    }
-
-                    let px: &[u8] = if matches!(pixel_format, capture::PixelFormat::Bgra8) {
-                        &pixels[..expected]
-                    } else {
-                        self.bgra_scratch.as_slice()
-                    };
-
-                    let name = self.prefs.spout_name.clone();
-                    if let Some(sender) = self.spout.as_mut() {
-                        match sender.send_bgra(&name, px, width, height) {
-                            Ok(()) => {
-                                if !self.status.spout_sending {
-                                    self.status.spout_sending = true;
-                                    self.status.spout_detail_key = "export_spout_sending".into();
-                                }
-                            }
-                            Err(e) => {
-                                tracing::debug!(error = %e, "Spout SendImage failed");
-                                self.status.spout_detail_key = "export_spout_send_fail".into();
-                            }
-                        }
+                if let Some(w) = self.spout_worker.as_ref() {
+                    if width > 0 && height > 0 {
+                        w.publish(SpoutJob {
+                            width,
+                            height,
+                            pixel_format,
+                            data: pixels,
+                        });
                     }
                 }
             }
         }
-        let _ = (width, height, pixel_format, pixels);
+        #[cfg(not(windows))]
+        {
+            let _ = (width, height, pixel_format, pixels);
+        }
         // NDI: intentional no-op until BYO SDK bridge (licensing).
+    }
+}
+
+#[cfg(windows)]
+struct SpoutJob {
+    width: u32,
+    height: u32,
+    pixel_format: capture::PixelFormat,
+    data: std::sync::Arc<capture::PooledBytes>,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Default)]
+struct SpoutWorkerStatus {
+    sending: bool,
+    send_failed: bool,
+    convert_failed: bool,
+    unsupported_format: bool,
+    bridge_failed: bool,
+}
+
+/// Latest-frame Spout pump: UI publishes Arc frames; worker converts + SendImage.
+#[cfg(windows)]
+struct SpoutWorkerHandle {
+    slot: std::sync::Arc<parking_lot::Mutex<Option<SpoutJob>>>,
+    name: std::sync::Arc<parking_lot::Mutex<String>>,
+    status: std::sync::Arc<parking_lot::Mutex<SpoutWorkerStatus>>,
+    wake_tx: crossbeam_channel::Sender<()>,
+    stop_tx: Option<crossbeam_channel::Sender<()>>,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(windows)]
+impl SpoutWorkerHandle {
+    fn start(bridge_dir: PathBuf, sender_name: String) -> Result<Self, String> {
+        // Fail fast if DLLs are missing (worker would only report later).
+        let bridge_path = bridge_dir.join("spout_bridge.dll");
+        if !bridge_path.is_file() {
+            return Err(format!(
+                "spout_bridge.dll missing in {}",
+                bridge_dir.display()
+            ));
+        }
+        if !bridge_dir.join("SpoutLibrary.dll").is_file() {
+            return Err(format!(
+                "SpoutLibrary.dll missing next to bridge ({})",
+                bridge_dir.display()
+            ));
+        }
+
+        let slot = std::sync::Arc::new(parking_lot::Mutex::new(None));
+        let name = std::sync::Arc::new(parking_lot::Mutex::new(sender_name));
+        let status = std::sync::Arc::new(parking_lot::Mutex::new(SpoutWorkerStatus::default()));
+        let (wake_tx, wake_rx) = crossbeam_channel::bounded::<()>(1);
+        let (stop_tx, stop_rx) = crossbeam_channel::bounded::<()>(1);
+
+        let slot_w = std::sync::Arc::clone(&slot);
+        let name_w = std::sync::Arc::clone(&name);
+        let status_w = std::sync::Arc::clone(&status);
+        let join = std::thread::Builder::new()
+            .name("spout-send".into())
+            .spawn(move || {
+                spout_worker_loop(bridge_dir, slot_w, name_w, status_w, wake_rx, stop_rx);
+            })
+            .map_err(|e| format!("spawn spout worker: {e}"))?;
+
+        Ok(Self {
+            slot,
+            name,
+            status,
+            wake_tx,
+            stop_tx: Some(stop_tx),
+            join: Some(join),
+        })
+    }
+
+    fn publish(&self, job: SpoutJob) {
+        *self.slot.lock() = Some(job);
+        let _ = self.wake_tx.try_send(());
+    }
+
+    fn set_name(&self, name: String) {
+        *self.name.lock() = name;
+    }
+
+    fn snapshot_status(&self) -> SpoutWorkerStatus {
+        *self.status.lock()
+    }
+
+    fn stop(mut self) {
+        if let Some(tx) = self.stop_tx.take() {
+            let _ = tx.send(());
+        }
+        let _ = self.wake_tx.try_send(());
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for SpoutWorkerHandle {
+    fn drop(&mut self) {
+        if let Some(tx) = self.stop_tx.take() {
+            let _ = tx.send(());
+        }
+        let _ = self.wake_tx.try_send(());
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+#[cfg(windows)]
+fn spout_worker_loop(
+    bridge_dir: PathBuf,
+    slot: std::sync::Arc<parking_lot::Mutex<Option<SpoutJob>>>,
+    name: std::sync::Arc<parking_lot::Mutex<String>>,
+    status: std::sync::Arc<parking_lot::Mutex<SpoutWorkerStatus>>,
+    wake_rx: crossbeam_channel::Receiver<()>,
+    stop_rx: crossbeam_channel::Receiver<()>,
+) {
+    let mut sender = match SpoutSender::open(&bridge_dir) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "Spout bridge open failed on worker");
+            status.lock().bridge_failed = true;
+            return;
+        }
+    };
+    let mut bgra_scratch: Vec<u8> = Vec::new();
+    // Cap send cadence so a slow OBS receiver cannot pile up CPU work.
+    let min_gap = std::time::Duration::from_millis(8); // ~125 Hz max
+    let mut last_send = std::time::Instant::now() - min_gap;
+
+    loop {
+        crossbeam_channel::select! {
+            recv(stop_rx) -> _ => break,
+            recv(wake_rx) -> _ => {}
+        }
+        if stop_rx.try_recv().is_ok() {
+            break;
+        }
+        // Coalesce wakes; always take the newest published frame.
+        while wake_rx.try_recv().is_ok() {}
+        let Some(job) = slot.lock().take() else {
+            continue;
+        };
+        // Drop intermediate frames when OBS/SendImage cannot keep up — always prefer freshness.
+        if last_send.elapsed() < min_gap {
+            continue;
+        }
+
+        let pixels = job.data.as_slice();
+        let w = job.width;
+        let h = job.height;
+        let expected_bgra = (w as usize).saturating_mul(h as usize).saturating_mul(4);
+
+        let px: Option<&[u8]> = match job.pixel_format {
+            capture::PixelFormat::Bgra8 if pixels.len() >= expected_bgra => {
+                Some(&pixels[..expected_bgra])
+            }
+            capture::PixelFormat::Nv12 => {
+                if crate::pixel_convert::nv12_to_bgra_into(pixels, w, h, w, h, &mut bgra_scratch)
+                    .is_some()
+                {
+                    Some(bgra_scratch.as_slice())
+                } else {
+                    let mut st = status.lock();
+                    st.convert_failed = true;
+                    None
+                }
+            }
+            capture::PixelFormat::Yuy2 => {
+                if crate::pixel_convert::yuy2_to_bgra_into(pixels, w, h, &mut bgra_scratch).is_some()
+                {
+                    Some(bgra_scratch.as_slice())
+                } else {
+                    let mut st = status.lock();
+                    st.convert_failed = true;
+                    None
+                }
+            }
+            _ => {
+                status.lock().unsupported_format = true;
+                None
+            }
+        };
+
+        let Some(px) = px else {
+            continue;
+        };
+        let sender_name = name.lock().clone();
+        match sender.send_bgra(&sender_name, px, w, h) {
+            Ok(()) => {
+                last_send = std::time::Instant::now();
+                let mut st = status.lock();
+                st.sending = true;
+                st.send_failed = false;
+                st.convert_failed = false;
+                st.unsupported_format = false;
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "Spout SendImage failed");
+                status.lock().send_failed = true;
+            }
+        }
     }
 }
 
@@ -552,6 +743,10 @@ struct SpoutSender {
     last_error: unsafe extern "C" fn(*mut std::ffi::c_void) -> *const std::os::raw::c_char,
 }
 
+// Spout OpenGL context + SendImage stay on the worker thread only.
+#[cfg(windows)]
+unsafe impl Send for SpoutSender {}
+
 #[cfg(windows)]
 impl SpoutSender {
     fn open(bridge_dir: &Path) -> Result<Self, String> {
@@ -559,7 +754,6 @@ impl SpoutSender {
         if !bridge_path.is_file() {
             return Err(format!("spout_bridge.dll missing in {}", bridge_dir.display()));
         }
-        // Ensure SpoutLibrary.dll is discoverable next to the bridge.
         let spout = bridge_dir.join("SpoutLibrary.dll");
         if !spout.is_file() {
             return Err(format!(

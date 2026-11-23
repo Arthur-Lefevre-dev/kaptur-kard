@@ -105,20 +105,34 @@ pub fn downsample_bgra(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Option
 }
 
 pub fn yuy2_to_bgra(src: &[u8], w: u32, h: u32) -> Option<Vec<u8>> {
-    let need = (w * h * 2) as usize;
+    let need = (w as usize).saturating_mul(h as usize).saturating_mul(2);
     if src.len() < need || w < 2 {
         return None;
     }
-    let mut out = vec![0u8; (w * h * 4) as usize];
+    let mut out = vec![0u8; (w as usize).saturating_mul(h as usize).saturating_mul(4)];
+    yuy2_to_bgra_into(src, w, h, &mut out)?;
+    Some(out)
+}
+
+/// Convert YUY2 into an existing BGRA buffer (resizes `out` as needed).
+pub fn yuy2_to_bgra_into(src: &[u8], w: u32, h: u32, out: &mut Vec<u8>) -> Option<()> {
+    let need_src = (w as usize).saturating_mul(h as usize).saturating_mul(2);
+    if src.len() < need_src || w < 2 {
+        return None;
+    }
+    let need_out = (w as usize).saturating_mul(h as usize).saturating_mul(4);
+    if out.len() != need_out {
+        out.resize(need_out, 0);
+    }
     for y in 0..h {
         for x in (0..w).step_by(2) {
             let i = ((y * w + x) * 2) as usize;
-            let y0 = src[i] as f32;
-            let u = src[i + 1] as f32;
-            let y1 = src[i + 2] as f32;
-            let v = src[i + 3] as f32;
-            let (b0, g0, r0) = yuv_to_bgra(y0, u, v);
-            let (b1, g1, r1) = yuv_to_bgra(y1, u, v);
+            let y0 = src[i] as i32;
+            let u = src[i + 1] as i32;
+            let y1 = src[i + 2] as i32;
+            let v = src[i + 3] as i32;
+            let (b0, g0, r0) = yuv_to_bgra_i(y0, u, v);
+            let (b1, g1, r1) = yuv_to_bgra_i(y1, u, v);
             let o0 = ((y * w + x) * 4) as usize;
             out[o0] = b0;
             out[o0 + 1] = g0;
@@ -133,11 +147,25 @@ pub fn yuy2_to_bgra(src: &[u8], w: u32, h: u32) -> Option<Vec<u8>> {
             }
         }
     }
-    Some(out)
+    Some(())
 }
 
 /// Convert tightly-packed NV12 to BGRA, sampling into `dw×dh` (point filter).
 pub fn nv12_to_bgra_scaled(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    nv12_to_bgra_into(src, sw, sh, dw, dh, &mut out)?;
+    Some(out)
+}
+
+/// Convert NV12 → BGRA into `out` (reuses capacity; resizes to `dw*dh*4`).
+pub fn nv12_to_bgra_into(
+    src: &[u8],
+    sw: u32,
+    sh: u32,
+    dw: u32,
+    dh: u32,
+    out: &mut Vec<u8>,
+) -> Option<()> {
     if sw == 0 || sh == 0 || dw == 0 || dh == 0 || sw < 2 || sh < 2 {
         return None;
     }
@@ -146,40 +174,83 @@ pub fn nv12_to_bgra_scaled(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Op
     if src.len() < y_size + uv_size {
         return None;
     }
+    let need = (dw as usize).saturating_mul(dh as usize).saturating_mul(4);
+    if out.len() != need {
+        out.resize(need, 0);
+    }
     let y_plane = &src[..y_size];
     let uv_plane = &src[y_size..y_size + uv_size];
-    let mut out = vec![0u8; (dw * dh * 4) as usize];
+    let same = sw == dw && sh == dh;
     for dy in 0..dh {
-        let sy = (dy as u64 * sh as u64 / dh as u64) as u32;
+        let sy = if same {
+            dy
+        } else {
+            (dy as u64 * sh as u64 / dh as u64) as u32
+        };
+        let y_row = (sy * sw) as usize;
+        let uv_row = ((sy / 2) * sw) as usize;
+        let out_row = (dy * dw * 4) as usize;
         for dx in 0..dw {
-            let sx = (dx as u64 * sw as u64 / dw as u64) as u32;
-            let y_val = y_plane[(sy * sw + sx) as usize] as f32;
-            let uv_i = ((sy / 2) * sw + (sx & !1)) as usize;
-            let u = uv_plane[uv_i] as f32;
-            let v = uv_plane[uv_i + 1] as f32;
-            let (b, g, r) = yuv_to_bgra(y_val, u, v);
-            let o = ((dy * dw + dx) * 4) as usize;
+            let sx = if same {
+                dx
+            } else {
+                (dx as u64 * sw as u64 / dw as u64) as u32
+            };
+            let y_val = y_plane[y_row + sx as usize] as i32;
+            let uv_i = uv_row + (sx & !1) as usize;
+            let u = uv_plane[uv_i] as i32;
+            let v = uv_plane[uv_i + 1] as i32;
+            let (b, g, r) = yuv_to_bgra_i(y_val, u, v);
+            let o = out_row + (dx * 4) as usize;
             out[o] = b;
             out[o + 1] = g;
             out[o + 2] = r;
             out[o + 3] = 255;
         }
     }
-    Some(out)
+    Some(())
 }
 
-fn yuv_to_bgra(y: f32, u: f32, v: f32) -> (u8, u8, u8) {
-    let c = y - 16.0;
-    let d = u - 128.0;
-    let e = v - 128.0;
-    let r = (298.0 * c + 409.0 * e + 128.0) / 256.0;
-    let g = (298.0 * c - 100.0 * d - 208.0 * e + 128.0) / 256.0;
-    let b = (298.0 * c + 516.0 * d + 128.0) / 256.0;
+/// BT.601 limited-range YUV → BGRA (integer, matches prior f32 path).
+#[inline]
+fn yuv_to_bgra_i(y: i32, u: i32, v: i32) -> (u8, u8, u8) {
+    let c = y - 16;
+    let d = u - 128;
+    let e = v - 128;
+    let r = (298 * c + 409 * e + 128) >> 8;
+    let g = (298 * c - 100 * d - 208 * e + 128) >> 8;
+    let b = (298 * c + 516 * d + 128) >> 8;
     (
-        b.clamp(0.0, 255.0) as u8,
-        g.clamp(0.0, 255.0) as u8,
-        r.clamp(0.0, 255.0) as u8,
+        b.clamp(0, 255) as u8,
+        g.clamp(0, 255) as u8,
+        r.clamp(0, 255) as u8,
     )
+}
+
+/// Downscale packed BGRA into tightly-packed RGBA for egui thumbs (point filter).
+pub fn bgra_to_rgba_thumb(src: &[u8], sw: u32, sh: u32, max_w: u32) -> Option<(u32, u32, Vec<u8>)> {
+    if sw == 0 || sh == 0 || max_w == 0 {
+        return None;
+    }
+    let (dw, dh) = stored_size(sw, sh, max_w);
+    let need = (sw as usize).saturating_mul(sh as usize).saturating_mul(4);
+    if src.len() < need {
+        return None;
+    }
+    let mut out = vec![0u8; (dw as usize).saturating_mul(dh as usize).saturating_mul(4)];
+    for y in 0..dh {
+        let sy = (y as u64 * sh as u64 / dh as u64) as u32;
+        for x in 0..dw {
+            let sx = (x as u64 * sw as u64 / dw as u64) as u32;
+            let si = ((sy * sw + sx) * 4) as usize;
+            let di = ((y * dw + x) * 4) as usize;
+            out[di] = src[si + 2]; // R
+            out[di + 1] = src[si + 1]; // G
+            out[di + 2] = src[si]; // B
+            out[di + 3] = src[si + 3]; // A
+        }
+    }
+    Some((dw, dh, out))
 }
 
 #[cfg(test)]
@@ -203,5 +274,19 @@ mod tests {
         assert_eq!(out.len(), src.len());
         let bgra = nv12_to_bgra_scaled(&out, 4, 2, 4, 2).unwrap();
         assert_eq!(bgra.len(), 4 * 2 * 4);
+    }
+
+    #[test]
+    fn nv12_into_reuses_buffer() {
+        let sw = 4u32;
+        let sh = 2u32;
+        let mut src = vec![16u8; (sw * sh) as usize];
+        src.extend_from_slice(&[128, 128, 128, 128]);
+        let mut buf = Vec::with_capacity(64);
+        nv12_to_bgra_into(&src, sw, sh, sw, sh, &mut buf).unwrap();
+        assert_eq!(buf.len(), 32);
+        let cap = buf.capacity();
+        nv12_to_bgra_into(&src, sw, sh, sw, sh, &mut buf).unwrap();
+        assert!(buf.capacity() >= cap);
     }
 }

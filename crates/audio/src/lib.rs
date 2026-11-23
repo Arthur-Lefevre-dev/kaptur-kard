@@ -5,6 +5,7 @@ pub mod clock;
 pub mod device;
 pub mod engine;
 pub mod level;
+pub mod replay_tap;
 pub mod resample;
 
 pub use associate::suggest_input_for_video;
@@ -14,4 +15,5 @@ pub use device::{
 };
 pub use engine::{AudioEngine, AudioEngineConfig, AudioStatus};
 pub use level::LevelMeter;
+pub use replay_tap::{AudioClipSnapshot, AudioReplayTap, SharedReplayTap};
 pub use resample::{fold_to_stereo_interleaved, StereoResampler};
