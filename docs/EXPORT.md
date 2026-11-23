@@ -7,6 +7,7 @@ KapturKard can **share the live preview** with OBS, Resolve, and other tools.
 - **What:** [Spout2](https://spout.zeal.co/) shared-frame sender (`SpoutLibrary.dll`, BSD-2-Clause).
 - **Ship:** Windows builds include `SpoutLibrary.dll` + `spout_bridge.dll` next to `captureview.exe` (also extracted to `%APPDATA%\CaptureView\spout\` on first run if needed).
 - **Probe order:** next to exe → `%APPDATA%\CaptureView\spout\` → `third_party/spout` (dev) → `PATH`.
+- **Default:** **Off** (Spout adds ~30 ms display delay). Existing installs are migrated off once; re-enable in Infos when needed.
 - **In-app:** Infos → **Spout**. Sender name defaults to `KapturKard`.
 - **OBS:** Add a Spout2 source and pick `KapturKard`.
 - **Send path:** CPU **BGRA `SendImage`** via a thin MIT bridge (`native/spout`). Live **NV12 / YUY2** capture is converted to BGRA before send (MF cards usually deliver NV12). A GPU shared-texture path (DX/GL interop with wgpu) remains optional for later.
@@ -31,6 +32,6 @@ Mode C / DLSS-G never ship NVIDIA proprietary DLLs. Effects / Infos show a clear
 
 | Path | Use |
 |------|-----|
-| **Replay buffer** (F9) | Last *N* seconds (downscaled NV12 ring, ~20 fps) → **H.264 MP4** via ffmpeg when present, else **MJPEG AVI**, under `%APPDATA%\CaptureView\clips\` |
-| **Clips panel** (Infos) | List / play / reveal / delete saved clips |
-| **Spout / NDI** | Live frames into OBS / Resolve / network |
+| **Replay buffer** (Clips tab, F9) | Off by default. Last *N* seconds (NV12 ring up to ~1080p, ~20 fps) → background **H.264 MP4** (CRF 18) via ffmpeg when present, else **MJPEG AVI**, under `%APPDATA%\CaptureView\clips\` |
+| **Clips tab** | Replay options + list / play / reveal / delete saved clips (Infos keeps monitoring / export / health / updates) |
+| **Spout / NDI** | Live frames into OBS / Resolve / network (off by default) |

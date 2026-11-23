@@ -16,10 +16,14 @@ use crate::pixel_convert::{
 };
 use crate::prefs::app_data_dir;
 
-/// Hard RAM ceiling for buffered frame bytes (~128 MiB — NV12 is lighter than BGRA).
-const MAX_BUFFER_BYTES: usize = 128 * 1024 * 1024;
-/// Cap width for stored frames (downsample keeps 1% lows healthy).
-const MAX_STORE_WIDTH: u32 = 960;
+/// Hard RAM ceiling for buffered frame bytes (~384 MiB — NV12 at up to 1080p).
+const MAX_BUFFER_BYTES: usize = 384 * 1024 * 1024;
+/// Cap width for stored frames (keep near capture res; avoid heavy downscale that nukes quality).
+const MAX_STORE_WIDTH: u32 = 1920;
+/// ffmpeg libx264 CRF (lower = higher quality). Was 23 — too soft for preview clips.
+const ENCODE_CRF: &str = "18";
+/// MJPEG fallback quality (1–100).
+const MJPEG_QUALITY: u8 = 95;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StoredFormat {
@@ -140,53 +144,116 @@ impl ReplayBuffer {
         }
     }
 
-    /// Encode buffered frames to a video file under `%APPDATA%/CaptureView/clips/`.
-    /// Prefers ffmpeg H.264 `.mp4`; falls back to in-process MJPEG `.avi`.
-    pub fn save_clip(&self) -> Result<PathBuf, String> {
+    /// Clone buffered frames for a background encode (Arc pixel data — cheap).
+    /// Does not block present/capture; caller must encode off the UI thread.
+    pub fn snapshot_for_encode(&self) -> Result<ReplaySnapshot, String> {
         if self.frames.is_empty() {
             return Err("replay buffer empty".into());
         }
-        let root = clips_dir().ok_or_else(|| "no app data dir".to_string())?;
-        fs::create_dir_all(&root).map_err(|e| e.to_string())?;
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-
-        let w = self.frames[0].width;
-        let h = self.frames[0].height;
-        let fps = estimate_fps(&self.frames).clamp(10.0, 60.0);
-
-        // Materialize BGRA once (encode path only — not on the capture hot path).
-        let mut bgra_frames: Vec<Vec<u8>> = Vec::with_capacity(self.frames.len());
-        for frame in &self.frames {
-            let bgra = stored_to_bgra(frame).ok_or_else(|| "frame convert failed".to_string())?;
-            bgra_frames.push(bgra);
-        }
-
-        let mp4 = root.join(format!("clip-{stamp}.mp4"));
-        if let Some(ffmpeg) = find_ffmpeg() {
-            match encode_mp4_ffmpeg(&ffmpeg, &mp4, w, h, fps, &bgra_frames) {
-                Ok(()) => return Ok(mp4),
-                Err(e) => {
-                    tracing::warn!(error = %e, "ffmpeg encode failed; falling back to MJPEG AVI");
-                    let _ = fs::remove_file(&mp4);
-                }
-            }
-        } else {
-            tracing::info!("ffmpeg not found; encoding MJPEG AVI fallback");
-        }
-
-        let avi = root.join(format!("clip-{stamp}.avi"));
-        encode_mjpeg_avi(&avi, w, h, fps, &bgra_frames)?;
-        Ok(avi)
+        Ok(ReplaySnapshot {
+            frames: self.frames.iter().cloned().collect(),
+        })
     }
+
+    /// Encode buffered frames to a video file under `%APPDATA%/CaptureView/clips/`.
+    /// Prefers ffmpeg H.264 `.mp4`; falls back to in-process MJPEG `.avi`.
+    /// Prefer [`Self::snapshot_for_encode`] + [`ReplaySnapshot::encode`] on a worker.
+    pub fn save_clip(&self) -> Result<PathBuf, String> {
+        self.snapshot_for_encode()?.encode()
+    }
+}
+
+/// Owned ring snapshot for off-thread encode (keeps UI / present free).
+pub struct ReplaySnapshot {
+    frames: Vec<StoredFrame>,
+}
+
+impl ReplaySnapshot {
+    pub fn frame_count(&self) -> usize {
+        self.frames.len()
+    }
+
+    /// Encode to `%APPDATA%/CaptureView/clips/` — safe to call from a background thread.
+    pub fn encode(self) -> Result<PathBuf, String> {
+        encode_frames(&self.frames)
+    }
+}
+
+fn encode_frames(frames: &[StoredFrame]) -> Result<PathBuf, String> {
+    if frames.is_empty() {
+        return Err("replay buffer empty".into());
+    }
+    let root = clips_dir().ok_or_else(|| "no app data dir".to_string())?;
+    fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let w = frames[0].width;
+    let h = frames[0].height;
+    let fps = estimate_fps_slice(frames).clamp(10.0, 60.0);
+
+    // Materialize BGRA once (encode path only — not on the capture hot path).
+    let mut bgra_frames: Vec<Vec<u8>> = Vec::with_capacity(frames.len());
+    for frame in frames {
+        let bgra = stored_to_bgra(frame).ok_or_else(|| "frame convert failed".to_string())?;
+        bgra_frames.push(bgra);
+    }
+
+    let mp4 = root.join(format!("clip-{stamp}.mp4"));
+    if let Some(ffmpeg) = find_ffmpeg() {
+        match encode_mp4_ffmpeg(&ffmpeg, &mp4, w, h, fps, &bgra_frames) {
+            Ok(()) => return Ok(mp4),
+            Err(e) => {
+                tracing::warn!(error = %e, "ffmpeg encode failed; falling back to MJPEG AVI");
+                let _ = fs::remove_file(&mp4);
+            }
+        }
+    } else {
+        tracing::info!("ffmpeg not found; encoding MJPEG AVI fallback");
+    }
+
+    let avi = root.join(format!("clip-{stamp}.avi"));
+    encode_mjpeg_avi(&avi, w, h, fps, &bgra_frames)?;
+    Ok(avi)
 }
 
 pub fn clips_dir() -> Option<PathBuf> {
     let mut p = app_data_dir()?;
     p.push("clips");
     Some(p)
+}
+
+/// `%APPDATA%\CaptureView\luts` — imported `.cube` files live next to clips prefs.
+pub fn luts_dir() -> Option<PathBuf> {
+    let mut p = app_data_dir()?;
+    p.push("luts");
+    Some(p)
+}
+
+/// Copy a `.cube` into the app LUT folder; returns the destination path.
+pub fn import_cube_lut(src: &Path) -> Result<PathBuf, String> {
+    if !src.is_file() {
+        return Err("not a file".into());
+    }
+    let ext = src
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if ext != "cube" {
+        return Err("expected .cube".into());
+    }
+    let root = luts_dir().ok_or_else(|| "no app data dir".to_string())?;
+    fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+    let name = src
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_else(|| "imported.cube".into());
+    let dest = root.join(name);
+    fs::copy(src, &dest).map_err(|e| e.to_string())?;
+    Ok(dest)
 }
 
 /// List saved clips (files + legacy PNG-sequence folders), newest first.
@@ -360,15 +427,15 @@ fn stored_to_bgra(frame: &StoredFrame) -> Option<Vec<u8>> {
     }
 }
 
-fn estimate_fps(frames: &VecDeque<StoredFrame>) -> f32 {
+fn estimate_fps_slice(frames: &[StoredFrame]) -> f32 {
     if frames.len() < 2 {
         return 20.0;
     }
     let dt = frames
-        .back()
+        .last()
         .unwrap()
         .at
-        .duration_since(frames.front().unwrap().at);
+        .duration_since(frames.first().unwrap().at);
     if dt.as_secs_f32() <= 0.001 {
         return 20.0;
     }
@@ -468,9 +535,9 @@ fn encode_mp4_ffmpeg(
             "-c:v",
             "libx264",
             "-preset",
-            "veryfast",
+            "faster",
             "-crf",
-            "23",
+            ENCODE_CRF,
             "-pix_fmt",
             "yuv420p",
             "-movflags",
@@ -538,7 +605,7 @@ fn encode_mjpeg_avi(
         }
         let mut jpeg = Vec::new();
         let mut cursor = std::io::Cursor::new(&mut jpeg);
-        let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut cursor, 85);
+        let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut cursor, MJPEG_QUALITY);
         enc.encode(&rgba, w, h, image::ExtendedColorType::Rgba8)
             .map_err(|e| e.to_string())?;
         jpegs.push(jpeg);

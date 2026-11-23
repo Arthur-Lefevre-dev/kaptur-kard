@@ -49,7 +49,8 @@ use crate::health::HealthMonitor;
 use crate::i18n::{I18n, Lang};
 use crate::lut::{CubeLut1d, GradePrefs};
 use crate::prefs::{
-    load_audio_prefs, load_ui_prefs, save_audio_prefs, save_ui_prefs, AudioPrefs, UiPrefs,
+    load_audio_prefs, load_ui_prefs, migrate_latency_defaults, save_audio_prefs, save_ui_prefs,
+    AudioPrefs, UiPrefs,
 };
 use crate::profiles::NamedProfile;
 use crate::replay::{self, ReplayBuffer};
@@ -219,6 +220,8 @@ pub struct App {
     /// Non-blocking hot-plug result. MF enum never runs on the UI thread.
     hotplug_rx: Option<Receiver<HotplugResult>>,
     hotplug_inflight: bool,
+    /// Background clip encode result (never block UI / present on ffmpeg).
+    clip_save_rx: Option<Receiver<Result<std::path::PathBuf, String>>>,
     /// Throttle expensive metrics percentile / graph copy (UI only).
     last_metrics_ui_at: Instant,
     cached_one_percent_low: f32,
@@ -277,7 +280,10 @@ impl Default for App {
         };
         devices.push(mock_info.clone());
 
-        let ui_prefs_early = load_ui_prefs();
+        let mut ui_prefs_early = load_ui_prefs();
+        if migrate_latency_defaults(&mut ui_prefs_early) {
+            save_ui_prefs(&ui_prefs_early);
+        }
         let preferred = capture::pick_preferred_device_index(&devices).unwrap_or(0);
         let device_idx = if !ui_prefs_early.last_device_id.is_empty() {
             match devices
@@ -493,6 +499,7 @@ impl Default for App {
             last_hotplug_at: Instant::now(),
             hotplug_rx: None,
             hotplug_inflight: false,
+            clip_save_rx: None,
             last_metrics_ui_at: Instant::now()
                 .checked_sub(Duration::from_secs(1))
                 .unwrap_or_else(Instant::now),
@@ -778,6 +785,7 @@ impl ApplicationHandler<UserEvent> for App {
 
         // Apply finished presence polls; only start a new one when not near a present.
         self.poll_hotplug_async(until_due > HOTPLUG_PRESENT_SLACK && !due);
+        self.poll_clip_save();
         self.flush_prefs_if_due();
         self.push_discord_activity(false);
 
@@ -1877,6 +1885,9 @@ impl App {
         if actions.refresh_clips {
             self.refresh_clips_list();
         }
+        if actions.import_cube_lut {
+            self.import_cube_lut_dialog();
+        }
         if let Some(path) = actions.play_clip {
             replay::play_clip(&path);
         }
@@ -2170,33 +2181,114 @@ impl App {
         }
     }
 
-    fn save_replay_clip(&mut self) {
-        match self.replay.save_clip() {
-            Ok(path) => {
-                let frames = self.replay.frame_count();
-                let msg = format!(
-                    "{} ({frames}) — {}",
-                    self.i18n.t("msg_replay_saved"),
-                    path.display()
-                );
-                // Longer dwell so the path is readable.
-                self.show_toast_kind(msg, ToastKind::Success, Duration::from_secs(6));
-                self.refresh_clips_list();
+    /// Native file picker → copy `.cube` into `%APPDATA%\CaptureView\luts\` → load.
+    fn import_cube_lut_dialog(&mut self) {
+        let picked = rfd::FileDialog::new()
+            .add_filter("CUBE LUT", &["cube"])
+            .set_title(self.i18n.t("btn_cube_import"))
+            .pick_file();
+        let Some(src) = picked else {
+            return;
+        };
+        match replay::import_cube_lut(&src) {
+            Ok(dest) => self.load_cube_lut(dest.display().to_string()),
+            Err(e) => {
+                tracing::warn!(error = %e, "cube lut import failed");
+                self.show_toast(self.i18n.t("msg_cube_import_err"));
             }
+        }
+    }
+
+    /// Snapshot ring + encode on a worker — never block UI / present / capture.
+    fn save_replay_clip(&mut self) {
+        if self.clip_save_rx.is_some() {
+            self.show_toast_kind(
+                self.i18n.t("msg_replay_busy"),
+                ToastKind::Neutral,
+                Duration::from_secs(3),
+            );
+            return;
+        }
+        let snapshot = match self.replay.snapshot_for_encode() {
+            Ok(s) => s,
             Err(e) if e.contains("empty") => {
                 self.show_toast_kind(
                     self.i18n.t("msg_replay_empty"),
                     ToastKind::Error,
                     Duration::from_secs(5),
                 );
+                return;
             }
             Err(e) => {
-                tracing::warn!(error = %e, "replay save failed");
+                tracing::warn!(error = %e, "replay snapshot failed");
                 self.show_toast_kind(
                     self.i18n.t("msg_replay_err"),
                     ToastKind::Error,
                     Duration::from_secs(5),
                 );
+                return;
+            }
+        };
+        let frames = snapshot.frame_count();
+        self.show_toast_kind(
+            format!("{} ({frames})", self.i18n.t("msg_replay_encoding")),
+            ToastKind::Neutral,
+            Duration::from_secs(30),
+        );
+        self.overlay.clip_encoding = true;
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        self.clip_save_rx = Some(rx);
+        let proxy = self.proxy.clone();
+        let _ = thread::Builder::new()
+            .name("clip-encode".into())
+            .spawn(move || {
+                let result = snapshot.encode();
+                let _ = tx.send(result);
+                if let Some(proxy) = proxy {
+                    let _ = proxy.send_event(UserEvent::FrameReady);
+                }
+            });
+    }
+
+    fn poll_clip_save(&mut self) {
+        let Some(rx) = self.clip_save_rx.as_ref() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(result) => {
+                self.clip_save_rx = None;
+                self.overlay.clip_encoding = false;
+                match result {
+                    Ok(path) => {
+                        let msg = format!(
+                            "{} — {}",
+                            self.i18n.t("msg_replay_saved"),
+                            path.display()
+                        );
+                        self.show_toast_kind(msg, ToastKind::Success, Duration::from_secs(6));
+                        self.refresh_clips_list();
+                    }
+                    Err(e) if e.contains("empty") => {
+                        self.show_toast_kind(
+                            self.i18n.t("msg_replay_empty"),
+                            ToastKind::Error,
+                            Duration::from_secs(5),
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "replay save failed");
+                        self.show_toast_kind(
+                            self.i18n.t("msg_replay_err"),
+                            ToastKind::Error,
+                            Duration::from_secs(5),
+                        );
+                    }
+                }
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                self.clip_save_rx = None;
+                self.overlay.clip_encoding = false;
             }
         }
     }
@@ -2213,6 +2305,7 @@ impl App {
         self.overlay.replay_enabled = self.ui_prefs.replay_enabled;
         self.overlay.replay_seconds = self.ui_prefs.replay_seconds;
         self.overlay.replay_frames = self.replay.frame_count() as u32;
+        self.overlay.clip_encoding = self.clip_save_rx.is_some();
         self.overlay.grade = self.ui_prefs.grade;
         self.overlay.cube_lut_path = self.ui_prefs.cube_lut_path.clone();
         self.overlay.health = self.health.ui.clone();
