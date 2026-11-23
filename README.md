@@ -166,13 +166,22 @@ Use an external LED / high-speed camera / dedicated lag tester for absolute HDMI
 
 ## Releases
 
-Prebuilt binaries (Windows / Linux / macOS) are published on the GitHub Releases page for this repository. Local packaging on Windows:
+Prebuilt binaries (Windows / Linux / macOS) are published on the GitHub Releases page for this repository.
+
+### Windows install (MSI)
+
+Preferred: download **`captureview-windows-x64.msi`**, double-click to install (Start Menu shortcut; optional desktop shortcut in the feature tree). Uninstall from **Settings → Apps → Installed apps** (Add/Remove Programs) — search for **CaptureView**.
+
+Portable zip (`captureview-windows-x64.zip`) remains available if you prefer no installer.
+
+Local packaging on Windows:
 
 ```powershell
-.\scripts\package-windows.ps1
+.\scripts\package-windows.ps1          # zip only
+.\scripts\build-msi.ps1                # zip staging + WiX MSI (needs .NET SDK + `wix` tool)
 ```
 
-CI workflow: `.github/workflows/release.yml` (tag `v*` or `workflow_dispatch`).
+CI workflow: `.github/workflows/release.yml` (tag `v*` or `workflow_dispatch`) uploads both the zip and the MSI.
 
 ## What’s next
 

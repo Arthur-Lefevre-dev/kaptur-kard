@@ -1,16 +1,20 @@
 ﻿# Package a Windows release zip next to the release binary.
+# For MSI (Start Menu / ARP uninstall), see scripts/build-msi.ps1.
 param(
     [string]$OutDir = "dist/captureview-windows-x64",
-    [string]$ZipPath = "dist/captureview-windows-x64.zip"
+    [string]$ZipPath = "dist/captureview-windows-x64.zip",
+    [switch]$SkipBuild
 )
 
 $ErrorActionPreference = "Stop"
 $root = Resolve-Path (Join-Path $PSScriptRoot "..")
 Set-Location $root
 
-Write-Host "Building release binary..."
-cargo build --release -p captureview
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+if (-not $SkipBuild) {
+    Write-Host "Building release binary..."
+    cargo build --release -p captureview
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+}
 
 $exe = Join-Path $root "target/release/captureview.exe"
 if (-not (Test-Path $exe)) {
@@ -21,8 +25,11 @@ New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 Copy-Item $exe (Join-Path $OutDir "captureview.exe") -Force
 Copy-Item (Join-Path $root "README.md") (Join-Path $OutDir "README.md") -Force
 Copy-Item (Join-Path $root "LICENSE") (Join-Path $OutDir "LICENSE") -Force
+$licOut = Join-Path $OutDir "licenses"
+if (Test-Path $licOut) { Remove-Item $licOut -Recurse -Force }
+New-Item -ItemType Directory -Force -Path $licOut | Out-Null
 if (Test-Path (Join-Path $root "licenses")) {
-    Copy-Item (Join-Path $root "licenses") (Join-Path $OutDir "licenses") -Recurse -Force
+    Copy-Item (Join-Path $root "licenses\*") $licOut -Force
 }
 # Spout2 (BSD) — bundled; never ship NDI DLLs.
 $spoutSrc = Join-Path $root "third_party/spout"

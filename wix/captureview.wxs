@@ -1,0 +1,120 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  CaptureView / KapturKard Windows x64 MSI (WiX v5).
+  Built by scripts/build-msi.ps1 — preprocessor vars: ProductVersion, StageDir, RepoRoot.
+  UpgradeCode is stable across releases so MajorUpgrade replaces prior installs.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+  <Package
+      Name="CaptureView"
+      Manufacturer="KapturKard"
+      Version="$(var.ProductVersion)"
+      UpgradeCode="AAC395CE-BB87-4A5F-A5EF-1EF741311A16"
+      Language="1033"
+      Scope="perMachine">
+
+    <SummaryInformation
+        Description="Desktop preview for UVC / capture-card sources (KapturKard)"
+        Manufacturer="KapturKard" />
+
+    <MajorUpgrade
+        DowngradeErrorMessage="A newer version of CaptureView is already installed. Remove it first if you need to install this build."
+        Schedule="afterInstallInitialize" />
+
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <!-- Add/Remove Programs (ARP) -->
+    <Icon Id="AppIcon" SourceFile="$(var.RepoRoot)\assets\kapturkard-logo.ico" />
+    <Property Id="ARPPRODUCTICON" Value="AppIcon" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/Arthur-Lefevre-dev/kaptur-kard" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/Arthur-Lefevre-dev/kaptur-kard" />
+    <Property Id="ARPCOMMENTS" Value="CaptureView / KapturKard — UVC / capture-card desktop preview" />
+    <Property Id="ARPNOREPAIR" Value="1" />
+
+    <Feature Id="ProductFeature" Title="CaptureView" Description="Application files and Start Menu shortcut" Level="1" ConfigurableDirectory="INSTALLFOLDER" AllowAbsent="no">
+      <ComponentGroupRef Id="AppFiles" />
+      <ComponentRef Id="StartMenuShortcut" />
+    </Feature>
+
+    <!-- Optional: user can uncheck in the feature tree -->
+    <Feature Id="DesktopShortcutFeature" Title="Desktop shortcut" Description="Create a CaptureView shortcut on the desktop" Level="1">
+      <ComponentRef Id="DesktopShortcut" />
+    </Feature>
+
+    <ui:WixUI Id="WixUI_FeatureTree" />
+    <WixVariable Id="WixUILicenseRtf" Value="$(var.RepoRoot)\wix\License.rtf" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="CaptureView">
+        <Directory Id="AssetsFolder" Name="assets" />
+        <Directory Id="LicensesFolder" Name="licenses" />
+      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="ApplicationProgramsFolder" Name="CaptureView" />
+    </StandardDirectory>
+
+    <StandardDirectory Id="DesktopFolder" />
+
+    <ComponentGroup Id="AppFiles" Directory="INSTALLFOLDER">
+      <Component Id="MainExe" Guid="1D7D8F4D-D60B-4DCB-B696-7C1B9719C448">
+        <File Id="CaptureViewExe" Source="$(var.StageDir)\captureview.exe" KeyPath="yes" />
+      </Component>
+      <Component Id="SpoutLibraryDll" Guid="332918FD-848D-402E-96A5-933E015C46E1">
+        <File Id="SpoutLibraryDll" Source="$(var.StageDir)\SpoutLibrary.dll" KeyPath="yes" />
+      </Component>
+      <Component Id="SpoutBridgeDll" Guid="BEB53B18-50AB-4756-A769-1EAED5FE8B49">
+        <File Id="SpoutBridgeDll" Source="$(var.StageDir)\spout_bridge.dll" KeyPath="yes" />
+      </Component>
+      <Component Id="Readme" Guid="*">
+        <File Id="ReadmeFile" Source="$(var.StageDir)\README.md" KeyPath="yes" />
+      </Component>
+      <Component Id="LicenseFile" Guid="*">
+        <File Id="LicenseMit" Source="$(var.StageDir)\LICENSE" KeyPath="yes" />
+      </Component>
+      <Component Id="ReleaseNotes" Guid="*">
+        <File Id="ReleaseTxt" Source="$(var.StageDir)\RELEASE.txt" KeyPath="yes" />
+      </Component>
+      <Component Id="LogoPng" Directory="AssetsFolder" Guid="*">
+        <File Id="LogoPngFile" Source="$(var.StageDir)\assets\kapturkard-logo.png" KeyPath="yes" />
+      </Component>
+      <Component Id="LicAmdFsr" Directory="LicensesFolder" Guid="*">
+        <File Id="LicAmdFsrFile" Source="$(var.StageDir)\licenses\AMD-FSR1-MIT.txt" KeyPath="yes" />
+      </Component>
+      <Component Id="LicNis" Directory="LicensesFolder" Guid="*">
+        <File Id="LicNisFile" Source="$(var.StageDir)\licenses\NVIDIA-NIS-MIT.txt" KeyPath="yes" />
+      </Component>
+      <Component Id="LicStreamline" Directory="LicensesFolder" Guid="*">
+        <File Id="LicStreamlineFile" Source="$(var.StageDir)\licenses\NVIDIA-STREAMLINE-NOTE.txt" KeyPath="yes" />
+      </Component>
+      <Component Id="LicSpout" Directory="LicensesFolder" Guid="*">
+        <File Id="LicSpoutFile" Source="$(var.StageDir)\licenses\SPOUT-BSD.txt" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <Component Id="StartMenuShortcut" Directory="ApplicationProgramsFolder" Guid="*">
+      <Shortcut
+          Id="StartMenuShortcut"
+          Name="CaptureView"
+          Description="KapturKard / CaptureView"
+          Target="[!CaptureViewExe]"
+          WorkingDirectory="INSTALLFOLDER"
+          Icon="AppIcon" />
+      <RemoveFolder Id="RemoveApplicationProgramsFolder" Directory="ApplicationProgramsFolder" On="uninstall" />
+      <RegistryValue Root="HKCU" Key="Software\KapturKard\CaptureView" Name="StartMenuInstalled" Type="integer" Value="1" KeyPath="yes" />
+    </Component>
+
+    <Component Id="DesktopShortcut" Directory="DesktopFolder" Guid="*">
+      <Shortcut
+          Id="DesktopShortcut"
+          Name="CaptureView"
+          Description="KapturKard / CaptureView"
+          Target="[!CaptureViewExe]"
+          WorkingDirectory="INSTALLFOLDER"
+          Icon="AppIcon" />
+      <RegistryValue Root="HKCU" Key="Software\KapturKard\CaptureView" Name="DesktopInstalled" Type="integer" Value="1" KeyPath="yes" />
+    </Component>
+  </Package>
+</Wix>
