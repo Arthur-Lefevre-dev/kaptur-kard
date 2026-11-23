@@ -406,7 +406,10 @@ impl Default for App {
             },
             current_format: format.clone(),
             metrics: SharedMetrics::new(),
-            overlay: OverlayState::default(),
+            overlay: OverlayState {
+                monitor: ui_prefs.monitor.clone(),
+                ..OverlayState::default()
+            },
             fps_window_start: Instant::now(),
             frames_in_window: 0,
             captures_in_window: 0,
@@ -474,6 +477,14 @@ impl Default for App {
 }
 
 /// Soft fade-in / hold / fade-out for the launch shortcuts card.
+fn push_history(buf: &mut Vec<f32>, value: f32, cap: usize) {
+    buf.push(value);
+    if buf.len() > cap {
+        let drain = buf.len() - cap;
+        buf.drain(0..drain);
+    }
+}
+
 fn launch_tips_alpha(elapsed: Duration) -> f32 {
     const FADE_IN: f32 = 0.35;
     const HOLD: f32 = 4.5;
@@ -1679,6 +1690,11 @@ impl App {
             let _ = crate::logging::set_level(&level);
             self.persist_ui_prefs();
         }
+        if let Some(mon) = actions.monitor_prefs_changed {
+            self.ui_prefs.monitor = mon.clone();
+            self.overlay.monitor = mon;
+            self.persist_ui_prefs();
+        }
         if let Some(lang) = actions.language_changed {
             let lang = Lang::from_pref(lang);
             self.ui_prefs.ui_language = lang.as_str().into();
@@ -2088,11 +2104,32 @@ impl App {
             .map(|p| p.display().to_string())
             .unwrap_or_default();
 
-        // Refresh process CPU/RAM ~2 Hz (UI thread only).
+        // Keep monitor toggles live even if prefs were edited elsewhere.
+        self.overlay.monitor = self.ui_prefs.monitor.clone();
+
+        // Refresh process / system samples ~2 Hz (UI thread only).
         if self.process_sample_at.elapsed() >= Duration::from_millis(500) {
             let sample = sample_process();
-            self.overlay.ram_mb = sample.rss_bytes as f32 / (1024.0 * 1024.0);
+            const HISTORY: usize = 60;
+            let mb = 1024.0_f64 * 1024.0;
+            self.overlay.ram_mb = (sample.rss_bytes as f64 / mb) as f32;
             self.overlay.cpu_one_core = sample.cpu_one_core;
+            self.overlay.system_cpu_frac = sample.system_cpu_frac;
+            self.overlay.per_core_frac = sample.per_core_frac;
+            self.overlay.affinity_mask = sample.affinity_mask;
+            self.overlay.logical_cores = sample.logical_cores;
+            self.overlay.system_ram_used_mb = (sample.system_ram_used_bytes as f64 / mb) as f32;
+            self.overlay.system_ram_total_mb = (sample.system_ram_total_bytes as f64 / mb) as f32;
+            self.overlay.vram_used_mb = (sample.vram_used_bytes as f64 / mb) as f32;
+            self.overlay.vram_budget_mb = (sample.vram_budget_bytes as f64 / mb) as f32;
+            self.overlay.io_read_mbps = (sample.io_read_bps / mb) as f32;
+            self.overlay.io_write_mbps = (sample.io_write_bps / mb) as f32;
+            push_history(
+                &mut self.overlay.cpu_history,
+                sample.cpu_one_core * 100.0,
+                HISTORY,
+            );
+            push_history(&mut self.overlay.ram_history, self.overlay.ram_mb, HISTORY);
             self.process_sample_at = Instant::now();
         }
 
