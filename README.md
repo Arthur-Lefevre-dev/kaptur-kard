@@ -2,54 +2,47 @@
 
 Desktop preview app for generic UVC / capture-card sources. Product / window name **KapturKard**; workspace/binary crate **`captureview`**; repository folder **`kaptur-kard`**. Brand mark: `assets/kapturkard-logo.png` (Windows `.ico` embedded in the exe).
 
-## Screenshots / Captures d’écran
+## Screenshots
 
-Captured from a Windows release build (`captureview.exe`) with the mock color-bars source. UI shown in **French** (switch language under **Infos**).  
-Captures prises depuis un build release Windows avec la source mock. Interface en **français** (langue changeable dans **Infos**).
+Captured from a Windows release build (`captureview.exe`) with the mock color-bars source. Switch UI language under **Info** (F1).
 
-### Preview / Aperçu
+### Preview
 
-Mock 1080p @ 60 Hz preview (frame counter from the synthetic source).  
-Aperçu mock 1080p @ 60 Hz (compteur de frames de la source synthétique).
+Mock 1080p @ 60 Hz preview (frame counter from the synthetic source).
 
-![KapturKard preview / aperçu](docs/images/preview.png)
+![KapturKard preview](docs/images/preview.png)
 
-### Image settings / Réglages Image
+### Picture settings
 
-Source, resolution (**Qualité d’image**), refresh (**Fluidité**), plus impact hints (latency / GPU). Floating toolbar: Image · Son · Effets · Infos · Plein écran.  
-Source, résolution, fluidité, et indicateurs d’impact (retard / GPU). Barre flottante : Image · Son · Effets · Infos · Plein écran.
+Source, resolution (**Picture quality**), refresh (**Smoothness**), plus impact hints (latency / GPU). Floating toolbar: Picture · Sound · Effects · Info · Full screen.
 
-![Image settings / Réglages Image](docs/images/settings-image.png)
+![Picture settings](docs/images/settings-image.png)
 
-### Sound / Son
+### Sound
 
-HDMI capture audio in, speakers/headset out, mute, volume, and level meter.  
-Entrée audio HDMI, sortie casque/haut-parleurs, mute, volume et niveau.
+HDMI capture audio in, speakers/headset out, mute, volume, and level meter.
 
-![Sound settings / Réglages Son](docs/images/settings-sound.png)
+![Sound settings](docs/images/settings-sound.png)
 
-### Effects — FSR / frame gen / Effets
+### Effects — FSR / frame gen
 
-**Mode A — FSR 1**, sharpness (RCAS), optical-flow **interpolation x2**, motion blur, DLSS-G multipliers (RTX path; greyed on AMD), display FPS limit.  
-**Mode A — FSR 1**, netteté (RCAS), **interpolation x2**, flou de mouvement, multiplicateurs DLSS-G (chemin RTX ; grisé sur AMD), limite FPS écran.
+**Mode A — FSR 1**, sharpness (RCAS), optical-flow **interpolation x2**, motion blur, DLSS-G multipliers (RTX path; greyed on AMD), display FPS limit.
 
-![Effects settings / Réglages Effets](docs/images/settings-effects.png)
+![Effects settings](docs/images/settings-effects.png)
 
-### Infos — monitoring graphs, VRR / HDR, language
+### Info — monitoring graphs, VRR / HDR, language
 
-**Graphiques de monitoring** toggles (CPU/RAM/GPU, VRAM, disk I/O, FPS / 1% lows, present latency, framegen throughput), live sparklines, FPS (capture / after interpolation / display), pipeline delay, VSync, **VRR** (G-Sync / FreeSync), **HDR** status, language (English / Français).  
-Cases **Graphiques de monitoring**, courbes live, FPS, retard pipeline, VSync, **VRR**, statut **HDR**, choix de langue.
+**Monitoring graphs** toggles (CPU/RAM/GPU, VRAM, disk I/O, FPS / 1% lows, present latency, framegen throughput), live sparklines, FPS (capture / after interpolation / display), pipeline delay, VSync, **VRR** (G-Sync / FreeSync), **HDR** status, language (English / French).
 
-![Infos monitoring VRR HDR](docs/images/settings-info.png)
+![Info monitoring VRR HDR](docs/images/settings-info.png)
 
-### Metrics overlay (F2) / Mesures
+### Metrics overlay (F2)
 
-**Simple** and **Detailed** overlays — VRR/HDR lines; detailed mode adds CPU/RAM/VRAM graphs and frame-time history.  
-Overlays **simple** et **détail** — lignes VRR/HDR ; le détail ajoute les graphiques CPU/RAM/VRAM et l’historique des temps d’image.
+**Simple** and **Detailed** overlays — VRR/HDR lines; detailed mode adds CPU/RAM/VRAM graphs and frame-time history.
 
-| Simple | Detailed / Détail |
-|--------|-------------------|
-| ![Mesures simple](docs/images/metrics-simple.png) | ![Mesures détail](docs/images/metrics-detailed.png) |
+| Simple | Detailed |
+|--------|----------|
+| ![Simple metrics](docs/images/metrics-simple.png) | ![Detailed metrics](docs/images/metrics-detailed.png) |
 
 ## Status
 
