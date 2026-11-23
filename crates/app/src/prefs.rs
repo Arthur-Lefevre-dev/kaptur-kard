@@ -98,6 +98,61 @@ pub struct UiPrefs {
     /// Per-device overrides (id → range/matrix).
     #[serde(default)]
     pub device_colors: Vec<DeviceColorPrefs>,
+    /// Live monitoring graphs / HUD line toggles (Infos + F2 overlay).
+    #[serde(default)]
+    pub monitor: MonitorPrefs,
+}
+
+/// Which live monitoring graphs and HUD lines are visible.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct MonitorPrefs {
+    /// Process CPU % sparkline.
+    #[serde(default = "default_true")]
+    pub graph_cpu: bool,
+    /// Process / system RAM sparkline.
+    #[serde(default = "default_true")]
+    pub graph_ram: bool,
+    /// Frame-time / present-load sparkline (GPU present cost).
+    #[serde(default = "default_true")]
+    pub graph_gpu: bool,
+    /// Per-core bars + process affinity highlight.
+    #[serde(default)]
+    pub cpu_cores: bool,
+    /// Dedicated VRAM usage (DXGI local segment).
+    #[serde(default)]
+    pub vram: bool,
+    /// Process working-set text line.
+    #[serde(default = "default_true")]
+    pub process_ram: bool,
+    /// 1% low FPS line.
+    #[serde(default = "default_true")]
+    pub fps_1pct: bool,
+    /// Capture→present latency line.
+    #[serde(default = "default_true")]
+    pub present_latency: bool,
+    /// Optical / DLSS frame-gen rate in the FPS row.
+    #[serde(default = "default_true")]
+    pub framegen_rate: bool,
+    /// Process disk read/write throughput.
+    #[serde(default)]
+    pub disk_io: bool,
+}
+
+impl Default for MonitorPrefs {
+    fn default() -> Self {
+        Self {
+            graph_cpu: true,
+            graph_ram: true,
+            graph_gpu: true,
+            cpu_cores: false,
+            vram: false,
+            process_ram: true,
+            fps_1pct: true,
+            present_latency: true,
+            framegen_rate: true,
+            disk_io: false,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -171,6 +226,7 @@ impl Default for UiPrefs {
             color_range: "auto".into(),
             color_matrix: "auto".into(),
             device_colors: Vec::new(),
+            monitor: MonitorPrefs::default(),
         }
     }
 }

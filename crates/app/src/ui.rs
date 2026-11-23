@@ -7,6 +7,7 @@ use capture::{
 use egui::{Color32, Context, Key, Modifiers, RichText, Sense};
 
 use crate::i18n::I18n;
+use crate::prefs::MonitorPrefs;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SettingsTab {
@@ -113,6 +114,26 @@ pub struct OverlayState {
     pub gpu_name: String,
     pub cpu_one_core: f32,
     pub ram_mb: f32,
+    /// System RAM used / total (MiB).
+    pub system_ram_used_mb: f32,
+    pub system_ram_total_mb: f32,
+    /// System-wide average CPU busy (0..=1).
+    pub system_cpu_frac: f32,
+    /// Per-logical-core busy fractions (0..=1).
+    pub per_core_frac: Vec<f32>,
+    /// Process affinity mask (bit i = core may run this process).
+    pub affinity_mask: u64,
+    pub logical_cores: u32,
+    pub vram_used_mb: f32,
+    pub vram_budget_mb: f32,
+    pub io_read_mbps: f32,
+    pub io_write_mbps: f32,
+    /// Recent process CPU % (0..=100+) for the CPU graph.
+    pub cpu_history: Vec<f32>,
+    /// Recent process RAM MiB for the RAM graph.
+    pub ram_history: Vec<f32>,
+    /// Which monitor graphs / lines are enabled (from prefs).
+    pub monitor: MonitorPrefs,
     pub mode_label: String,
     pub format_label: String,
     pub metrics_mode: MetricsMode,
@@ -158,6 +179,19 @@ impl Default for OverlayState {
             gpu_name: String::new(),
             cpu_one_core: 0.0,
             ram_mb: 0.0,
+            system_ram_used_mb: 0.0,
+            system_ram_total_mb: 0.0,
+            system_cpu_frac: 0.0,
+            per_core_frac: Vec::new(),
+            affinity_mask: 0,
+            logical_cores: 0,
+            vram_used_mb: 0.0,
+            vram_budget_mb: 0.0,
+            io_read_mbps: 0.0,
+            io_write_mbps: 0.0,
+            cpu_history: Vec::new(),
+            ram_history: Vec::new(),
+            monitor: MonitorPrefs::default(),
             mode_label: String::new(),
             format_label: String::new(),
             metrics_mode: MetricsMode::Off,
@@ -280,6 +314,8 @@ pub struct UiActions {
     pub color_range_toggle: bool,
     /// User dismissed the brief launch shortcuts overlay.
     pub dismiss_launch_tips: bool,
+    /// Full replacement of monitor graph / HUD toggles (apply immediately).
+    pub monitor_prefs_changed: Option<MonitorPrefs>,
 }
 
 #[derive(Clone, Debug)]
@@ -1330,6 +1366,9 @@ fn draw_info_tab(ui: &mut egui::Ui, input: &DrawInput<'_>, actions: &mut UiActio
     draw_brand_header(ui, input.logo.as_ref(), i18n);
     ui.label(RichText::new(i18n.t("metrics_disclaimer")).small().weak());
     ui.add_space(4.0);
+    draw_monitor_prefs(ui, i18n, &o.monitor, actions);
+    ui.add_space(8.0);
+    ui.separator();
     draw_metrics_body(ui, i18n, o, true);
     ui.add_space(8.0);
     ui.separator();
@@ -1527,28 +1566,199 @@ fn draw_metrics_overlay(
         });
 }
 
-fn draw_metrics_body(ui: &mut egui::Ui, i18n: &I18n, o: &OverlayState, detailed: bool) {
-    let gen_label = if o.frame_gen_fps > 0.5 {
-        format!("{:.0}", o.frame_gen_fps)
+fn draw_monitor_prefs(
+    ui: &mut egui::Ui,
+    i18n: &I18n,
+    prefs: &MonitorPrefs,
+    actions: &mut UiActions,
+) {
+    ui.label(RichText::new(i18n.t("section_monitor_graphs")).strong());
+    ui.label(
+        RichText::new(i18n.t("tip_monitor_graphs"))
+            .small()
+            .italics(),
+    );
+    let mut next = prefs.clone();
+    let mut changed = false;
+    ui.horizontal_wrapped(|ui| {
+        changed |= ui
+            .checkbox(&mut next.graph_cpu, i18n.t("mon_graph_cpu"))
+            .changed();
+        changed |= ui
+            .checkbox(&mut next.graph_ram, i18n.t("mon_graph_ram"))
+            .changed();
+        changed |= ui
+            .checkbox(&mut next.graph_gpu, i18n.t("mon_graph_gpu"))
+            .changed();
+    });
+    ui.horizontal_wrapped(|ui| {
+        changed |= ui
+            .checkbox(&mut next.cpu_cores, i18n.t("mon_cpu_cores"))
+            .changed();
+        changed |= ui.checkbox(&mut next.vram, i18n.t("mon_vram")).changed();
+        changed |= ui
+            .checkbox(&mut next.process_ram, i18n.t("mon_process_ram"))
+            .changed();
+        changed |= ui
+            .checkbox(&mut next.disk_io, i18n.t("mon_disk_io"))
+            .changed();
+    });
+    ui.horizontal_wrapped(|ui| {
+        changed |= ui
+            .checkbox(&mut next.fps_1pct, i18n.t("mon_fps_1pct"))
+            .changed();
+        changed |= ui
+            .checkbox(&mut next.present_latency, i18n.t("mon_present_latency"))
+            .changed();
+        changed |= ui
+            .checkbox(&mut next.framegen_rate, i18n.t("mon_framegen_rate"))
+            .changed();
+    });
+    if changed {
+        actions.monitor_prefs_changed = Some(next);
+    }
+}
+
+fn draw_sparkline(ui: &mut egui::Ui, values: &[f32], max_hint: f32, color_fn: impl Fn(f32) -> Color32) {
+    if values.is_empty() {
+        ui.weak("—");
+        return;
+    }
+    let max_v = values
+        .iter()
+        .copied()
+        .fold(max_hint, f32::max)
+        .max(max_hint)
+        .max(1.0);
+    let (rect, _resp) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width().min(280.0), 40.0),
+        Sense::hover(),
+    );
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 2.0, Color32::from_rgb(24, 28, 34));
+    let n = values.len().max(1) as f32;
+    for (i, &v) in values.iter().enumerate() {
+        let x0 = rect.left() + rect.width() * (i as f32 / n);
+        let x1 = rect.left() + rect.width() * ((i as f32 + 1.0) / n);
+        let h = (v / max_v).clamp(0.0, 1.0) * rect.height();
+        let bar = egui::Rect::from_min_max(
+            egui::pos2(x0, rect.bottom() - h),
+            egui::pos2(x1.max(x0 + 1.0), rect.bottom()),
+        );
+        painter.rect_filled(bar, 0.0, color_fn(v));
+    }
+}
+
+fn draw_cpu_cores(ui: &mut egui::Ui, i18n: &I18n, o: &OverlayState) {
+    ui.label(i18n.t("label_cpu_cores"));
+    let cores = o.per_core_frac.len().max(o.logical_cores as usize).max(1);
+    let fracs = if o.per_core_frac.is_empty() {
+        vec![0.0f32; cores]
     } else {
-        "—".into()
+        o.per_core_frac.clone()
     };
-    ui.label(format!(
-        "{}: {:.0}  ·  {}: {}  ·  {}: {:.0}",
-        i18n.t("label_capture_fps"),
-        o.capture_fps,
-        i18n.t("label_frame_gen_fps"),
-        gen_label,
-        i18n.t("label_display_fps"),
-        o.fps
-    ));
-    ui.label(format!(
-        "{}: {:.0} ms  ·  {}: {}",
-        i18n.t("label_pipeline_delay"),
-        o.pipeline_delay_ms,
-        i18n.t("label_display_fps_limit"),
-        display_fps_limit_label(i18n, o.display_fps_limit)
-    ));
+    let cols = cores.min(16).max(1);
+    let bar_w = (ui.available_width().min(280.0) / cols as f32).clamp(8.0, 18.0);
+    let bar_h = 28.0;
+    ui.horizontal_wrapped(|ui| {
+        for (i, &frac) in fracs.iter().enumerate().take(64) {
+            let allowed = if i < 64 {
+                (o.affinity_mask >> i) & 1 == 1
+            } else {
+                true
+            };
+            let (rect, resp) = ui.allocate_exact_size(egui::vec2(bar_w, bar_h), Sense::hover());
+            let painter = ui.painter_at(rect);
+            let bg = if allowed {
+                Color32::from_rgb(28, 34, 42)
+            } else {
+                Color32::from_rgb(18, 18, 22)
+            };
+            painter.rect_filled(rect, 2.0, bg);
+            let h = frac.clamp(0.0, 1.0) * rect.height();
+            let fill = egui::Rect::from_min_max(
+                egui::pos2(rect.left(), rect.bottom() - h),
+                egui::pos2(rect.right(), rect.bottom()),
+            );
+            let color = if !allowed {
+                Color32::from_rgb(60, 60, 70)
+            } else if frac > 0.85 {
+                Color32::from_rgb(220, 100, 90)
+            } else if frac > 0.55 {
+                Color32::from_rgb(220, 180, 80)
+            } else {
+                Color32::from_rgb(90, 180, 140)
+            };
+            painter.rect_filled(fill, 0.0, color);
+            if allowed {
+                painter.rect_stroke(
+                    rect,
+                    2.0,
+                    egui::Stroke::new(1.0_f32, Color32::from_rgb(70, 140, 200)),
+                    egui::StrokeKind::Inside,
+                );
+            }
+            resp.on_hover_text(format!(
+                "{} {} · {:.0}%{}",
+                i18n.t("label_core"),
+                i,
+                frac * 100.0,
+                if allowed {
+                    format!(" · {}", i18n.t("label_core_affinity"))
+                } else {
+                    String::new()
+                }
+            ));
+        }
+    });
+    ui.label(
+        RichText::new(i18n.t("tip_cpu_cores_affinity"))
+            .small()
+            .weak(),
+    );
+}
+
+fn draw_metrics_body(ui: &mut egui::Ui, i18n: &I18n, o: &OverlayState, detailed: bool) {
+    let m = &o.monitor;
+    if m.framegen_rate {
+        let gen_label = if o.frame_gen_fps > 0.5 {
+            format!("{:.0}", o.frame_gen_fps)
+        } else {
+            "—".into()
+        };
+        ui.label(format!(
+            "{}: {:.0}  ·  {}: {}  ·  {}: {:.0}",
+            i18n.t("label_capture_fps"),
+            o.capture_fps,
+            i18n.t("label_frame_gen_fps"),
+            gen_label,
+            i18n.t("label_display_fps"),
+            o.fps
+        ));
+    } else {
+        ui.label(format!(
+            "{}: {:.0}  ·  {}: {:.0}",
+            i18n.t("label_capture_fps"),
+            o.capture_fps,
+            i18n.t("label_display_fps"),
+            o.fps
+        ));
+    }
+    if m.present_latency {
+        ui.label(format!(
+            "{}: {:.0} ms  ·  {}: {}",
+            i18n.t("label_pipeline_delay"),
+            o.pipeline_delay_ms,
+            i18n.t("label_display_fps_limit"),
+            display_fps_limit_label(i18n, o.display_fps_limit)
+        ));
+    } else {
+        ui.label(format!(
+            "{}: {}",
+            i18n.t("label_display_fps_limit"),
+            display_fps_limit_label(i18n, o.display_fps_limit)
+        ));
+    }
     ui.label(format!(
         "{}: {}",
         i18n.t("label_vsync"),
@@ -1557,56 +1767,121 @@ fn draw_metrics_body(ui: &mut egui::Ui, i18n: &I18n, o: &OverlayState, detailed:
     ui.label(vrr_status_line(i18n, o));
     ui.label(hdr_status_line(i18n, o));
     if !detailed {
+        // Simple mode still shows enabled graphs so toggles are useful without F2 detail.
+        draw_monitor_graphs(ui, i18n, o);
         return;
     }
-    ui.label(format!(
-        "{}: {:.0}  ·  {}: {}",
-        i18n.t("label_one_percent_low"),
-        o.one_percent_low_fps,
-        i18n.t("label_dropped"),
-        o.dropped_frames
-    ));
-    ui.label(format!(
-        "{}: {:.0}%  ·  {}: {:.0} Mo",
-        i18n.t("label_cpu"),
-        o.cpu_one_core * 100.0,
-        i18n.t("label_ram"),
-        o.ram_mb
-    ));
+    if m.fps_1pct {
+        ui.label(format!(
+            "{}: {:.0}  ·  {}: {}",
+            i18n.t("label_one_percent_low"),
+            o.one_percent_low_fps,
+            i18n.t("label_dropped"),
+            o.dropped_frames
+        ));
+    } else {
+        ui.label(format!("{}: {}", i18n.t("label_dropped"), o.dropped_frames));
+    }
+    if m.process_ram {
+        ui.label(format!(
+            "{}: {:.0}%  ·  {}: {:.0} Mo",
+            i18n.t("label_cpu"),
+            o.cpu_one_core * 100.0,
+            i18n.t("label_ram"),
+            o.ram_mb
+        ));
+    } else {
+        ui.label(format!(
+            "{}: {:.0}%",
+            i18n.t("label_cpu"),
+            o.cpu_one_core * 100.0
+        ));
+    }
+    if m.vram && o.vram_budget_mb > 0.0 {
+        ui.label(format!(
+            "{}: {:.0} / {:.0} Mo",
+            i18n.t("label_vram"),
+            o.vram_used_mb,
+            o.vram_budget_mb
+        ));
+    }
+    if m.disk_io {
+        ui.label(format!(
+            "{}: ↓ {:.1} · ↑ {:.1} Mo/s",
+            i18n.t("label_disk_io"),
+            o.io_read_mbps,
+            o.io_write_mbps
+        ));
+    }
     ui.label(format!("{}: {}", i18n.t("label_gpu"), o.gpu_name));
     ui.label(format!("{}: {}", i18n.t("label_active_mode"), o.mode_label));
     ui.label(format!("{}: {}", i18n.t("label_active_format"), o.format_label));
-    ui.add_space(4.0);
-    ui.label(i18n.t("label_frame_graph"));
-    let times = &o.frame_times_ms;
-    if times.is_empty() {
-        ui.weak("—");
-    } else {
-        let max_ms = times.iter().copied().fold(1.0f32, f32::max).max(20.0);
-        let (rect, _resp) = ui.allocate_exact_size(
-            egui::vec2(ui.available_width().min(280.0), 48.0),
-            Sense::hover(),
-        );
-        let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, 2.0, Color32::from_rgb(24, 28, 34));
-        let n = times.len().max(1) as f32;
-        for (i, &ms) in times.iter().enumerate() {
-            let x0 = rect.left() + rect.width() * (i as f32 / n);
-            let x1 = rect.left() + rect.width() * ((i as f32 + 1.0) / n);
-            let h = (ms / max_ms).clamp(0.0, 1.0) * rect.height();
-            let bar = egui::Rect::from_min_max(
-                egui::pos2(x0, rect.bottom() - h),
-                egui::pos2(x1.max(x0 + 1.0), rect.bottom()),
-            );
-            let color = if ms > 25.0 {
+    draw_monitor_graphs(ui, i18n, o);
+}
+
+fn draw_monitor_graphs(ui: &mut egui::Ui, i18n: &I18n, o: &OverlayState) {
+    let m = &o.monitor;
+    if m.graph_cpu {
+        ui.add_space(4.0);
+        ui.label(format!(
+            "{} · {:.0}%",
+            i18n.t("label_graph_cpu"),
+            o.cpu_one_core * 100.0
+        ));
+        draw_sparkline(ui, &o.cpu_history, 50.0, |v| {
+            if v > 80.0 {
                 Color32::from_rgb(220, 100, 90)
-            } else if ms > 18.0 {
+            } else if v > 40.0 {
                 Color32::from_rgb(220, 180, 80)
             } else {
-                Color32::from_rgb(90, 180, 140)
-            };
-            painter.rect_filled(bar, 0.0, color);
+                Color32::from_rgb(90, 160, 220)
+            }
+        });
+    }
+    if m.graph_ram {
+        ui.add_space(4.0);
+        let sys = if o.system_ram_total_mb > 0.0 {
+            format!(
+                " · {} {:.0}/{:.0} Mo",
+                i18n.t("label_system_ram"),
+                o.system_ram_used_mb,
+                o.system_ram_total_mb
+            )
+        } else {
+            String::new()
+        };
+        ui.label(format!(
+            "{} · {:.0} Mo{}",
+            i18n.t("label_graph_ram"),
+            o.ram_mb,
+            sys
+        ));
+        let max_hint = o.ram_history.iter().copied().fold(256.0f32, f32::max);
+        draw_sparkline(ui, &o.ram_history, max_hint, |_| {
+            Color32::from_rgb(160, 120, 220)
+        });
+    }
+    if m.graph_gpu {
+        ui.add_space(4.0);
+        ui.label(i18n.t("label_graph_gpu"));
+        let times = &o.frame_times_ms;
+        if times.is_empty() {
+            ui.weak("—");
+        } else {
+            draw_sparkline(ui, times, 20.0, |ms| {
+                if ms > 25.0 {
+                    Color32::from_rgb(220, 100, 90)
+                } else if ms > 18.0 {
+                    Color32::from_rgb(220, 180, 80)
+                } else {
+                    Color32::from_rgb(90, 180, 140)
+                }
+            });
         }
+    }
+    if m.cpu_cores {
+        ui.add_space(4.0);
+        draw_cpu_cores(ui, i18n, o);
     }
 }
 
