@@ -388,6 +388,7 @@ dependencies = [
  "egui-wgpu",
  "egui-winit",
  "image",
+ "libloading",
  "metrics",
  "parking_lot",
  "pollster",

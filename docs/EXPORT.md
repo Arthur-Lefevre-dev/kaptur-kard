@@ -1,22 +1,31 @@
-# Spout / NDI export (BYO runtimes)
+# Spout / NDI export
 
-KapturKard can **share the live preview** with OBS, Resolve, and other tools. Runtimes are **not vendored** (licensing / size). Install them yourself, then enable the toggles under **Infos**.
+KapturKard can **share the live preview** with OBS, Resolve, and other tools.
 
-## Spout (Windows)
+## Spout (Windows) — bundled
 
-- **What:** [Spout2](https://spout.zeal.co/) shared-texture sender (GPU path when the DLL is present).
-- **Install:** Spout2 release from the Spout project; ensure `SpoutLibrary.dll` is on `PATH` or next to `captureview.exe`.
-- **In-app:** Infos → **Spout export**. Sender name defaults to `KapturKard`.
+- **What:** [Spout2](https://spout.zeal.co/) shared-frame sender (`SpoutLibrary.dll`, BSD-2-Clause).
+- **Ship:** Windows builds include `SpoutLibrary.dll` + `spout_bridge.dll` next to `captureview.exe` (also extracted to `%APPDATA%\CaptureView\spout\` on first run if needed).
+- **Probe order:** next to exe → `%APPDATA%\CaptureView\spout\` → `third_party/spout` (dev) → `PATH`.
+- **In-app:** Infos → **Spout**. Sender name defaults to `KapturKard`.
 - **OBS:** Add a Spout2 source and pick `KapturKard`.
-- **Status:** The Infos panel reports whether the DLL was found. Without it, the toggle stays off / shows a clear message — no console spam.
+- **Send path:** CPU **BGRA `SendImage`** via a thin MIT bridge (`native/spout`). This is real Spout output; a GPU shared-texture path (DX/GL interop with wgpu) is **not** wired yet — the UI says so honestly.
+- **License:** SpoutLibrary Simplified BSD — see `licenses/SPOUT-BSD.txt` and `third_party/spout/licence.txt`.
 
-## NDI (optional)
+## NDI (optional) — BYO only
 
 - **What:** NewTek / Vizrt **NDI** network video.
-- **Install:** [NDI Runtime / Tools](https://ndi.video/) (BYO). The app probes `%NDI_RUNTIME_DIR_V6%` / `V5` and `%ProgramFiles%\NDI`.
-- **In-app:** Infos → **NDI export**. Sender name defaults to `KapturKard`.
-- **License:** Respect NewTek NDI license terms; we do not redistribute NDI binaries.
-- **Status:** Scaffolding + probe in v0.3; full send hooks follow once a BYO SDK bridge is linked (`docs/EXPORT.md` stays the source of truth).
+- **Install:** [NDI Tools / Runtime](https://ndi.video/) (BYO). **We do not redistribute NDI DLLs.**
+- **In-app:** Infos → **NDI setup (download)** opens ndi.video; **Re-check** re-probes; **Open NDI folder** when a runtime folder is found.
+- **Probe:** `%NDI_RUNTIME_DIR_V6%` / `V5` / `NDI_RUNTIME_DIR`, then `%ProgramFiles%\NDI`.
+- **Status:** Probe + prefs in this release; full send hooks wait on a BYO SDK bridge (`docs/EXPORT.md` stays the source of truth).
+
+## DLSS (BYO NVIDIA) — related setup UX
+
+Mode C / DLSS-G never ship NVIDIA proprietary DLLs. Effects / Infos show a clear greyed reason and buttons:
+
+- **DLSS setup (docs)** → [docs/DLSS.md](./DLSS.md)
+- **Open DLSS folder** → `%APPDATA%\CaptureView\dlss5-nr\`
 
 ## Replay clips vs live export
 

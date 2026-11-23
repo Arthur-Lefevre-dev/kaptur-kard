@@ -401,6 +401,10 @@ pub struct UiActions {
     pub spout_name_changed: Option<String>,
     pub ndi_name_changed: Option<String>,
     pub export_refresh: bool,
+    pub ndi_open_download: bool,
+    pub ndi_open_folder: bool,
+    pub dlss_open_docs: bool,
+    pub dlss_open_folder: bool,
     pub health_auto_reinit_changed: Option<bool>,
     pub health_stall_secs_changed: Option<u32>,
     pub update_check: bool,
@@ -1235,6 +1239,15 @@ fn draw_effects_tab(ui: &mut egui::Ui, input: &DrawInput<'_>, actions: &mut UiAc
         ui.label(RichText::new(i18n.t("tip_dlss_boost")).small().italics());
     } else if !fx.dlss_ok {
         ui.label(RichText::new(i18n.t("tip_dlss_greyed")).small().italics());
+        ui.label(RichText::new(i18n.t("tip_dlss_byo")).small().italics());
+        ui.horizontal_wrapped(|ui| {
+            if ui.button(i18n.t("btn_dlss_docs")).clicked() {
+                actions.dlss_open_docs = true;
+            }
+            if ui.button(i18n.t("btn_dlss_open_folder")).clicked() {
+                actions.dlss_open_folder = true;
+            }
+        });
     }
     ui.label(RichText::new(i18n.t("tip_upscale")).small().italics());
     ui.add_space(8.0);
@@ -1937,11 +1950,32 @@ fn draw_grade_prefs(ui: &mut egui::Ui, i18n: &I18n, o: &OverlayState, actions: &
 fn draw_export_prefs(ui: &mut egui::Ui, i18n: &I18n, o: &OverlayState, actions: &mut UiActions) {
     ui.label(RichText::new(i18n.t("section_export")).strong());
     ui.label(RichText::new(i18n.t("tip_export")).small().italics());
+
+    // Spout — bundled on Windows; no “missing” when DLL ships with the app.
     let mut spout = o.spout_enabled;
-    if ui.checkbox(&mut spout, i18n.t("label_spout")).changed() {
-        actions.spout_enabled_changed = Some(spout);
+    ui.add_enabled_ui(o.export.spout_available || !cfg!(windows), |ui| {
+        if ui.checkbox(&mut spout, i18n.t("label_spout")).changed() {
+            actions.spout_enabled_changed = Some(spout);
+        }
+    });
+    let spout_key = if o.export.spout_detail_key.is_empty() {
+        "export_spout_missing"
+    } else {
+        o.export.spout_detail_key.as_str()
+    };
+    ui.label(RichText::new(i18n.t(spout_key)).small());
+    if !o.export.spout_dll_path.is_empty() {
+        ui.label(
+            RichText::new(format!(
+                "{}: {}",
+                i18n.t("label_export_dll"),
+                o.export.spout_dll_path
+            ))
+            .small()
+            .weak(),
+        );
     }
-    ui.small(&o.export.spout_detail);
+    ui.label(RichText::new(i18n.t("tip_spout_send")).small().italics());
     let mut spout_name = o.spout_name.clone();
     if ui
         .add(
@@ -1953,11 +1987,35 @@ fn draw_export_prefs(ui: &mut egui::Ui, i18n: &I18n, o: &OverlayState, actions: 
     {
         actions.spout_name_changed = Some(spout_name);
     }
+
+    ui.add_space(6.0);
+    // NDI — BYO only; never redistribute NDI DLLs.
     let mut ndi = o.ndi_enabled;
-    if ui.checkbox(&mut ndi, i18n.t("label_ndi")).changed() {
-        actions.ndi_enabled_changed = Some(ndi);
-    }
-    ui.small(&o.export.ndi_detail);
+    ui.add_enabled_ui(o.export.ndi_available, |ui| {
+        if ui.checkbox(&mut ndi, i18n.t("label_ndi")).changed() {
+            actions.ndi_enabled_changed = Some(ndi);
+        }
+    });
+    let ndi_key = if o.export.ndi_detail_key.is_empty() {
+        "export_ndi_missing"
+    } else {
+        o.export.ndi_detail_key.as_str()
+    };
+    ui.label(RichText::new(i18n.t(ndi_key)).small());
+    ui.label(RichText::new(i18n.t("tip_ndi_setup")).small().italics());
+    ui.horizontal_wrapped(|ui| {
+        if ui.button(i18n.t("btn_ndi_download")).clicked() {
+            actions.ndi_open_download = true;
+        }
+        if ui.button(i18n.t("btn_export_refresh")).clicked() {
+            actions.export_refresh = true;
+        }
+        if !o.export.ndi_folder.is_empty()
+            && ui.button(i18n.t("btn_ndi_open_folder")).clicked()
+        {
+            actions.ndi_open_folder = true;
+        }
+    });
     let mut ndi_name = o.ndi_name.clone();
     if ui
         .add(
@@ -1968,9 +2026,6 @@ fn draw_export_prefs(ui: &mut egui::Ui, i18n: &I18n, o: &OverlayState, actions: 
         .changed()
     {
         actions.ndi_name_changed = Some(ndi_name);
-    }
-    if ui.button(i18n.t("btn_export_refresh")).clicked() {
-        actions.export_refresh = true;
     }
 }
 
