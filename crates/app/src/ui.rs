@@ -301,6 +301,8 @@ pub struct UiChrome {
     pub settings_pinned: bool,
     /// 0 = hidden, 1 = fully visible. Soft launch tips overlay opacity.
     pub launch_tips_alpha: f32,
+    /// Capture-preview style: hide OS cursor after pointer idle over the window.
+    pub hide_idle_cursor: bool,
 }
 
 impl Default for UiChrome {
@@ -317,6 +319,7 @@ impl Default for UiChrome {
             metrics_pinned: false,
             settings_pinned: false,
             launch_tips_alpha: 0.0,
+            hide_idle_cursor: false,
         }
     }
 }
@@ -515,6 +518,11 @@ pub fn draw_ui(ctx: &Context, input: DrawInput<'_>) -> UiActions {
     let pointer_moved = ctx.input(|i| i.pointer.motion().is_some());
     if pointer_moved {
         actions.show_toolbar = true;
+    }
+
+    // Idle cursor hide (CaptureView preview): egui None maps to an invisible cursor.
+    if input.chrome.hide_idle_cursor && !pointer_moved {
+        ctx.set_cursor_icon(egui::CursorIcon::None);
     }
 
     // Keyboard shortcuts: F1 = settings menu, F2 = metrics only (no toolbar).

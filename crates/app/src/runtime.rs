@@ -33,6 +33,9 @@ use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy};
 use winit::window::{Window, WindowId};
 
+/// Hide the OS cursor after this much pointer idle (capture-preview UX).
+const CURSOR_IDLE_HIDE: Duration = Duration::from_millis(1500);
+
 /// Wakes the UI when the capture thread queues a frame (capture-driven present).
 #[derive(Debug, Clone, Copy)]
 pub enum UserEvent {
@@ -205,6 +208,8 @@ pub struct App {
     chrome: UiChrome,
     ui_prefs: UiPrefs,
     last_pointer_at: Instant,
+    /// True while we forced the OS cursor hidden for idle preview.
+    cursor_hidden: bool,
     toast_until: Option<Instant>,
     support_log: Vec<String>,
     process_sample_at: Instant,
@@ -476,6 +481,7 @@ impl Default for App {
             chrome,
             ui_prefs,
             last_pointer_at: Instant::now(),
+            cursor_hidden: false,
             toast_until: None,
             support_log: Vec::new(),
             process_sample_at: Instant::now(),
@@ -694,6 +700,13 @@ impl ApplicationHandler<UserEvent> for App {
         // Compute before borrowing GPU (egui repaint must honor the same FPS cap).
         let redraw_due = Instant::now() >= self.next_present_at;
 
+        // Cursor idle tracking must run before the exclusive GPU borrow.
+        match &event {
+            WindowEvent::CursorMoved { .. } => self.note_pointer_activity(),
+            WindowEvent::CursorLeft { .. } => self.show_os_cursor(),
+            _ => {}
+        }
+
         let Some(gpu) = self.gpu.as_mut() else {
             return;
         };
@@ -776,6 +789,31 @@ impl App {
             let _ = source.stop();
         }
         self.running = false;
+    }
+
+    fn note_pointer_activity(&mut self) {
+        self.last_pointer_at = Instant::now();
+        self.show_os_cursor();
+    }
+
+    fn hide_os_cursor(&mut self) {
+        if self.cursor_hidden {
+            return;
+        }
+        if let Some(gpu) = self.gpu.as_ref() {
+            gpu.window.set_cursor_visible(false);
+        }
+        self.cursor_hidden = true;
+    }
+
+    fn show_os_cursor(&mut self) {
+        if !self.cursor_hidden {
+            return;
+        }
+        if let Some(gpu) = self.gpu.as_ref() {
+            gpu.window.set_cursor_visible(true);
+        }
+        self.cursor_hidden = false;
     }
 
     /// True when optical-flow x2 should drive a 2× present cadence (LS-style).
@@ -1502,7 +1540,7 @@ impl App {
             self.chrome.settings_tab = tab;
             // F1 / settings: show toolbar for quick tabs; F2 must not open this path.
             self.chrome.toolbar_visible = true;
-            self.last_pointer_at = Instant::now();
+            self.note_pointer_activity();
         }
         if actions.close_settings {
             self.chrome.settings_open = false;
@@ -1525,7 +1563,7 @@ impl App {
         }
         if actions.show_toolbar {
             self.chrome.toolbar_visible = true;
-            self.last_pointer_at = Instant::now();
+            self.note_pointer_activity();
         }
         if actions.reset_auto {
             self.reset_to_auto();
@@ -2591,6 +2629,18 @@ impl App {
             self.chrome.toolbar_visible = false;
         }
 
+        // Idle cursor: hide over the preview; keep visible for settings / wizard / UI use.
+        let ui_keeps_cursor = self.chrome.settings_open
+            || self.chrome.wizard_open
+            || self.chrome.launch_tips_alpha > 0.01;
+        let want_hide = !ui_keeps_cursor && self.last_pointer_at.elapsed() > CURSOR_IDLE_HIDE;
+        self.chrome.hide_idle_cursor = want_hide;
+        if want_hide {
+            self.hide_os_cursor();
+        } else {
+            self.show_os_cursor();
+        }
+
         // Launch shortcuts tip: wait until the wizard is gone, then fade in once.
         if !self.launch_tips_dismissed && !self.chrome.wizard_open {
             if self.launch_tips_started.is_none() {
@@ -2690,6 +2740,11 @@ impl App {
         });
         gpu.egui_state
             .handle_platform_output(&gpu.window, full_output.platform_output);
+        // egui may restore a cursor icon; re-assert idle hide after platform output.
+        if self.chrome.hide_idle_cursor {
+            gpu.window.set_cursor_visible(false);
+            self.cursor_hidden = true;
+        }
         // Steer egui away from immediate repaint storms under NoVsync; about_to_wait
         // is the source of truth for the next present.
         gpu.egui_ctx.request_repaint_after(display_period);
