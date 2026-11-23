@@ -9,7 +9,7 @@ KapturKard can **share the live preview** with OBS, Resolve, and other tools.
 - **Probe order:** next to exe → `%APPDATA%\CaptureView\spout\` → `third_party/spout` (dev) → `PATH`.
 - **In-app:** Infos → **Spout**. Sender name defaults to `KapturKard`.
 - **OBS:** Add a Spout2 source and pick `KapturKard`.
-- **Send path:** CPU **BGRA `SendImage`** via a thin MIT bridge (`native/spout`). This is real Spout output; a GPU shared-texture path (DX/GL interop with wgpu) is **not** wired yet — the UI says so honestly.
+- **Send path:** CPU **BGRA `SendImage`** via a thin MIT bridge (`native/spout`). Live **NV12 / YUY2** capture is converted to BGRA before send (MF cards usually deliver NV12). A GPU shared-texture path (DX/GL interop with wgpu) remains optional for later.
 - **License:** SpoutLibrary Simplified BSD — see `licenses/SPOUT-BSD.txt` and `third_party/spout/licence.txt`.
 
 ## NDI (optional) — BYO only
@@ -31,9 +31,6 @@ Mode C / DLSS-G never ship NVIDIA proprietary DLLs. Effects / Infos show a clear
 
 | Path | Use |
 |------|-----|
-| **Replay buffer** (F9) | Last *N* seconds → PNG sequence under `%APPDATA%\CaptureView\clips\` |
+| **Replay buffer** (F9) | Last *N* seconds (downscaled NV12 ring, ~20 fps) → **H.264 MP4** via ffmpeg when present, else **MJPEG AVI**, under `%APPDATA%\CaptureView\clips\` |
+| **Clips panel** (Infos) | List / play / reveal / delete saved clips |
 | **Spout / NDI** | Live frames into OBS / Resolve / network |
-
-```text
-ffmpeg -framerate 30 -i frame_%05d.png -c:v libx264 -pix_fmt yuv420p clip.mp4
-```

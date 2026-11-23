@@ -52,7 +52,7 @@ use crate::prefs::{
     load_audio_prefs, load_ui_prefs, save_audio_prefs, save_ui_prefs, AudioPrefs, UiPrefs,
 };
 use crate::profiles::NamedProfile;
-use crate::replay::ReplayBuffer;
+use crate::replay::{self, ReplayBuffer};
 use crate::ui::{
     self, AudioUiState, ColorUiState, EffectsUiState, OverlayState, ToastKind, UiChrome,
     UiSelection,
@@ -448,6 +448,7 @@ impl Default for App {
             metrics: SharedMetrics::new(),
             overlay: OverlayState {
                 monitor: ui_prefs.monitor.clone(),
+                clips: replay::list_clips(),
                 ..OverlayState::default()
             },
             fps_window_start: Instant::now(),
@@ -1870,6 +1871,34 @@ impl App {
         if actions.save_replay_clip {
             self.save_replay_clip();
         }
+        if actions.open_clips_folder {
+            replay::open_clips_folder();
+        }
+        if actions.refresh_clips {
+            self.refresh_clips_list();
+        }
+        if let Some(path) = actions.play_clip {
+            replay::play_clip(&path);
+        }
+        if let Some(path) = actions.reveal_clip {
+            replay::reveal_clip(&path);
+        }
+        if let Some(path) = actions.delete_clip {
+            match replay::delete_clip(&path) {
+                Ok(()) => {
+                    self.refresh_clips_list();
+                    self.show_toast(self.i18n.t("msg_clip_deleted"));
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "clip delete failed");
+                    self.show_toast_kind(
+                        self.i18n.t("msg_clip_delete_err"),
+                        ToastKind::Error,
+                        Duration::from_secs(4),
+                    );
+                }
+            }
+        }
         if let Some((w, h, num, den)) = actions.resolution_preset {
             self.apply_resolution_preset(w, h, Rational::new(num, den));
         }
@@ -2143,15 +2172,16 @@ impl App {
 
     fn save_replay_clip(&mut self) {
         match self.replay.save_clip() {
-            Ok(dir) => {
+            Ok(path) => {
                 let frames = self.replay.frame_count();
                 let msg = format!(
                     "{} ({frames}) — {}",
                     self.i18n.t("msg_replay_saved"),
-                    dir.display()
+                    path.display()
                 );
-                // Longer dwell so the folder path is readable.
+                // Longer dwell so the path is readable.
                 self.show_toast_kind(msg, ToastKind::Success, Duration::from_secs(6));
+                self.refresh_clips_list();
             }
             Err(e) if e.contains("empty") => {
                 self.show_toast_kind(
@@ -2169,6 +2199,10 @@ impl App {
                 );
             }
         }
+    }
+
+    fn refresh_clips_list(&mut self) {
+        self.overlay.clips = replay::list_clips();
     }
 
     fn sync_feature_overlay(&mut self) {

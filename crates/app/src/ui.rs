@@ -12,6 +12,7 @@ use crate::i18n::I18n;
 use crate::lut::GradePrefs;
 use crate::prefs::MonitorPrefs;
 use crate::profiles::ProfilesPrefs;
+use crate::replay::ClipEntry;
 use crate::update_check::UpdateStatus;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -172,6 +173,8 @@ pub struct OverlayState {
     pub replay_enabled: bool,
     pub replay_seconds: u32,
     pub replay_frames: u32,
+    /// Saved clips under `%APPDATA%\CaptureView\clips\`.
+    pub clips: Vec<ClipEntry>,
     pub grade: GradePrefs,
     pub cube_lut_path: String,
     pub health: CaptureHealthUi,
@@ -249,6 +252,7 @@ impl Default for OverlayState {
             replay_enabled: false,
             replay_seconds: 8,
             replay_frames: 0,
+            clips: Vec::new(),
             grade: GradePrefs::default(),
             cube_lut_path: String::new(),
             health: CaptureHealthUi::default(),
@@ -394,6 +398,11 @@ pub struct UiActions {
     pub replay_enabled_changed: Option<bool>,
     pub replay_seconds_changed: Option<u32>,
     pub save_replay_clip: bool,
+    pub open_clips_folder: bool,
+    pub refresh_clips: bool,
+    pub play_clip: Option<std::path::PathBuf>,
+    pub reveal_clip: Option<std::path::PathBuf>,
+    pub delete_clip: Option<std::path::PathBuf>,
     pub resolution_preset: Option<(u32, u32, u32, u32)>,
     pub grade_changed: Option<GradePrefs>,
     pub grade_reset: bool,
@@ -1172,6 +1181,18 @@ fn draw_sound_tab(ui: &mut egui::Ui, input: &DrawInput<'_>, actions: &mut UiActi
 }
 
 fn draw_effects_tab(ui: &mut egui::Ui, input: &DrawInput<'_>, actions: &mut UiActions) {
+    // Match Infos: long Effects content must stay reachable on short windows.
+    let max_h = (ui.ctx().screen_rect().height() * 0.65).clamp(280.0, 640.0);
+    egui::ScrollArea::vertical()
+        .id_salt("effects_tab_scroll")
+        .max_height(max_h)
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            draw_effects_tab_body(ui, input, actions);
+        });
+}
+
+fn draw_effects_tab_body(ui: &mut egui::Ui, input: &DrawInput<'_>, actions: &mut UiActions) {
     let i18n = input.i18n;
     let fx = input.effects;
     ui.label(RichText::new(i18n.t("label_why_fsr")).strong());
@@ -1520,6 +1541,9 @@ fn draw_info_tab_body(ui: &mut egui::Ui, input: &DrawInput<'_>, actions: &mut Ui
     draw_hud_prefs(ui, i18n, o, actions);
     ui.add_space(6.0);
     draw_replay_prefs(ui, i18n, o, actions);
+    ui.add_space(8.0);
+    ui.separator();
+    draw_clips_panel(ui, i18n, o, actions);
     ui.add_space(6.0);
     draw_grade_prefs(ui, i18n, o, actions);
     ui.add_space(6.0);
@@ -1917,10 +1941,66 @@ fn draw_replay_prefs(ui: &mut egui::Ui, i18n: &I18n, o: &OverlayState, actions: 
     {
         actions.replay_seconds_changed = Some(secs);
     }
-    ui.small(format!("{}: {}", i18n.t("btn_replay_save"), o.replay_frames));
+    ui.small(format!("{}: {}", i18n.t("label_replay_frames"), o.replay_frames));
     if ui.button(i18n.t("btn_replay_save")).clicked() {
         actions.save_replay_clip = true;
     }
+}
+
+fn draw_clips_panel(ui: &mut egui::Ui, i18n: &I18n, o: &OverlayState, actions: &mut UiActions) {
+    ui.label(RichText::new(i18n.t("section_clips")).strong());
+    ui.label(RichText::new(i18n.t("tip_clips")).small().italics());
+    ui.horizontal_wrapped(|ui| {
+        if ui.button(i18n.t("btn_clips_open_folder")).clicked() {
+            actions.open_clips_folder = true;
+        }
+        if ui.button(i18n.t("btn_clips_refresh")).clicked() {
+            actions.refresh_clips = true;
+        }
+    });
+    if o.clips.is_empty() {
+        ui.small(i18n.t("clips_empty"));
+        return;
+    }
+    let list_h = 140.0_f32.min(ui.available_height().max(80.0));
+    egui::ScrollArea::vertical()
+        .id_salt("clips_list_scroll")
+        .max_height(list_h)
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            for clip in &o.clips {
+                ui.horizontal(|ui| {
+                    let size_mb = clip.size_bytes as f32 / (1024.0 * 1024.0);
+                    let kind = if clip.is_dir {
+                        i18n.t("clips_kind_seq")
+                    } else {
+                        i18n.t("clips_kind_video")
+                    };
+                    ui.label(format!("{} · {kind} · {size_mb:.1} Mo", clip.name));
+                    if ui
+                        .small_button(i18n.t("btn_clips_play"))
+                        .on_hover_text(i18n.t("tip_clips_play"))
+                        .clicked()
+                    {
+                        actions.play_clip = Some(clip.path.clone());
+                    }
+                    if ui
+                        .small_button(i18n.t("btn_clips_reveal"))
+                        .on_hover_text(i18n.t("tip_clips_reveal"))
+                        .clicked()
+                    {
+                        actions.reveal_clip = Some(clip.path.clone());
+                    }
+                    if ui
+                        .small_button(i18n.t("btn_clips_delete"))
+                        .on_hover_text(i18n.t("tip_clips_delete"))
+                        .clicked()
+                    {
+                        actions.delete_clip = Some(clip.path.clone());
+                    }
+                });
+            }
+        });
 }
 
 fn draw_grade_prefs(ui: &mut egui::Ui, i18n: &I18n, o: &OverlayState, actions: &mut UiActions) {

@@ -373,6 +373,9 @@ pub struct FrameExport {
     pub status: ExportStatus,
     #[cfg(windows)]
     spout: Option<SpoutSender>,
+    /// Scratch BGRA when converting NV12/YUY2 for SendImage (avoids per-frame alloc churn).
+    #[cfg(windows)]
+    bgra_scratch: Vec<u8>,
 }
 
 impl Default for FrameExport {
@@ -382,6 +385,8 @@ impl Default for FrameExport {
             status: probe_export(),
             #[cfg(windows)]
             spout: None,
+            #[cfg(windows)]
+            bgra_scratch: Vec::new(),
         };
         s.sync_active_flags();
         s
@@ -448,7 +453,7 @@ impl FrameExport {
         }
     }
 
-    /// Called each presented capture frame. Spout: CPU BGRA SendImage when format allows.
+    /// Called each presented capture frame. Spout: CPU BGRA SendImage (converts NV12/YUY2).
     /// NDI: probe/prefs only until a BYO SDK bridge is linked.
     pub fn on_frame(
         &mut self,
@@ -461,25 +466,66 @@ impl FrameExport {
         {
             if self.prefs.spout_enabled && self.status.spout_available {
                 self.ensure_spout();
-                if let Some(sender) = self.spout.as_mut() {
-                    if matches!(pixel_format, capture::PixelFormat::Bgra8) {
-                        let expected = (width as usize).saturating_mul(height as usize) * 4;
-                        if pixels.len() >= expected && width > 0 && height > 0 {
-                            match sender.send_bgra(&self.prefs.spout_name, pixels, width, height) {
-                                Ok(()) => {
-                                    if !self.status.spout_sending {
-                                        self.status.spout_sending = true;
-                                        self.status.spout_detail_key = "export_spout_sending".into();
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::debug!(error = %e, "Spout SendImage failed");
-                                    self.status.spout_detail_key = "export_spout_send_fail".into();
+                if self.spout.is_some() && width > 0 && height > 0 {
+                    let expected = (width as usize).saturating_mul(height as usize) * 4;
+                    let converted: Option<Vec<u8>> = match pixel_format {
+                        capture::PixelFormat::Bgra8 if pixels.len() >= expected => None,
+                        capture::PixelFormat::Nv12 => {
+                            match crate::pixel_convert::nv12_to_bgra_scaled(
+                                pixels, width, height, width, height,
+                            ) {
+                                Some(bgra) => Some(bgra),
+                                None => {
+                                    self.status.spout_detail_key =
+                                        "export_spout_convert_fail".into();
+                                    return;
                                 }
                             }
                         }
+                        capture::PixelFormat::Yuy2 => {
+                            match crate::pixel_convert::yuy2_to_bgra(pixels, width, height) {
+                                Some(bgra) => Some(bgra),
+                                None => {
+                                    self.status.spout_detail_key =
+                                        "export_spout_convert_fail".into();
+                                    return;
+                                }
+                            }
+                        }
+                        capture::PixelFormat::Bgra8 => {
+                            self.status.spout_detail_key = "export_spout_need_bgra".into();
+                            return;
+                        }
+                        _ => {
+                            self.status.spout_detail_key = "export_spout_need_bgra".into();
+                            return;
+                        }
+                    };
+
+                    if let Some(bgra) = converted {
+                        self.bgra_scratch = bgra;
+                    }
+
+                    let px: &[u8] = if matches!(pixel_format, capture::PixelFormat::Bgra8) {
+                        &pixels[..expected]
                     } else {
-                        self.status.spout_detail_key = "export_spout_need_bgra".into();
+                        self.bgra_scratch.as_slice()
+                    };
+
+                    let name = self.prefs.spout_name.clone();
+                    if let Some(sender) = self.spout.as_mut() {
+                        match sender.send_bgra(&name, px, width, height) {
+                            Ok(()) => {
+                                if !self.status.spout_sending {
+                                    self.status.spout_sending = true;
+                                    self.status.spout_detail_key = "export_spout_sending".into();
+                                }
+                            }
+                            Err(e) => {
+                                tracing::debug!(error = %e, "Spout SendImage failed");
+                                self.status.spout_detail_key = "export_spout_send_fail".into();
+                            }
+                        }
                     }
                 }
             }
