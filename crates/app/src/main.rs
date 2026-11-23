@@ -16,6 +16,7 @@ mod health;
 mod i18n;
 mod logging;
 mod lut;
+mod pixel_convert;
 mod prefs;
 mod profiles;
 mod replay;
