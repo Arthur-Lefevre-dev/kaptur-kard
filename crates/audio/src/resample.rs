@@ -23,16 +23,23 @@ pub fn fold_to_stereo_interleaved(input: &[f32], channels: usize) -> Vec<f32> {
         }
         2 => out.extend_from_slice(&input[..frames * 2]),
         n => {
+            // ITU-R BS.775-style fold. Preserve center (dialogue) without over-attenuating.
+            // Layout assumed: FL FR FC LFE BL BR [SL SR]. Stereo HDMI (Switch) is passthrough above.
             for f in 0..frames {
                 let base = f * n;
-                // ITU-ish-ish simple downmix: FL, FR, optional FC/LFE/BL/BR…
                 let fl = input[base];
                 let fr = if n > 1 { input[base + 1] } else { fl };
-                let fc = if n > 2 { input[base + 2] * 0.707 } else { 0.0 };
-                let bl = if n > 4 { input[base + 4] * 0.5 } else { 0.0 };
-                let br = if n > 5 { input[base + 5] * 0.5 } else { 0.0 };
-                out.push((fl + fc + bl).clamp(-1.0, 1.0));
-                out.push((fr + fc + br).clamp(-1.0, 1.0));
+                let fc = if n > 2 { input[base + 2] } else { 0.0 };
+                let lfe = if n > 3 { input[base + 3] * 0.5 } else { 0.0 };
+                let bl = if n > 4 { input[base + 4] * 0.707 } else { 0.0 };
+                let br = if n > 5 { input[base + 5] * 0.707 } else { 0.0 };
+                let sl = if n > 6 { input[base + 6] * 0.707 } else { 0.0 };
+                let sr = if n > 7 { input[base + 7] * 0.707 } else { 0.0 };
+                // Center at full level into both ears (dialogue). Soft headroom scale avoids hard clip.
+                let left = (fl + fc + bl + sl + lfe) * 0.89;
+                let right = (fr + fc + br + sr + lfe) * 0.89;
+                out.push(left.clamp(-1.0, 1.0));
+                out.push(right.clamp(-1.0, 1.0));
             }
         }
     }
