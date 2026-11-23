@@ -107,6 +107,8 @@ struct PresentGpu {
     scale_offset: [f32; 4],
     /// x = 1 → nearest (textureLoad), 0 → bilinear.
     flags: [u32; 4],
+    /// brightness, contrast, gamma, lut_mix
+    grade: [f32; 4],
 }
 
 #[repr(C)]
@@ -126,6 +128,8 @@ pub struct UpscaleEngine {
     pub mode: UpscaleMode,
     /// 0.0 = soft … 1.0 = sharp (mapped to FSR stops / NIS strength).
     pub sharpness: f32,
+    /// Present grade: brightness, contrast, gamma, lut_mix.
+    pub grade: [f32; 4],
     pub compute_ok: bool,
     pub block: UpscaleBlockReason,
     pub vendor: String,
@@ -267,6 +271,7 @@ impl UpscaleEngine {
             contents: bytemuck::bytes_of(&PresentGpu {
                 scale_offset: [1.0, 1.0, 0.0, 0.0],
                 flags: [0; 4],
+                grade: [0.0, 1.0, 1.0, 0.0],
             }),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -461,6 +466,7 @@ impl UpscaleEngine {
         Self {
             mode: UpscaleMode::Off,
             sharpness: 0.4,
+            grade: [0.0, 1.0, 1.0, 0.0],
             compute_ok,
             block,
             vendor,
@@ -520,6 +526,10 @@ impl UpscaleEngine {
 
     pub fn dlss_availability(&self) -> DlssAvailability {
         self.dlss.availability()
+    }
+
+    pub fn set_grade(&mut self, grade: [f32; 4]) {
+        self.grade = grade;
     }
 
     pub fn set_mode(&mut self, mode: UpscaleMode) {
@@ -871,6 +881,7 @@ impl UpscaleEngine {
             bytemuck::bytes_of(&PresentGpu {
                 scale_offset,
                 flags: [nearest, 0, 0, 0],
+                grade: self.grade,
             }),
         );
         let gen = self.tex_gen;

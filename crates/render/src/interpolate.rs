@@ -88,6 +88,7 @@ struct PresentGpu {
     scale_offset: [f32; 4],
     /// x = 1 → nearest (textureLoad), 0 → bilinear.
     flags: [u32; 4],
+    grade: [f32; 4],
 }
 
 struct TexSlot {
@@ -105,6 +106,8 @@ pub struct InterpolateEngine {
     pub last_gpu_ms: f32,
     /// Motion blur on Mid (0 = off … 1 = strong). Applied only while framegen is active.
     pub motion_blur: f32,
+    /// Present grade (mirrors upscale path).
+    pub grade: [f32; 4],
     over_budget_streak: u32,
     auto_disabled: bool,
     /// After presenting Mid, the next present must show Curr (x2 cadence).
@@ -197,6 +200,7 @@ impl InterpolateEngine {
             contents: bytemuck::bytes_of(&PresentGpu {
                 scale_offset: [1.0, 1.0, 0.0, 0.0],
                 flags: [0; 4],
+                grade: [0.0, 1.0, 1.0, 0.0],
             }),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -351,6 +355,7 @@ impl InterpolateEngine {
             delay_ms: 0.0,
             last_gpu_ms: 0.0,
             motion_blur: 0.0,
+            grade: [0.0, 1.0, 1.0, 0.0],
             over_budget_streak: 0,
             auto_disabled: false,
             owed_curr: false,
@@ -404,6 +409,10 @@ impl InterpolateEngine {
     /// Intensity for Mid motion blur (0 = off … 1 = strong). No-op when framegen is off.
     pub fn set_motion_blur(&mut self, intensity: f32) {
         self.motion_blur = intensity.clamp(0.0, 1.0);
+    }
+
+    pub fn set_grade(&mut self, grade: [f32; 4]) {
+        self.grade = grade;
     }
 
     pub fn set_source_delay_ms(&mut self, ms: f32) {
@@ -718,6 +727,7 @@ impl InterpolateEngine {
             bytemuck::bytes_of(&PresentGpu {
                 scale_offset,
                 flags: [nearest, 0, 0, 0],
+                grade: self.grade,
             }),
         );
         let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {

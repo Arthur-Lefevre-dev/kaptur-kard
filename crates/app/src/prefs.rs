@@ -6,6 +6,11 @@ use std::path::PathBuf;
 use audio::{default_output_id, NONE_INPUT_ID};
 use serde::{Deserialize, Serialize};
 
+use crate::export::ExportPrefs;
+use crate::health::HealthPrefs;
+use crate::lut::GradePrefs;
+use crate::profiles::ProfilesPrefs;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AudioPrefs {
     pub input_id: String,
@@ -101,6 +106,37 @@ pub struct UiPrefs {
     /// Live monitoring graphs / HUD line toggles (Infos + F2 overlay).
     #[serde(default)]
     pub monitor: MonitorPrefs,
+    /// Named Stream / Edit / Low-latency presets.
+    #[serde(default)]
+    pub profiles: ProfilesPrefs,
+    /// Compact always-visible HUD (FPS / 1% low / latency).
+    #[serde(default)]
+    pub hud_enabled: bool,
+    /// Pin main window above others while the HUD is useful for monitoring.
+    #[serde(default)]
+    pub hud_always_on_top: bool,
+    /// Rolling replay buffer (seconds, 3–30).
+    #[serde(default = "default_replay_seconds")]
+    pub replay_seconds: u32,
+    #[serde(default)]
+    pub replay_enabled: bool,
+    /// Brightness / contrast / gamma (+ optional .cube mix).
+    #[serde(default)]
+    pub grade: GradePrefs,
+    /// Optional path to a .cube LUT (empty = curves only).
+    #[serde(default)]
+    pub cube_lut_path: String,
+    #[serde(default)]
+    pub export: ExportPrefs,
+    #[serde(default)]
+    pub health: HealthPrefs,
+    /// Check GitHub releases on launch / from Infos.
+    #[serde(default = "default_true")]
+    pub update_check: bool,
+}
+
+fn default_replay_seconds() -> u32 {
+    8
 }
 
 /// Which live monitoring graphs and HUD lines are visible.
@@ -227,6 +263,16 @@ impl Default for UiPrefs {
             color_matrix: "auto".into(),
             device_colors: Vec::new(),
             monitor: MonitorPrefs::default(),
+            profiles: ProfilesPrefs::default(),
+            hud_enabled: false,
+            hud_always_on_top: false,
+            replay_seconds: default_replay_seconds(),
+            replay_enabled: false,
+            grade: GradePrefs::default(),
+            cube_lut_path: String::new(),
+            export: ExportPrefs::default(),
+            health: HealthPrefs::default(),
+            update_check: true,
         }
     }
 }
