@@ -57,7 +57,7 @@ jobs:
       - name: Build release binary
         run: cargo build --release -p captureview
 
-      - name: Package Windows zip
+      - name: Package Windows zip + MSI
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
@@ -66,7 +66,9 @@ jobs:
           Copy-Item "target/release/captureview.exe" "$out/captureview.exe"
           Copy-Item "README.md" "$out/README.md"
           Copy-Item "LICENSE" "$out/LICENSE"
-          if (Test-Path "licenses") { Copy-Item "licenses" "$out/licenses" -Recurse }
+          if (Test-Path "$out/licenses") { Remove-Item "$out/licenses" -Recurse -Force }
+          New-Item -ItemType Directory -Force -Path "$out/licenses" | Out-Null
+          if (Test-Path "licenses") { Copy-Item "licenses\*" "$out/licenses" -Force }
           if (Test-Path "assets/kapturkard-logo.png") {
             New-Item -ItemType Directory -Force -Path "$out/assets" | Out-Null
             Copy-Item "assets/kapturkard-logo.png" "$out/assets/"
@@ -90,12 +92,23 @@ jobs:
           CaptureView / KapturKard ${{ github.ref_name }}
           Windows x64 release build.
 
-          Run: captureview.exe
+          Preferred install: captureview-windows-x64.msi (Start Menu + ARP uninstall).
+          Portable: run captureview.exe from this zip.
           Mock source works without a capture card.
           Logs: %APPDATA%\CaptureView\logs\
           Spout: SpoutLibrary.dll bundled. NDI is BYO (https://ndi.video/).
           "@ | Set-Content -Encoding utf8 "$out/RELEASE.txt"
           Compress-Archive -Path "$out/*" -DestinationPath "dist/${{ matrix.artifact }}.zip" -Force
+
+          # WiX v5 MSI (exe + Spout DLLs + licenses/docs, Start Menu, optional desktop)
+          dotnet tool install --global wix --version 5.0.2
+          $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" +
+                      [System.Environment]::GetEnvironmentVariable("Path", "User")
+          wix extension add -g WixToolset.UI.wixext/5.0.2
+          powershell -ExecutionPolicy Bypass -File scripts/build-msi.ps1 `
+            -StageDir $out `
+            -MsiPath "dist/${{ matrix.artifact }}.msi" `
+            -SkipStage
 
       - name: Package Unix archive
         if: runner.os != 'Windows'
@@ -125,6 +138,7 @@ jobs:
           name: ${{ matrix.artifact }}
           path: |
             dist/${{ matrix.artifact }}.zip
+            dist/${{ matrix.artifact }}.msi
             dist/${{ matrix.artifact }}.tar.gz
           if-no-files-found: error
 
@@ -142,7 +156,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p upload
-          find artifacts -type f \( -name '*.zip' -o -name '*.tar.gz' \) -print -exec cp {} upload/ \;
+          find artifacts -type f \( -name '*.zip' -o -name '*.msi' -o -name '*.tar.gz' \) -print -exec cp {} upload/ \;
           ls -la upload
 
       - name: Resolve tag name
@@ -172,10 +186,12 @@ jobs:
             ### Artifacts
             | File | Platform |
             |------|----------|
-            | `captureview-windows-x64.zip` | Windows 10/11 x64 |
+            | `captureview-windows-x64.msi` | Windows 10/11 x64 (installer — preferred) |
+            | `captureview-windows-x64.zip` | Windows 10/11 x64 (portable) |
             | `captureview-linux-x64.tar.gz` | Linux x64 (V4L2) |
             | `captureview-macos-arm64.tar.gz` | macOS arm64 (AVFoundation still stub) |
 
+            Windows: double-click the MSI for Start Menu install; uninstall from Apps & features.
             Windows Media Foundation is the primary capture path. Mock source is always available.
             MIT licensed — see `LICENSE` inside each archive.
         env:
