@@ -55,8 +55,13 @@ pub struct AudioStatus {
     pub notice: String,
     pub input_rate: u32,
     pub output_rate: u32,
+    /// Capture channel count actually opened (2 preferred when the device allows it).
+    pub input_channels: u16,
     pub running: bool,
 }
+
+/// Live monitor volume ceiling (300%). Soft-clip on boost so quiet cutscene dialogue can be lifted.
+pub const VOLUME_MAX: f32 = 3.0;
 
 struct SharedState {
     volume: AtomicU32, // milli
@@ -125,8 +130,8 @@ impl AudioEngine {
     }
 
     pub fn set_volume(&mut self, volume: f32) {
-        // Allow mild boost (quiet cutscene dialogue on some HDMI mixes); soft-clip on output.
-        let v = volume.clamp(0.0, 2.0);
+        // Live monitor boost (quiet cutscene dialogue on some HDMI mixes); soft-clip on output.
+        let v = volume.clamp(0.0, VOLUME_MAX);
         self.config.volume = v;
         self.shared
             .volume
@@ -169,7 +174,7 @@ impl AudioEngine {
             .buffer_ms
             .clamp(TARGET_BUFFER_MS_MIN, TARGET_BUFFER_MS_MAX);
         config.delay_ms = config.delay_ms.clamp(0.0, 500.0);
-        config.volume = config.volume.clamp(0.0, 2.0);
+        config.volume = config.volume.clamp(0.0, VOLUME_MAX);
         self.config = config.clone();
         self.shared
             .volume
@@ -180,6 +185,7 @@ impl AudioEngine {
         if config.input_id == NONE_INPUT_ID {
             self.status.running = false;
             self.status.input_rate = 0;
+            self.status.input_channels = 0;
             info!("audio input: Aucun son");
             // Still open output? Not needed without input — keep silent.
             return Ok(());
@@ -201,7 +207,7 @@ impl AudioEngine {
             };
 
         // If configured output vanished mid-check, try default once more after open config fails.
-        let in_cfg = pick_input_config(&input_dev)?;
+        let (in_cfg, in_format) = pick_input_config(&input_dev)?;
         let out_cfg = match pick_output_config(&output_dev) {
             Ok(c) => c,
             Err(e) => {
@@ -220,6 +226,7 @@ impl AudioEngine {
         let in_channels = in_cfg.channels as usize;
         self.status.input_rate = in_rate;
         self.status.output_rate = out_rate;
+        self.status.input_channels = in_cfg.channels;
 
         let delay_frames = AudioClock::new(out_rate).ms_to_frames(config.delay_ms);
         let buffer_frames = AudioClock::new(out_rate).ms_to_frames(config.buffer_ms);
@@ -252,7 +259,7 @@ impl AudioEngine {
         let input_stream = build_input_stream(
             &input_dev,
             &in_cfg,
-            in_channels,
+            in_format,
             move |data: &[f32]| {
                 let stereo = fold_to_stereo_interleaved(data, in_channels);
                 meter_in.observe_interleaved_stereo(&stereo);
@@ -329,13 +336,9 @@ impl AudioEngine {
                     out.fill(0.0);
                 } else if (vol - 1.0).abs() > 0.001 {
                     // Soft clip when boosting (>1) so quiet dialogue can be lifted without hard square.
+                    // Milder than raw tanh(x*vol) at 200–300% — keeps speech intelligible.
                     for s in out.iter_mut() {
-                        let v = *s * vol;
-                        *s = if vol > 1.0 {
-                            v.tanh()
-                        } else {
-                            v.clamp(-1.0, 1.0)
-                        };
+                        *s = apply_monitor_gain(*s, vol);
                     }
                 }
                 meter_out.observe_interleaved_stereo(out);
@@ -355,9 +358,11 @@ impl AudioEngine {
         info!(
             in_rate,
             out_rate,
+            in_channels = in_cfg.channels,
             delay_ms = config.delay_ms,
             buffer_ms = config.buffer_ms,
-            "audio engine started"
+            volume = config.volume,
+            "audio engine started (live monitor path)"
         );
         // Keep streams warm briefly so first callback can allocate.
         std::thread::sleep(Duration::from_millis(1));
@@ -371,15 +376,74 @@ impl Default for AudioEngine {
     }
 }
 
-fn pick_input_config(dev: &cpal::Device) -> Result<StreamConfig, AudioError> {
-    let cfg = dev
+/// Live monitor gain with soft ceiling. At unity, caller skips this path.
+fn apply_monitor_gain(sample: f32, vol: f32) -> f32 {
+    let v = sample * vol;
+    if vol <= 1.0 {
+        return v.clamp(-1.0, 1.0);
+    }
+    // Soft-clip: linear-ish for quiet speech, gentle knee for loud SFX after boost.
+    // Scale tanh so |x|<<1 stays close to x*vol (intelligible dialogue lift).
+    let drive = 1.15;
+    (v * drive).tanh() / drive.tanh()
+}
+
+fn pick_input_config(dev: &cpal::Device) -> Result<(StreamConfig, SampleFormat), AudioError> {
+    let default = dev
         .default_input_config()
         .map_err(|e| AudioError::Config(e.to_string()))?;
-    Ok(StreamConfig {
-        channels: cfg.channels(),
-        sample_rate: cfg.sample_rate(),
-        buffer_size: cpal::BufferSize::Default,
-    })
+
+    // Prefer stereo when available. Multi-channel defaults force a fold; some capture cards
+    // expose 6/8ch WASAPI endpoints even for stereo HDMI, which used to apply headroom ducking.
+    let chosen = if default.channels() == 2 {
+        default
+    } else {
+        let stereo = dev.supported_input_configs().ok().and_then(|configs| {
+            let def_rate = default.sample_rate();
+            let mut at_rate = None;
+            let mut any = None;
+            for range in configs {
+                if range.channels() != 2 {
+                    continue;
+                }
+                if def_rate >= range.min_sample_rate() && def_rate <= range.max_sample_rate() {
+                    at_rate = Some(range.with_sample_rate(def_rate));
+                    break;
+                }
+                if any.is_none() {
+                    any = Some(range.with_sample_rate(range.max_sample_rate()));
+                }
+            }
+            at_rate.or(any)
+        });
+        match stereo {
+            Some(c) => {
+                info!(
+                    from_ch = default.channels(),
+                    to_ch = c.channels(),
+                    rate = c.sample_rate().0,
+                    "audio input: preferring stereo over multi-channel default (live monitor)"
+                );
+                c
+            }
+            None => {
+                info!(
+                    channels = default.channels(),
+                    "audio input: multi-channel only; folding to stereo with center preserved"
+                );
+                default
+            }
+        }
+    };
+
+    Ok((
+        StreamConfig {
+            channels: chosen.channels(),
+            sample_rate: chosen.sample_rate(),
+            buffer_size: cpal::BufferSize::Default,
+        },
+        chosen.sample_format(),
+    ))
 }
 
 fn pick_output_config(dev: &cpal::Device) -> Result<StreamConfig, AudioError> {
@@ -396,17 +460,15 @@ fn pick_output_config(dev: &cpal::Device) -> Result<StreamConfig, AudioError> {
 fn build_input_stream<F>(
     device: &cpal::Device,
     config: &StreamConfig,
-    _channels: usize,
+    sample_format: SampleFormat,
     mut on_data: F,
 ) -> Result<Stream, AudioError>
 where
     F: FnMut(&[f32]) + Send + 'static,
 {
     let err_fn = |e| warn!(error = %e, "input stream error");
-    let supported = device
-        .default_input_config()
-        .map_err(|e| AudioError::Config(e.to_string()))?;
-    match supported.sample_format() {
+    // Use the format from the chosen config (may differ from device default when we prefer stereo).
+    match sample_format {
         SampleFormat::F32 => device
             .build_input_stream(
                 config,

@@ -11,8 +11,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use capture::{PixelFormat, PooledBytes, VideoFrame};
 
 use crate::pixel_convert::{
-    bgra_to_rgba_thumb, downsample_bgra, downsample_nv12, frame_to_bgra_scaled, nv12_to_bgra_scaled,
-    stored_size, yuy2_to_bgra,
+    bgra_to_rgba_thumb, downsample_bgra, downsample_nv12, nv12_to_bgra_scaled, stored_size,
+    yuy2_to_bgra,
 };
 use crate::prefs::app_data_dir;
 
@@ -24,8 +24,26 @@ const MAX_STORE_WIDTH: u32 = 1920;
 const ENCODE_CRF: &str = "18";
 /// MJPEG fallback quality (1–100).
 const MJPEG_QUALITY: u8 = 95;
-/// Target sample rate for the ring (~20 fps). Capture may be 60/120; encode uses this cadence.
-const SAMPLE_GAP_MS: u64 = 50;
+/// Default ring sample rate (30 fps). User may choose 30 / 60 / 120 in the Clips tab.
+pub const REPLAY_SAMPLE_FPS_DEFAULT: u32 = 30;
+pub const REPLAY_SAMPLE_FPS_CHOICES: [u32; 3] = [30, 60, 120];
+
+/// Normalize to an allowed clip sample FPS.
+pub fn normalize_sample_fps(fps: u32) -> u32 {
+    if REPLAY_SAMPLE_FPS_CHOICES.contains(&fps) {
+        fps
+    } else if fps == 20 {
+        // Legacy pref from v0.3.8 — map to nearest primary choice.
+        30
+    } else {
+        REPLAY_SAMPLE_FPS_DEFAULT
+    }
+}
+
+fn gap_for_sample_fps(fps: u32) -> Duration {
+    let fps = normalize_sample_fps(fps).max(1);
+    Duration::from_secs_f64(1.0 / f64::from(fps))
+}
 /// Toast / list thumbnail max width.
 const THUMB_MAX_W: u32 = 160;
 
@@ -84,20 +102,23 @@ pub struct ReplayBuffer {
     frames: VecDeque<StoredFrame>,
     bytes: usize,
     last_push: Instant,
-    /// Min gap between stored frames (~20 fps) — keeps buffer capture cheap.
+    /// Chosen ring / encode sample rate (20, 30, or 60).
+    sample_fps: u32,
+    /// Min gap between stored frames — derived from `sample_fps`.
     min_gap: Duration,
 }
 
 impl Default for ReplayBuffer {
     fn default() -> Self {
+        let sample_fps = REPLAY_SAMPLE_FPS_DEFAULT;
         Self {
             enabled: false,
             seconds: 8,
             frames: VecDeque::new(),
             bytes: 0,
             last_push: Instant::now() - Duration::from_secs(1),
-            // ~20 fps sample — enough for a clip, cheap on the capture path.
-            min_gap: Duration::from_millis(SAMPLE_GAP_MS),
+            sample_fps,
+            min_gap: gap_for_sample_fps(sample_fps),
         }
     }
 }
@@ -115,6 +136,16 @@ impl ReplayBuffer {
         self.trim();
     }
 
+    /// Set ring sample / encode FPS (30, 60, or 120). Default 30.
+    pub fn set_sample_fps(&mut self, fps: u32) {
+        let fps = normalize_sample_fps(fps);
+        if self.sample_fps == fps {
+            return;
+        }
+        self.sample_fps = fps;
+        self.min_gap = gap_for_sample_fps(fps);
+    }
+
     pub fn enabled(&self) -> bool {
         self.enabled
     }
@@ -123,13 +154,17 @@ impl ReplayBuffer {
         self.seconds
     }
 
+    pub fn sample_fps(&self) -> u32 {
+        self.sample_fps
+    }
+
     pub fn frame_count(&self) -> usize {
         self.frames.len()
     }
 
-    /// Target sample rate for the ring (~20). Capture source FPS is independent.
+    /// Target sample rate for the ring. Capture source FPS is independent.
     pub fn sample_fps_target(&self) -> f32 {
-        1000.0 / self.min_gap.as_millis().max(1) as f32
+        self.sample_fps as f32
     }
 
     /// Measured spacing of frames currently in the ring (encode uses this).
@@ -143,7 +178,7 @@ impl ReplayBuffer {
         if dt.as_secs_f32() <= 0.001 {
             return self.sample_fps_target();
         }
-        ((self.frames.len() - 1) as f32 / dt.as_secs_f32()).clamp(10.0, 60.0)
+        ((self.frames.len() - 1) as f32 / dt.as_secs_f32()).clamp(10.0, 120.0)
     }
 
     pub fn time_range(&self) -> Option<(Instant, Instant)> {
@@ -233,7 +268,7 @@ impl ReplaySnapshot {
     }
 
     pub fn encode_fps_estimate(&self) -> f32 {
-        estimate_fps_slice(&self.frames).clamp(10.0, 60.0)
+        estimate_fps_slice(&self.frames).clamp(10.0, 120.0)
     }
 
     /// First buffered frame as a small RGBA thumb for the clip toast / list.
@@ -265,7 +300,7 @@ fn encode_frames(
 
     let w = frames[0].width;
     let h = frames[0].height;
-    let fps = estimate_fps_slice(frames).clamp(10.0, 60.0);
+    let fps = estimate_fps_slice(frames).clamp(10.0, 120.0);
     let frame_count = frames.len();
 
     // Materialize BGRA once (encode path only — not on the capture hot path).
@@ -315,11 +350,17 @@ fn write_clip_thumb(
     bgra: &[u8],
 ) -> Option<PathBuf> {
     let (tw, th, rgba) = bgra_to_rgba_thumb(bgra, w, h, THUMB_MAX_W)?;
+    // JPEG has no alpha — encode RGB. Rgba8 encode used to fail silently, so the
+    // companion .jpg was missing and the Clips list showed empty thumb slots.
+    let rgb: Vec<u8> = rgba
+        .chunks_exact(4)
+        .flat_map(|p| [p[0], p[1], p[2]])
+        .collect();
     let path = root.join(format!("clip-{stamp}.jpg"));
     let mut jpeg = Vec::new();
     let mut cursor = std::io::Cursor::new(&mut jpeg);
     let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut cursor, 85);
-    enc.encode(&rgba, tw, th, image::ExtendedColorType::Rgba8)
+    enc.encode(&rgb, tw, th, image::ExtendedColorType::Rgb8)
         .ok()?;
     fs::write(&path, jpeg).ok()?;
     Some(path)
@@ -430,6 +471,40 @@ fn companion_thumb_path(video: &Path) -> Option<PathBuf> {
     let stem = video.file_stem()?.to_str()?;
     let parent = video.parent()?;
     Some(parent.join(format!("{stem}.jpg")))
+}
+
+/// Rebuild companion `clip-….jpg` from the video via ffmpeg (list thumbs for legacy clips).
+/// Returns the thumb path when a readable JPEG was written.
+pub fn backfill_clip_thumb(video: &Path) -> Option<PathBuf> {
+    if !video.is_file() {
+        return None;
+    }
+    let thumb = companion_thumb_path(video)?;
+    let ffmpeg = find_ffmpeg()?;
+    let _ = fs::remove_file(&thumb);
+    let mut cmd = Command::new(&ffmpeg);
+    silence_window(&mut cmd);
+    let status = cmd
+        .args([
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+        ])
+        .arg(video)
+        .args(["-frames:v", "1", "-q:v", "4"])
+        .arg(&thumb)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .ok()?;
+    if status.success() && thumb.is_file() && thumb.metadata().ok()?.len() > 32 {
+        Some(thumb)
+    } else {
+        let _ = fs::remove_file(&thumb);
+        None
+    }
 }
 
 fn first_png_in_dir(dir: &Path) -> Option<PathBuf> {
@@ -574,7 +649,7 @@ fn stored_to_bgra(frame: &StoredFrame) -> Option<Vec<u8>> {
 
 fn estimate_fps_slice(frames: &[StoredFrame]) -> f32 {
     if frames.len() < 2 {
-        return 20.0;
+        return REPLAY_SAMPLE_FPS_DEFAULT as f32;
     }
     let dt = frames
         .last()
@@ -582,7 +657,7 @@ fn estimate_fps_slice(frames: &[StoredFrame]) -> f32 {
         .at
         .duration_since(frames.first().unwrap().at);
     if dt.as_secs_f32() <= 0.001 {
-        return 20.0;
+        return REPLAY_SAMPLE_FPS_DEFAULT as f32;
     }
     (frames.len() - 1) as f32 / dt.as_secs_f32()
 }
