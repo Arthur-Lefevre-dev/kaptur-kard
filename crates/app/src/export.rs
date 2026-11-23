@@ -4,6 +4,18 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+/// Allowed Spout send rates (worker min-gap). Was a fixed ~125 Hz cap before v0.3.9.
+pub const SPOUT_FPS_CHOICES: [u32; 3] = [30, 60, 120];
+pub const SPOUT_FPS_DEFAULT: u32 = 60;
+
+pub fn normalize_spout_fps(fps: u32) -> u32 {
+    if SPOUT_FPS_CHOICES.contains(&fps) {
+        fps
+    } else {
+        SPOUT_FPS_DEFAULT
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ExportPrefs {
     /// Share presented frames via Spout2 when the runtime DLL is available.
@@ -12,6 +24,9 @@ pub struct ExportPrefs {
     /// Spout sender name (OBS / Resolve Spout input).
     #[serde(default = "default_spout_name")]
     pub spout_name: String,
+    /// Max Spout SendImage rate: 30, 60, or 120 (default 60).
+    #[serde(default = "default_spout_fps")]
+    pub spout_fps: u32,
     /// NDI sender (requires NewTek NDI Runtime — BYO; we never redistribute NDI DLLs).
     #[serde(default)]
     pub ndi_enabled: bool,
@@ -23,6 +38,10 @@ fn default_spout_name() -> String {
     "KapturKard".into()
 }
 
+fn default_spout_fps() -> u32 {
+    SPOUT_FPS_DEFAULT
+}
+
 fn default_ndi_name() -> String {
     "KapturKard".into()
 }
@@ -32,6 +51,7 @@ impl Default for ExportPrefs {
         Self {
             spout_enabled: false,
             spout_name: default_spout_name(),
+            spout_fps: default_spout_fps(),
             ndi_enabled: false,
             ndi_name: default_ndi_name(),
         }
@@ -435,12 +455,17 @@ impl FrameExport {
             if self.spout_worker.is_some() {
                 if let Some(w) = self.spout_worker.as_ref() {
                     w.set_name(self.prefs.spout_name.clone());
+                    w.set_fps(self.prefs.spout_fps);
                 }
                 return;
             }
             let dll = PathBuf::from(&self.status.spout_dll_path);
             let dir = find_spout_bridge_dir(&dll);
-            match SpoutWorkerHandle::start(dir, self.prefs.spout_name.clone()) {
+            match SpoutWorkerHandle::start(
+                dir,
+                self.prefs.spout_name.clone(),
+                self.prefs.spout_fps,
+            ) {
                 Ok(w) => {
                     self.spout_worker = Some(w);
                     self.status.spout_detail_key = "export_spout_ready".into();
@@ -542,6 +567,8 @@ struct SpoutWorkerStatus {
 struct SpoutWorkerHandle {
     slot: std::sync::Arc<parking_lot::Mutex<Option<SpoutJob>>>,
     name: std::sync::Arc<parking_lot::Mutex<String>>,
+    /// Target send FPS (30 / 60 / 120) — worker reads atomically each job.
+    fps: std::sync::Arc<std::sync::atomic::AtomicU32>,
     status: std::sync::Arc<parking_lot::Mutex<SpoutWorkerStatus>>,
     wake_tx: crossbeam_channel::Sender<()>,
     stop_tx: Option<crossbeam_channel::Sender<()>>,
@@ -550,7 +577,7 @@ struct SpoutWorkerHandle {
 
 #[cfg(windows)]
 impl SpoutWorkerHandle {
-    fn start(bridge_dir: PathBuf, sender_name: String) -> Result<Self, String> {
+    fn start(bridge_dir: PathBuf, sender_name: String, fps: u32) -> Result<Self, String> {
         // Fail fast if DLLs are missing (worker would only report later).
         let bridge_path = bridge_dir.join("spout_bridge.dll");
         if !bridge_path.is_file() {
@@ -568,23 +595,28 @@ impl SpoutWorkerHandle {
 
         let slot = std::sync::Arc::new(parking_lot::Mutex::new(None));
         let name = std::sync::Arc::new(parking_lot::Mutex::new(sender_name));
+        let fps = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(normalize_spout_fps(
+            fps,
+        )));
         let status = std::sync::Arc::new(parking_lot::Mutex::new(SpoutWorkerStatus::default()));
         let (wake_tx, wake_rx) = crossbeam_channel::bounded::<()>(1);
         let (stop_tx, stop_rx) = crossbeam_channel::bounded::<()>(1);
 
         let slot_w = std::sync::Arc::clone(&slot);
         let name_w = std::sync::Arc::clone(&name);
+        let fps_w = std::sync::Arc::clone(&fps);
         let status_w = std::sync::Arc::clone(&status);
         let join = std::thread::Builder::new()
             .name("spout-send".into())
             .spawn(move || {
-                spout_worker_loop(bridge_dir, slot_w, name_w, status_w, wake_rx, stop_rx);
+                spout_worker_loop(bridge_dir, slot_w, name_w, fps_w, status_w, wake_rx, stop_rx);
             })
             .map_err(|e| format!("spawn spout worker: {e}"))?;
 
         Ok(Self {
             slot,
             name,
+            fps,
             status,
             wake_tx,
             stop_tx: Some(stop_tx),
@@ -599,6 +631,11 @@ impl SpoutWorkerHandle {
 
     fn set_name(&self, name: String) {
         *self.name.lock() = name;
+    }
+
+    fn set_fps(&self, fps: u32) {
+        self.fps
+            .store(normalize_spout_fps(fps), std::sync::atomic::Ordering::Relaxed);
     }
 
     fn snapshot_status(&self) -> SpoutWorkerStatus {
@@ -630,10 +667,17 @@ impl Drop for SpoutWorkerHandle {
 }
 
 #[cfg(windows)]
+fn spout_gap_for_fps(fps: u32) -> std::time::Duration {
+    let fps = normalize_spout_fps(fps).max(1);
+    std::time::Duration::from_secs_f64(1.0 / f64::from(fps))
+}
+
+#[cfg(windows)]
 fn spout_worker_loop(
     bridge_dir: PathBuf,
     slot: std::sync::Arc<parking_lot::Mutex<Option<SpoutJob>>>,
     name: std::sync::Arc<parking_lot::Mutex<String>>,
+    fps: std::sync::Arc<std::sync::atomic::AtomicU32>,
     status: std::sync::Arc<parking_lot::Mutex<SpoutWorkerStatus>>,
     wake_rx: crossbeam_channel::Receiver<()>,
     stop_rx: crossbeam_channel::Receiver<()>,
@@ -647,9 +691,9 @@ fn spout_worker_loop(
         }
     };
     let mut bgra_scratch: Vec<u8> = Vec::new();
-    // Cap send cadence so a slow OBS receiver cannot pile up CPU work.
-    let min_gap = std::time::Duration::from_millis(8); // ~125 Hz max
-    let mut last_send = std::time::Instant::now() - min_gap;
+    // Cap send cadence (user-selectable 30/60/120). Drop intermediates so OBS lag cannot stall present.
+    let mut last_send = std::time::Instant::now()
+        - spout_gap_for_fps(fps.load(std::sync::atomic::Ordering::Relaxed));
 
     loop {
         crossbeam_channel::select! {
@@ -664,6 +708,7 @@ fn spout_worker_loop(
         let Some(job) = slot.lock().take() else {
             continue;
         };
+        let min_gap = spout_gap_for_fps(fps.load(std::sync::atomic::Ordering::Relaxed));
         // Drop intermediate frames when OBS/SendImage cannot keep up — always prefer freshness.
         if last_send.elapsed() < min_gap {
             continue;

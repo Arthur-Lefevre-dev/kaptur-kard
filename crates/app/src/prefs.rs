@@ -120,6 +120,9 @@ pub struct UiPrefs {
     pub replay_seconds: u32,
     #[serde(default)]
     pub replay_enabled: bool,
+    /// Clip ring sample / encode FPS: 30, 60, or 120 (default 30).
+    #[serde(default = "default_replay_sample_fps")]
+    pub replay_sample_fps: u32,
     /// One-shot: Spout/replay forced off once (Spout adds ~30 ms display delay).
     /// Users may re-enable afterward; flag prevents re-migrating every launch.
     #[serde(default)]
@@ -144,6 +147,10 @@ pub struct UiPrefs {
 
 fn default_replay_seconds() -> u32 {
     8
+}
+
+fn default_replay_sample_fps() -> u32 {
+    30
 }
 
 /// Which live monitoring graphs and HUD lines are visible.
@@ -275,6 +282,7 @@ impl Default for UiPrefs {
             hud_always_on_top: false,
             replay_seconds: default_replay_seconds(),
             replay_enabled: false,
+            replay_sample_fps: default_replay_sample_fps(),
             latency_defaults_migrated: true,
             grade: GradePrefs::default(),
             cube_lut_path: String::new(),

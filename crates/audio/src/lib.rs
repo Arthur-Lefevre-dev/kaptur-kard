@@ -13,7 +13,7 @@ pub use clock::{drift_correction_frames, AudioClock, DriftCorrector};
 pub use device::{
     default_output_id, list_inputs, list_outputs, AudioDeviceInfo, AudioError, NONE_INPUT_ID,
 };
-pub use engine::{AudioEngine, AudioEngineConfig, AudioStatus};
+pub use engine::{AudioEngine, AudioEngineConfig, AudioStatus, VOLUME_MAX};
 pub use level::LevelMeter;
 pub use replay_tap::{AudioClipSnapshot, AudioReplayTap, SharedReplayTap};
 pub use resample::{fold_to_stereo_interleaved, StereoResampler};

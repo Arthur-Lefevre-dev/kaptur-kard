@@ -177,7 +177,9 @@ pub struct OverlayState {
     pub replay_enabled: bool,
     pub replay_seconds: u32,
     pub replay_frames: u32,
-    /// Target ring sample rate (~20). Independent of capture FPS.
+    /// Chosen clip FPS (20 / 30 / 60).
+    pub replay_sample_fps_choice: u32,
+    /// Target ring sample rate (from choice). Independent of capture FPS.
     pub replay_sample_fps: f32,
     /// Measured buffer spacing used as encode FPS.
     pub replay_buffer_fps: f32,
@@ -194,6 +196,8 @@ pub struct OverlayState {
     pub spout_enabled: bool,
     pub ndi_enabled: bool,
     pub spout_name: String,
+    /// Spout send FPS choice (30 / 60 / 120).
+    pub spout_fps: u32,
     pub ndi_name: String,
     pub update: UpdateStatus,
     pub current_version: String,
@@ -263,8 +267,9 @@ impl Default for OverlayState {
             replay_enabled: false,
             replay_seconds: 8,
             replay_frames: 0,
-            replay_sample_fps: 20.0,
-            replay_buffer_fps: 20.0,
+            replay_sample_fps_choice: 30,
+            replay_sample_fps: 30.0,
+            replay_buffer_fps: 30.0,
             clips: Vec::new(),
             clip_encoding: false,
             grade: GradePrefs::default(),
@@ -276,6 +281,7 @@ impl Default for OverlayState {
             spout_enabled: false,
             ndi_enabled: false,
             spout_name: "KapturKard".into(),
+            spout_fps: crate::export::SPOUT_FPS_DEFAULT,
             ndi_name: "KapturKard".into(),
             update: UpdateStatus::default(),
             current_version: env!("CARGO_PKG_VERSION").into(),
@@ -411,6 +417,7 @@ pub struct UiActions {
     pub hud_always_on_top_changed: Option<bool>,
     pub replay_enabled_changed: Option<bool>,
     pub replay_seconds_changed: Option<u32>,
+    pub replay_sample_fps_changed: Option<u32>,
     pub save_replay_clip: bool,
     pub open_clips_folder: bool,
     pub refresh_clips: bool,
@@ -427,6 +434,7 @@ pub struct UiActions {
     pub spout_enabled_changed: Option<bool>,
     pub ndi_enabled_changed: Option<bool>,
     pub spout_name_changed: Option<String>,
+    pub spout_fps_changed: Option<u32>,
     pub ndi_name_changed: Option<String>,
     pub export_refresh: bool,
     pub ndi_open_download: bool,
@@ -644,10 +652,10 @@ pub fn draw_ui(ctx: &Context, input: DrawInput<'_>) -> UiActions {
         draw_update_popup(ctx, i18n, input.overlay, input.logo.as_ref(), &mut actions);
     }
 
-    // Clip toast: top-left of the preview, with optional first-frame thumb.
+    // Clip toast: top-right of the preview, with optional first-frame thumb.
     if !input.overlay.toast.is_empty() && input.overlay.toast_clip {
         egui::Area::new(egui::Id::new("clip_toast"))
-            .anchor(egui::Align2::LEFT_TOP, [16.0, 16.0])
+            .anchor(egui::Align2::RIGHT_TOP, [-16.0, 16.0])
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
                 egui::Frame::NONE
@@ -1190,7 +1198,9 @@ fn draw_sound_tab(ui: &mut egui::Ui, input: &DrawInput<'_>, actions: &mut UiActi
         }
         let mut vol = audio.volume;
         if ui
-            .add(egui::Slider::new(&mut vol, 0.0..=2.0).text(i18n.t("label_volume")))
+            .add(
+                egui::Slider::new(&mut vol, 0.0..=audio::VOLUME_MAX).text(i18n.t("label_volume")),
+            )
             .on_hover_text(i18n.t("tip_volume_boost"))
             .changed()
         {
@@ -2015,6 +2025,24 @@ fn draw_replay_prefs(ui: &mut egui::Ui, i18n: &I18n, o: &OverlayState, actions: 
     {
         actions.replay_seconds_changed = Some(secs);
     }
+    ui.horizontal_wrapped(|ui| {
+        ui.label(i18n.t("label_replay_fps_choice"));
+        for &fps in &crate::replay::REPLAY_SAMPLE_FPS_CHOICES {
+            let selected = o.replay_sample_fps_choice == fps;
+            if ui
+                .selectable_label(selected, format!("{fps}"))
+                .on_hover_text(i18n.t("tip_replay_fps"))
+                .clicked()
+            {
+                actions.replay_sample_fps_changed = Some(fps);
+            }
+        }
+        ui.strong(format!(
+            "{}: {}",
+            i18n.t("label_replay_fps_current"),
+            o.replay_sample_fps_choice
+        ));
+    });
     ui.small(format!("{}: {}", i18n.t("label_replay_frames"), o.replay_frames));
     ui.small(format!(
         "{}: {:.0} · {}: {:.0} · {}: {:.0}",
@@ -2195,6 +2223,20 @@ fn draw_export_prefs(ui: &mut egui::Ui, i18n: &I18n, o: &OverlayState, actions: 
         );
     }
     ui.label(RichText::new(i18n.t("tip_spout_send")).small().italics());
+    ui.horizontal_wrapped(|ui| {
+        ui.label(i18n.t("label_spout_fps"));
+        for &fps in &crate::export::SPOUT_FPS_CHOICES {
+            let selected = o.spout_fps == fps;
+            if ui
+                .selectable_label(selected, format!("{fps}"))
+                .on_hover_text(i18n.t("tip_spout_fps"))
+                .clicked()
+            {
+                actions.spout_fps_changed = Some(fps);
+            }
+        }
+        ui.strong(format!("{}: {}", i18n.t("label_spout_fps_current"), o.spout_fps));
+    });
     let mut spout_name = o.spout_name.clone();
     if ui
         .add(

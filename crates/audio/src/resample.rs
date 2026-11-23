@@ -6,6 +6,19 @@ use rubato::{
 
 use crate::device::AudioError;
 
+/// Soft ceiling for multi-channel sums — linear below ~0.95, asymptotic to ±1.
+/// Avoids the old global *0.89 pre-scale that also ducked center (dialogue).
+fn soft_limit(x: f32) -> f32 {
+    const THRESH: f32 = 0.95;
+    let a = x.abs();
+    if a <= THRESH {
+        x
+    } else {
+        let t = a - THRESH;
+        x.signum() * (THRESH + (1.0 - THRESH) * (1.0 - (-t * 5.0).exp()))
+    }
+}
+
 /// Downmix arbitrary channel counts to interleaved stereo f32.
 pub fn fold_to_stereo_interleaved(input: &[f32], channels: usize) -> Vec<f32> {
     if channels == 0 || input.is_empty() {
@@ -23,23 +36,32 @@ pub fn fold_to_stereo_interleaved(input: &[f32], channels: usize) -> Vec<f32> {
         }
         2 => out.extend_from_slice(&input[..frames * 2]),
         n => {
-            // ITU-R BS.775-style fold. Preserve center (dialogue) without over-attenuating.
-            // Layout assumed: FL FR FC LFE BL BR [SL SR]. Stereo HDMI (Switch) is passthrough above.
+            // ITU-R BS.775-style fold. Layout: FL FR FC LFE BL BR [SL SR].
+            // Stereo HDMI (Switch) is true 2ch passthrough above; some cards still expose 6/8ch
+            // with silence on surrounds — detect that and passthrough FL/FR at full level.
             for f in 0..frames {
                 let base = f * n;
                 let fl = input[base];
                 let fr = if n > 1 { input[base + 1] } else { fl };
                 let fc = if n > 2 { input[base + 2] } else { 0.0 };
-                let lfe = if n > 3 { input[base + 3] * 0.5 } else { 0.0 };
-                let bl = if n > 4 { input[base + 4] * 0.707 } else { 0.0 };
-                let br = if n > 5 { input[base + 5] * 0.707 } else { 0.0 };
-                let sl = if n > 6 { input[base + 6] * 0.707 } else { 0.0 };
-                let sr = if n > 7 { input[base + 7] * 0.707 } else { 0.0 };
-                // Center at full level into both ears (dialogue). Soft headroom scale avoids hard clip.
-                let left = (fl + fc + bl + sl + lfe) * 0.89;
-                let right = (fr + fc + br + sr + lfe) * 0.89;
-                out.push(left.clamp(-1.0, 1.0));
-                out.push(right.clamp(-1.0, 1.0));
+                let lfe = if n > 3 { input[base + 3] } else { 0.0 };
+                let bl = if n > 4 { input[base + 4] } else { 0.0 };
+                let br = if n > 5 { input[base + 5] } else { 0.0 };
+                let sl = if n > 6 { input[base + 6] } else { 0.0 };
+                let sr = if n > 7 { input[base + 7] } else { 0.0 };
+                let surrounds =
+                    fc.abs() + lfe.abs() + bl.abs() + br.abs() + sl.abs() + sr.abs();
+                let (left, right) = if surrounds < 1e-6 {
+                    // Stereo content in a multi-channel container — no fold attenuation.
+                    (fl, fr)
+                } else {
+                    // Center (dialogue) at full level into both ears; surrounds/LFE side-weighted.
+                    let left = fl + fc + bl * 0.707 + sl * 0.707 + lfe * 0.5;
+                    let right = fr + fc + br * 0.707 + sr * 0.707 + lfe * 0.5;
+                    (soft_limit(left), soft_limit(right))
+                };
+                out.push(left);
+                out.push(right);
             }
         }
     }
@@ -132,6 +154,28 @@ mod tests {
         let mono = vec![0.5f32, -0.25];
         let st = fold_to_stereo_interleaved(&mono, 1);
         assert_eq!(st, vec![0.5, 0.5, -0.25, -0.25]);
+    }
+
+    #[test]
+    fn stereo_in_multichannel_passthrough_full_level() {
+        // 6ch with only FL/FR — must not apply legacy *0.89 duck.
+        let mut frame = vec![0.0f32; 6];
+        frame[0] = 0.8;
+        frame[1] = -0.4;
+        let st = fold_to_stereo_interleaved(&frame, 6);
+        assert_eq!(st.len(), 2);
+        assert!((st[0] - 0.8).abs() < 1e-5);
+        assert!((st[1] - -0.4).abs() < 1e-5);
+    }
+
+    #[test]
+    fn center_channel_preserved_at_full_level() {
+        // Silence L/R, dialogue on FC — must arrive near full in both ears.
+        let mut frame = vec![0.0f32; 6];
+        frame[2] = 0.7;
+        let st = fold_to_stereo_interleaved(&frame, 6);
+        assert!((st[0] - 0.7).abs() < 1e-5);
+        assert!((st[1] - 0.7).abs() < 1e-5);
     }
 
     #[test]

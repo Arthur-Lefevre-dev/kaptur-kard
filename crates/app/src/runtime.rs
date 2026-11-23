@@ -224,7 +224,7 @@ pub struct App {
     clip_save_rx: Option<Receiver<Result<replay::EncodeOutcome, String>>>,
     /// Shared PCM tap filled by the audio engine for clip mux.
     audio_replay_tap: SharedReplayTap,
-    /// RGBA thumb shown on the top-left clip toast (cleared with the toast).
+    /// RGBA thumb shown on the top-right clip toast (cleared with the toast).
     clip_toast_thumb: Option<(u32, u32, Vec<u8>)>,
     clip_toast_tex: Option<egui::TextureHandle>,
     /// Cached egui textures for Clips-tab first-frame thumbs (keyed by path).
@@ -426,6 +426,7 @@ impl Default for App {
         let mut replay = ReplayBuffer::default();
         replay.set_enabled(ui_prefs.replay_enabled);
         replay.set_seconds(ui_prefs.replay_seconds);
+        replay.set_sample_fps(ui_prefs.replay_sample_fps);
         let audio_replay_tap = AudioReplayTap::new_shared();
         {
             let mut tap = audio_replay_tap.lock();
@@ -445,9 +446,14 @@ impl Default for App {
         };
         let mut profiles = ui_prefs.profiles.clone();
         profiles.ensure_builtins();
-        // Keep prefs in sync with ensured builtins.
+        // Keep prefs in sync with ensured builtins + normalize new FPS fields.
         let mut ui_prefs = ui_prefs;
         ui_prefs.profiles = profiles;
+        ui_prefs.replay_sample_fps = replay::normalize_sample_fps(ui_prefs.replay_sample_fps);
+        ui_prefs.export.spout_fps =
+            crate::export::normalize_spout_fps(ui_prefs.export.spout_fps);
+        export.prefs.spout_fps = ui_prefs.export.spout_fps;
+        replay.set_sample_fps(ui_prefs.replay_sample_fps);
 
         Self {
             gpu: None,
@@ -1902,6 +1908,12 @@ impl App {
             self.sync_audio_replay_tap();
             self.persist_ui_prefs();
         }
+        if let Some(fps) = actions.replay_sample_fps_changed {
+            let fps = replay::normalize_sample_fps(fps);
+            self.ui_prefs.replay_sample_fps = fps;
+            self.replay.set_sample_fps(fps);
+            self.persist_ui_prefs();
+        }
         if actions.save_replay_clip {
             self.save_replay_clip();
         }
@@ -1984,6 +1996,14 @@ impl App {
         if let Some(name) = actions.spout_name_changed {
             self.export.prefs.spout_name = name.clone();
             self.ui_prefs.export.spout_name = name;
+            self.export.ensure_spout();
+            self.persist_ui_prefs();
+        }
+        if let Some(fps) = actions.spout_fps_changed {
+            let fps = crate::export::normalize_spout_fps(fps);
+            self.export.prefs.spout_fps = fps;
+            self.ui_prefs.export.spout_fps = fps;
+            self.export.ensure_spout();
             self.persist_ui_prefs();
         }
         if let Some(name) = actions.ndi_name_changed {
@@ -2366,6 +2386,7 @@ impl App {
         self.overlay.replay_enabled = self.ui_prefs.replay_enabled;
         self.overlay.replay_seconds = self.ui_prefs.replay_seconds;
         self.overlay.replay_frames = self.replay.frame_count() as u32;
+        self.overlay.replay_sample_fps_choice = self.replay.sample_fps();
         self.overlay.replay_sample_fps = self.replay.sample_fps_target();
         self.overlay.replay_buffer_fps = if self.replay.frame_count() >= 2 {
             self.replay.buffer_sample_fps()
@@ -2383,6 +2404,7 @@ impl App {
         self.overlay.spout_enabled = self.export.prefs.spout_enabled;
         self.overlay.ndi_enabled = self.export.prefs.ndi_enabled;
         self.overlay.spout_name = self.export.prefs.spout_name.clone();
+        self.overlay.spout_fps = crate::export::normalize_spout_fps(self.export.prefs.spout_fps);
         self.overlay.ndi_name = self.export.prefs.ndi_name.clone();
         self.overlay.update = self.update.status.clone();
         self.overlay.current_version = env!("CARGO_PKG_VERSION").into();
@@ -3588,10 +3610,16 @@ fn ensure_clip_list_thumbs(
         if cache.contains_key(&clip.path) {
             continue;
         }
-        let Some(thumb_path) = clip.thumb_path.as_ref() else {
-            continue;
-        };
-        let Some((w, h, rgba)) = load_thumb_rgba(thumb_path) else {
+        // Prefer companion .jpg; if missing/corrupt (legacy RGBA JPEG encode), backfill via ffmpeg.
+        let loaded = clip
+            .thumb_path
+            .as_ref()
+            .and_then(|p| load_thumb_rgba(p))
+            .or_else(|| {
+                let path = replay::backfill_clip_thumb(&clip.path)?;
+                load_thumb_rgba(&path)
+            });
+        let Some((w, h, rgba)) = loaded else {
             continue;
         };
         let img = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
