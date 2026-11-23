@@ -180,7 +180,8 @@ fn frame_to_bgra_downscaled(frame: &VideoFrame, max_w: u32) -> Option<Vec<u8>> {
                 downsample_bgra(&full, frame.width, frame.height, dw, dh)
             }
         }
-        // NV12 / others: skip to keep the buffer light (BGRA/YUY2 cover MF cards).
+        // MF capture cards usually deliver NV12; preview uses GPU convert, replay needs CPU.
+        PixelFormat::Nv12 => nv12_to_bgra_scaled(src, frame.width, frame.height, dw, dh),
         _ => None,
     }
 }
@@ -241,6 +242,39 @@ fn yuy2_to_bgra(src: &[u8], w: u32, h: u32) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Convert tightly-packed NV12 to BGRA, sampling into `dw×dh` (point filter).
+fn nv12_to_bgra_scaled(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Option<Vec<u8>> {
+    if sw == 0 || sh == 0 || dw == 0 || dh == 0 || sw < 2 || sh < 2 {
+        return None;
+    }
+    let y_size = (sw * sh) as usize;
+    let uv_size = (sw * sh / 2) as usize;
+    if src.len() < y_size + uv_size {
+        return None;
+    }
+    let y_plane = &src[..y_size];
+    let uv_plane = &src[y_size..y_size + uv_size];
+    let mut out = vec![0u8; (dw * dh * 4) as usize];
+    for dy in 0..dh {
+        let sy = (dy as u64 * sh as u64 / dh as u64) as u32;
+        for dx in 0..dw {
+            let sx = (dx as u64 * sw as u64 / dw as u64) as u32;
+            let y_val = y_plane[(sy * sw + sx) as usize] as f32;
+            // UV is interleaved, half-res: row stride = sw bytes.
+            let uv_i = ((sy / 2) * sw + (sx & !1)) as usize;
+            let u = uv_plane[uv_i] as f32;
+            let v = uv_plane[uv_i + 1] as f32;
+            let (b, g, r) = yuv_to_bgra(y_val, u, v);
+            let o = ((dy * dw + dx) * 4) as usize;
+            out[o] = b;
+            out[o + 1] = g;
+            out[o + 2] = r;
+            out[o + 3] = 255;
+        }
+    }
+    Some(out)
+}
+
 fn yuv_to_bgra(y: f32, u: f32, v: f32) -> (u8, u8, u8) {
     let c = y - 16.0;
     let d = u - 128.0;
@@ -287,11 +321,36 @@ pub fn pooled_len(data: &Arc<PooledBytes>) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use capture::PixelFormat;
 
     #[test]
     fn downsample_noop() {
         let src = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
         let out = downsample_bgra(&src, 2, 1, 2, 1).unwrap();
         assert_eq!(out, src);
+    }
+
+    #[test]
+    fn nv12_fills_replay_when_enabled() {
+        // 4×2 NV12: Y plane 8 bytes + UV plane 4 bytes.
+        let pool = capture::BufferPool::new();
+        let mut pooled = pool.take(12);
+        {
+            let s = pooled.as_mut_slice();
+            s[..8].fill(16); // blackish Y
+            s[8..].copy_from_slice(&[128, 128, 128, 128]); // neutral chroma
+        }
+        let frame = VideoFrame {
+            captured_at: Instant::now(),
+            width: 4,
+            height: 2,
+            pixel_format: PixelFormat::Nv12,
+            data: pooled.into_arc(),
+        };
+        let mut buf = ReplayBuffer::default();
+        buf.set_enabled(true);
+        buf.push_frame(&frame);
+        assert_eq!(buf.frame_count(), 1, "NV12 live frames must enter the ring");
+        assert!(frame_to_bgra_downscaled(&frame, MAX_STORE_WIDTH).is_some());
     }
 }
