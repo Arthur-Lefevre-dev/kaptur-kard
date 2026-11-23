@@ -120,6 +120,10 @@ pub struct UiPrefs {
     pub replay_seconds: u32,
     #[serde(default)]
     pub replay_enabled: bool,
+    /// One-shot: Spout/replay forced off once (Spout adds ~30 ms display delay).
+    /// Users may re-enable afterward; flag prevents re-migrating every launch.
+    #[serde(default)]
+    pub latency_defaults_migrated: bool,
     /// Brightness / contrast / gamma (+ optional .cube mix).
     #[serde(default)]
     pub grade: GradePrefs,
@@ -271,6 +275,7 @@ impl Default for UiPrefs {
             hud_always_on_top: false,
             replay_seconds: default_replay_seconds(),
             replay_enabled: false,
+            latency_defaults_migrated: true,
             grade: GradePrefs::default(),
             cube_lut_path: String::new(),
             export: ExportPrefs::default(),
@@ -279,6 +284,24 @@ impl Default for UiPrefs {
             update_skip_tag: String::new(),
         }
     }
+}
+
+/// Force Spout + replay off once for existing installs (latency / no auto-enable).
+/// Returns true when prefs were changed and should be persisted.
+pub fn migrate_latency_defaults(prefs: &mut UiPrefs) -> bool {
+    if prefs.latency_defaults_migrated {
+        return false;
+    }
+    let changed = prefs.export.spout_enabled || prefs.replay_enabled;
+    prefs.export.spout_enabled = false;
+    prefs.replay_enabled = false;
+    prefs.latency_defaults_migrated = true;
+    if changed {
+        tracing::info!(
+            "migrated latency defaults: Spout and replay buffer disabled (re-enable in Infos / Clips)"
+        );
+    }
+    true
 }
 
 impl UiPrefs {

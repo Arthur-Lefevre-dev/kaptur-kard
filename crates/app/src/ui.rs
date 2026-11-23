@@ -21,6 +21,8 @@ pub enum SettingsTab {
     Sound,
     Effects,
     Info,
+    /// Replay buffer + saved clips (after Infos).
+    Clips,
 }
 
 /// F2 cycles metrics only (Off → Simple → Detailed → Off). F1 toggles settings.
@@ -175,6 +177,8 @@ pub struct OverlayState {
     pub replay_frames: u32,
     /// Saved clips under `%APPDATA%\CaptureView\clips\`.
     pub clips: Vec<ClipEntry>,
+    /// True while a background clip encode is running (disable Save / show toast).
+    pub clip_encoding: bool,
     pub grade: GradePrefs,
     pub cube_lut_path: String,
     pub health: CaptureHealthUi,
@@ -253,6 +257,7 @@ impl Default for OverlayState {
             replay_seconds: 8,
             replay_frames: 0,
             clips: Vec::new(),
+            clip_encoding: false,
             grade: GradePrefs::default(),
             cube_lut_path: String::new(),
             health: CaptureHealthUi::default(),
@@ -408,6 +413,8 @@ pub struct UiActions {
     pub grade_reset: bool,
     pub cube_path_changed: Option<String>,
     pub cube_clear: bool,
+    /// Open a native file picker and import a `.cube` into app prefs.
+    pub import_cube_lut: bool,
     pub spout_enabled_changed: Option<bool>,
     pub ndi_enabled_changed: Option<bool>,
     pub spout_name_changed: Option<String>,
@@ -728,6 +735,14 @@ fn draw_toolbar(ctx: &Context, i18n: &I18n, chrome: &UiChrome, actions: &mut UiA
                         );
                         toolbar_btn(
                             ui,
+                            "🎬",
+                            &i18n.t("toolbar_clips"),
+                            &i18n.t("tip_clips_tab"),
+                            chrome.settings_tab == SettingsTab::Clips && chrome.settings_open,
+                            || actions.open_settings = Some(SettingsTab::Clips),
+                        );
+                        toolbar_btn(
+                            ui,
                             "⛶",
                             &i18n.t("toolbar_fullscreen"),
                             &i18n.t("tip_fullscreen"),
@@ -782,6 +797,7 @@ fn draw_settings(ctx: &Context, input: &DrawInput<'_>, actions: &mut UiActions) 
                     (SettingsTab::Sound, "tab_sound"),
                     (SettingsTab::Effects, "tab_effects"),
                     (SettingsTab::Info, "tab_info"),
+                    (SettingsTab::Clips, "tab_clips"),
                 ] {
                     let selected = input.chrome.settings_tab == tab;
                     if ui.selectable_label(selected, i18n.t(key)).clicked() {
@@ -810,6 +826,7 @@ fn draw_settings(ctx: &Context, input: &DrawInput<'_>, actions: &mut UiActions) 
                 SettingsTab::Sound => draw_sound_tab(ui, input, actions),
                 SettingsTab::Effects => draw_effects_tab(ui, input, actions),
                 SettingsTab::Info => draw_info_tab(ui, input, actions),
+                SettingsTab::Clips => draw_clips_tab(ui, input, actions),
             }
 
             ui.separator();
@@ -1529,6 +1546,22 @@ fn draw_info_tab(ui: &mut egui::Ui, input: &DrawInput<'_>, actions: &mut UiActio
         });
 }
 
+fn draw_clips_tab(ui: &mut egui::Ui, input: &DrawInput<'_>, actions: &mut UiActions) {
+    let max_h = (ui.ctx().screen_rect().height() * 0.65).clamp(280.0, 640.0);
+    egui::ScrollArea::vertical()
+        .id_salt("clips_tab_scroll")
+        .max_height(max_h)
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            let i18n = input.i18n;
+            let o = input.overlay;
+            draw_replay_prefs(ui, i18n, o, actions);
+            ui.add_space(8.0);
+            ui.separator();
+            draw_clips_panel(ui, i18n, o, actions);
+        });
+}
+
 fn draw_info_tab_body(ui: &mut egui::Ui, input: &DrawInput<'_>, actions: &mut UiActions) {
     let i18n = input.i18n;
     let o = input.overlay;
@@ -1539,11 +1572,6 @@ fn draw_info_tab_body(ui: &mut egui::Ui, input: &DrawInput<'_>, actions: &mut Ui
     ui.add_space(8.0);
     ui.separator();
     draw_hud_prefs(ui, i18n, o, actions);
-    ui.add_space(6.0);
-    draw_replay_prefs(ui, i18n, o, actions);
-    ui.add_space(8.0);
-    ui.separator();
-    draw_clips_panel(ui, i18n, o, actions);
     ui.add_space(6.0);
     draw_grade_prefs(ui, i18n, o, actions);
     ui.add_space(6.0);
@@ -1942,8 +1970,13 @@ fn draw_replay_prefs(ui: &mut egui::Ui, i18n: &I18n, o: &OverlayState, actions: 
         actions.replay_seconds_changed = Some(secs);
     }
     ui.small(format!("{}: {}", i18n.t("label_replay_frames"), o.replay_frames));
-    if ui.button(i18n.t("btn_replay_save")).clicked() {
-        actions.save_replay_clip = true;
+    ui.add_enabled_ui(!o.clip_encoding, |ui| {
+        if ui.button(i18n.t("btn_replay_save")).clicked() {
+            actions.save_replay_clip = true;
+        }
+    });
+    if o.clip_encoding {
+        ui.small(i18n.t("msg_replay_encoding"));
     }
 }
 
@@ -2032,11 +2065,18 @@ fn draw_grade_prefs(ui: &mut egui::Ui, i18n: &I18n, o: &OverlayState, actions: &
     ui.horizontal(|ui| {
         ui.label(i18n.t("label_cube_path"));
         if ui
-            .add(egui::TextEdit::singleline(&mut path).desired_width(220.0))
+            .add(egui::TextEdit::singleline(&mut path).desired_width(180.0))
             .lost_focus()
             && path != o.cube_lut_path
         {
             actions.cube_path_changed = Some(path);
+        }
+        if ui
+            .button(i18n.t("btn_cube_import"))
+            .on_hover_text(i18n.t("tip_cube_import"))
+            .clicked()
+        {
+            actions.import_cube_lut = true;
         }
     });
 }
