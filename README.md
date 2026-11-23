@@ -35,17 +35,17 @@ Entrée audio HDMI, sortie casque/haut-parleurs, mute, volume et niveau.
 
 ![Effects settings / Réglages Effets](docs/images/settings-effects.png)
 
-### Infos — monitoring, VRR / HDR, language
+### Infos — monitoring graphs, VRR / HDR, language
 
-Live FPS (capture / after interpolation / display), pipeline delay, VSync, **VRR** (G-Sync / FreeSync path), **HDR** status, 1% lows, CPU/RAM/GPU, frame-time graph, language (English / Français), Discord presence, logs, manual lag flash test.  
-FPS live (capture / après interpolation / écran), retard pipeline, VSync, **VRR**, statut **HDR**, 1 % bas, CPU/RAM/GPU, courbe temps par image, langue, Discord, journaux, test flash de retard.
+**Graphiques de monitoring** toggles (CPU/RAM/GPU, VRAM, disk I/O, FPS / 1% lows, present latency, framegen throughput), live sparklines, FPS (capture / after interpolation / display), pipeline delay, VSync, **VRR** (G-Sync / FreeSync), **HDR** status, language (English / Français).  
+Cases **Graphiques de monitoring**, courbes live, FPS, retard pipeline, VSync, **VRR**, statut **HDR**, choix de langue.
 
 ![Infos monitoring VRR HDR](docs/images/settings-info.png)
 
 ### Metrics overlay (F2) / Mesures
 
-**Simple** and **Detailed** overlays — same VRR/HDR lines, plus detailed CPU/RAM/GPU and frame-time graph in detailed mode.  
-Overlays **simple** et **détail** — mêmes lignes VRR/HDR ; détail ajoute CPU/RAM/GPU et la courbe.
+**Simple** and **Detailed** overlays — VRR/HDR lines; detailed mode adds CPU/RAM/VRAM graphs and frame-time history.  
+Overlays **simple** et **détail** — lignes VRR/HDR ; le détail ajoute les graphiques CPU/RAM/VRAM et l’historique des temps d’image.
 
 | Simple | Detailed / Détail |
 |--------|-------------------|
