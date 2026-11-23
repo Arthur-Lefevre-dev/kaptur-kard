@@ -237,6 +237,8 @@ pub struct App {
     /// Brief shortcuts overlay after the wizard (or immediately if wizard already done).
     launch_tips_started: Option<Instant>,
     launch_tips_dismissed: bool,
+    /// Startup update modal dismissed for this process (once per session).
+    update_popup_dismissed: bool,
     /// Cached Windows HDR / DXGI tearing probe (refreshed ~1 Hz).
     os_display_caps: OsDisplayCaps,
     last_display_caps_at: Instant,
@@ -507,6 +509,7 @@ impl Default for App {
             proxy: None,
             launch_tips_started: None,
             launch_tips_dismissed: false,
+            update_popup_dismissed: false,
             os_display_caps: OsDisplayCaps::default(),
             last_display_caps_at: Instant::now()
                 .checked_sub(Duration::from_secs(2))
@@ -527,6 +530,15 @@ fn push_history(buf: &mut Vec<f32>, value: f32, cap: usize) {
         let drain = buf.len() - cap;
         buf.drain(0..drain);
     }
+}
+
+
+fn tags_match(a: &str, b: &str) -> bool {
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    let norm = |s: &str| s.trim().trim_start_matches('v').to_ascii_lowercase();
+    norm(a) == norm(b)
 }
 
 fn launch_tips_alpha(elapsed: Duration) -> f32 {
@@ -1954,6 +1966,17 @@ impl App {
         if actions.update_open {
             self.update.open_latest();
         }
+        if actions.update_skip_this_version {
+            let tag = self.update.status.latest_tag.clone();
+            if !tag.is_empty() {
+                self.ui_prefs.update_skip_tag = tag;
+                self.persist_ui_prefs();
+            }
+        }
+        if actions.dismiss_update_popup {
+            self.chrome.update_popup_open = false;
+            self.update_popup_dismissed = true;
+        }
     }
 
     fn persist_ui_prefs(&mut self) {
@@ -2150,6 +2173,7 @@ impl App {
 
     fn sync_feature_overlay(&mut self) {
         self.update.poll();
+        self.maybe_open_update_popup();
         self.overlay.hud_enabled = self.ui_prefs.hud_enabled;
         self.overlay.hud_always_on_top = self.ui_prefs.hud_always_on_top;
         self.overlay.replay_enabled = self.ui_prefs.replay_enabled;
@@ -2168,6 +2192,35 @@ impl App {
         self.overlay.update = self.update.status.clone();
         self.overlay.current_version = env!("CARGO_PKG_VERSION").into();
         self.overlay.profiles = self.ui_prefs.profiles.clone();
+    }
+
+    /// Open the startup update modal once when a newer release arrives (non-blocking).
+    fn maybe_open_update_popup(&mut self) {
+        if self.update_popup_dismissed || self.chrome.update_popup_open {
+            return;
+        }
+        if self.chrome.wizard_open {
+            return;
+        }
+        // Avoid stacking on top of the brief launch shortcuts card.
+        if !self.launch_tips_dismissed && self.chrome.launch_tips_alpha > 0.01 {
+            return;
+        }
+        if !self.ui_prefs.update_check {
+            return;
+        }
+        let st = &self.update.status;
+        if st.checking || !st.newer || st.latest_tag.is_empty() {
+            return;
+        }
+        if tags_match(&st.latest_tag, &self.ui_prefs.update_skip_tag) {
+            return;
+        }
+        self.chrome.update_popup_open = true;
+        // Wake the UI loop so the modal appears even if capture is idle.
+        if let Some(proxy) = &self.proxy {
+            let _ = proxy.send_event(UserEvent::FrameReady);
+        }
     }
 
     fn flush_prefs_if_due(&mut self) {
@@ -2667,6 +2720,7 @@ impl App {
         // Idle cursor: hide over the preview; keep visible for settings / wizard / UI use.
         let ui_keeps_cursor = self.chrome.settings_open
             || self.chrome.wizard_open
+            || self.chrome.update_popup_open
             || self.chrome.launch_tips_alpha > 0.01;
         let want_hide = !ui_keeps_cursor && self.last_pointer_at.elapsed() > CURSOR_IDLE_HIDE;
         self.chrome.hide_idle_cursor = want_hide;

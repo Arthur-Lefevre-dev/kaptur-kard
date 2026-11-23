@@ -163,7 +163,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "audio"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "anyhow",
  "cpal",
@@ -363,7 +363,7 @@ dependencies = [
 
 [[package]]
 name = "capture"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "crossbeam-channel",
  "parking_lot",
@@ -376,7 +376,7 @@ dependencies = [
 
 [[package]]
 name = "captureview"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "anyhow",
  "arboard",
@@ -1497,7 +1497,7 @@ dependencies = [
 
 [[package]]
 name = "metrics"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "tracing",
  "windows 0.58.0",
@@ -2353,7 +2353,7 @@ checksum = "d902046e6a28a1e4c3cab97258a0ce11e994903f01c2d97a9447a0b3df85f4f6"
 
 [[package]]
 name = "render"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "bytemuck",
  "capture",
