@@ -41,6 +41,25 @@ impl MetricsMode {
     }
 }
 
+/// Severity for the top-center status toast / banner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ToastKind {
+    #[default]
+    Neutral,
+    Success,
+    Error,
+}
+
+impl ToastKind {
+    pub fn color(self) -> Color32 {
+        match self {
+            Self::Neutral => Color32::from_rgb(230, 230, 235),
+            Self::Success => Color32::from_rgb(120, 220, 140),
+            Self::Error => Color32::from_rgb(255, 140, 120),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Impact {
     None,
@@ -111,6 +130,8 @@ pub struct OverlayState {
     pub audio_notice: String,
     pub level: f32,
     pub toast: String,
+    /// Visual severity for the status toast banner.
+    pub toast_kind: ToastKind,
     /// Display pipeline delay (capture → present), milliseconds.
     pub pipeline_delay_ms: f32,
     pub one_percent_low_fps: f32,
@@ -196,6 +217,7 @@ impl Default for OverlayState {
             audio_notice: String::new(),
             level: 0.0,
             toast: String::new(),
+            toast_kind: ToastKind::Neutral,
             pipeline_delay_ms: 0.0,
             one_percent_low_fps: 0.0,
             dropped_frames: 0,
@@ -610,7 +632,10 @@ pub fn draw_ui(ctx: &Context, input: DrawInput<'_>) -> UiActions {
                             );
                         }
                         if !input.overlay.toast.is_empty() {
-                            ui.label(&input.overlay.toast);
+                            ui.colored_label(
+                                input.overlay.toast_kind.color(),
+                                RichText::new(&input.overlay.toast).strong(),
+                            );
                         }
                     });
             });
@@ -1437,6 +1462,18 @@ fn draw_effects_tab(ui: &mut egui::Ui, input: &DrawInput<'_>, actions: &mut UiAc
 }
 
 fn draw_info_tab(ui: &mut egui::Ui, input: &DrawInput<'_>, actions: &mut UiActions) {
+    // Infos packs many toggles; keep them reachable without growing the window forever.
+    let max_h = (ui.ctx().screen_rect().height() * 0.65).clamp(280.0, 640.0);
+    egui::ScrollArea::vertical()
+        .id_salt("info_tab_scroll")
+        .max_height(max_h)
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            draw_info_tab_body(ui, input, actions);
+        });
+}
+
+fn draw_info_tab_body(ui: &mut egui::Ui, input: &DrawInput<'_>, actions: &mut UiActions) {
     let i18n = input.i18n;
     let o = input.overlay;
     draw_brand_header(ui, input.logo.as_ref(), i18n);

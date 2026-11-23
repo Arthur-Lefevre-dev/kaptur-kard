@@ -51,7 +51,8 @@ use crate::prefs::{
 use crate::profiles::NamedProfile;
 use crate::replay::ReplayBuffer;
 use crate::ui::{
-    self, AudioUiState, ColorUiState, EffectsUiState, OverlayState, UiChrome, UiSelection,
+    self, AudioUiState, ColorUiState, EffectsUiState, OverlayState, ToastKind, UiChrome,
+    UiSelection,
 };
 use crate::update_check::UpdateChecker;
 use winit::window::WindowLevel;
@@ -2051,18 +2052,29 @@ impl App {
     fn save_replay_clip(&mut self) {
         match self.replay.save_clip() {
             Ok(dir) => {
-                self.show_toast(format!(
-                    "{} {}",
+                let frames = self.replay.frame_count();
+                let msg = format!(
+                    "{} ({frames}) — {}",
                     self.i18n.t("msg_replay_saved"),
                     dir.display()
-                ));
+                );
+                // Longer dwell so the folder path is readable.
+                self.show_toast_kind(msg, ToastKind::Success, Duration::from_secs(6));
             }
             Err(e) if e.contains("empty") => {
-                self.show_toast(self.i18n.t("msg_replay_empty"));
+                self.show_toast_kind(
+                    self.i18n.t("msg_replay_empty"),
+                    ToastKind::Error,
+                    Duration::from_secs(5),
+                );
             }
             Err(e) => {
                 tracing::warn!(error = %e, "replay save failed");
-                self.show_toast(self.i18n.t("msg_replay_err"));
+                self.show_toast_kind(
+                    self.i18n.t("msg_replay_err"),
+                    ToastKind::Error,
+                    Duration::from_secs(5),
+                );
             }
         }
     }
@@ -2239,8 +2251,13 @@ impl App {
     }
 
     fn show_toast(&mut self, msg: String) {
+        self.show_toast_kind(msg, ToastKind::Neutral, Duration::from_secs(3));
+    }
+
+    fn show_toast_kind(&mut self, msg: String, kind: ToastKind, dwell: Duration) {
         self.overlay.toast = msg;
-        self.toast_until = Some(Instant::now() + Duration::from_secs(3));
+        self.overlay.toast_kind = kind;
+        self.toast_until = Some(Instant::now() + dwell);
     }
 
     /// Resize the windowed client area to the active capture size (physical pixels).
@@ -2556,6 +2573,7 @@ impl App {
         if let Some(until) = self.toast_until {
             if Instant::now() > until {
                 self.overlay.toast.clear();
+                self.overlay.toast_kind = ToastKind::Neutral;
                 self.toast_until = None;
             }
         }
