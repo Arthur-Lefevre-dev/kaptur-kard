@@ -301,6 +301,8 @@ pub struct UiChrome {
     pub settings_pinned: bool,
     /// 0 = hidden, 1 = fully visible. Soft launch tips overlay opacity.
     pub launch_tips_alpha: f32,
+    /// Startup modal when a newer GitHub release is available.
+    pub update_popup_open: bool,
     /// Capture-preview style: hide OS cursor after pointer idle over the window.
     pub hide_idle_cursor: bool,
 }
@@ -319,6 +321,7 @@ impl Default for UiChrome {
             metrics_pinned: false,
             settings_pinned: false,
             launch_tips_alpha: 0.0,
+            update_popup_open: false,
             hide_idle_cursor: false,
         }
     }
@@ -409,6 +412,10 @@ pub struct UiActions {
     pub health_stall_secs_changed: Option<u32>,
     pub update_check: bool,
     pub update_open: bool,
+    /// Dismiss the startup update modal for this session.
+    pub dismiss_update_popup: bool,
+    /// Persist "don't remind for this version" when dismissing / opening download.
+    pub update_skip_this_version: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -554,8 +561,10 @@ pub fn draw_ui(ctx: &Context, input: DrawInput<'_>) -> UiActions {
             actions.mute_toggled = Some(!input.audio.muted);
         }
         if i.key_pressed(Key::Escape) {
-            // Launch tips → settings → leave fullscreen.
-            if input.chrome.launch_tips_alpha > 0.01 {
+            // Update popup → launch tips → settings → leave fullscreen.
+            if input.chrome.update_popup_open {
+                actions.dismiss_update_popup = true;
+            } else if input.chrome.launch_tips_alpha > 0.01 {
                 actions.dismiss_launch_tips = true;
             } else if input.chrome.settings_open {
                 actions.close_settings = true;
@@ -599,6 +608,11 @@ pub fn draw_ui(ctx: &Context, input: DrawInput<'_>) -> UiActions {
             input.logo.as_ref(),
             &mut actions,
         );
+    }
+
+    // Non-blocking: appears after background GitHub check finds a newer tag.
+    if input.chrome.update_popup_open {
+        draw_update_popup(ctx, i18n, input.overlay, input.logo.as_ref(), &mut actions);
     }
 
     // Status toasts / signal hints (non-blocking).
@@ -2089,6 +2103,122 @@ fn draw_update_prefs(ui: &mut egui::Ui, i18n: &I18n, o: &OverlayState, actions: 
             actions.update_open = true;
         }
     });
+}
+
+
+/// Startup modal when GitHub Releases reports a newer tag (once per session).
+fn draw_update_popup(
+    ctx: &Context,
+    i18n: &I18n,
+    overlay: &OverlayState,
+    logo: Option<&egui::TextureHandle>,
+    actions: &mut UiActions,
+) {
+    let screen = ctx.screen_rect();
+    // Dim layer absorbs clicks so capture UI underneath is not hit.
+    egui::Area::new(egui::Id::new("update_popup_dim"))
+        .fixed_pos(screen.min)
+        .order(egui::Order::Foreground)
+        .show(ctx, |ui| {
+            let _ = ui.allocate_response(screen.size(), egui::Sense::click());
+            ui.painter().rect_filled(
+                screen,
+                0.0,
+                Color32::from_rgba_unmultiplied(0, 0, 0, 140),
+            );
+        });
+
+    let title = format!(
+        "{} — {}",
+        i18n.t("update_available"),
+        overlay.update.latest_tag
+    );
+    let skip_id = egui::Id::new("update_popup_skip");
+    let mut skip = ctx.data(|d| d.get_temp::<bool>(skip_id).unwrap_or(false));
+    egui::Window::new(title)
+        .id(egui::Id::new("update_popup"))
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .order(egui::Order::Foreground)
+        .frame(
+            egui::Frame::NONE
+                .fill(Color32::from_rgba_unmultiplied(12, 14, 18, 240))
+                .corner_radius(egui::CornerRadius::same(10))
+                .inner_margin(egui::Margin::symmetric(18, 14))
+                .stroke(egui::Stroke::new(
+                    1.0_f32,
+                    Color32::from_rgba_unmultiplied(80, 90, 110, 160),
+                )),
+        )
+        .show(ctx, |ui| {
+            ui.set_min_width(380.0);
+            ui.set_max_width(480.0);
+            ui.horizontal(|ui| {
+                if let Some(tex) = logo {
+                    ui.add(egui::Image::new(tex).fit_to_exact_size(egui::vec2(28.0, 28.0)));
+                }
+                ui.vertical(|ui| {
+                    ui.label(
+                        RichText::new(i18n.t("update_popup_title"))
+                            .strong()
+                            .size(16.0),
+                    );
+                    ui.small(format!(
+                        "v{} → {}",
+                        overlay.current_version, overlay.update.latest_tag
+                    ));
+                });
+            });
+            ui.add_space(10.0);
+            if !overlay.update.body.is_empty() {
+                ui.label(RichText::new(i18n.t("update_popup_notes")).strong());
+                egui::ScrollArea::vertical()
+                    .id_salt("update_popup_body")
+                    .max_height(180.0)
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new(overlay.update.body.as_str())
+                                .small()
+                                .color(Color32::from_rgb(200, 205, 215)),
+                        );
+                    });
+            } else {
+                ui.label(
+                    RichText::new(i18n.t("update_popup_no_notes"))
+                        .small()
+                        .italics(),
+                );
+            }
+            ui.add_space(8.0);
+            ui.checkbox(&mut skip, i18n.t("update_skip_version"));
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .button(RichText::new(i18n.t("btn_update_open")).strong())
+                    .clicked()
+                {
+                    actions.update_open = true;
+                    actions.dismiss_update_popup = true;
+                    if skip {
+                        actions.update_skip_this_version = true;
+                    }
+                }
+                if ui.button(i18n.t("btn_update_later")).clicked() {
+                    actions.dismiss_update_popup = true;
+                    if skip {
+                        actions.update_skip_this_version = true;
+                    }
+                }
+            });
+            ui.add_space(2.0);
+            ui.label(
+                RichText::new(i18n.t("update_popup_hint"))
+                    .small()
+                    .weak(),
+            );
+        });
+    ctx.data_mut(|d| d.insert_temp(skip_id, skip));
 }
 
 fn draw_sparkline(ui: &mut egui::Ui, values: &[f32], max_hint: f32, color_fn: impl Fn(f32) -> Color32) {

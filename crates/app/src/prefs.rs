@@ -133,6 +133,9 @@ pub struct UiPrefs {
     /// Check GitHub releases on launch / from Infos.
     #[serde(default = "default_true")]
     pub update_check: bool,
+    /// Latest tag the user chose not to be reminded about (empty = none).
+    #[serde(default)]
+    pub update_skip_tag: String,
 }
 
 fn default_replay_seconds() -> u32 {
@@ -273,6 +276,7 @@ impl Default for UiPrefs {
             export: ExportPrefs::default(),
             health: HealthPrefs::default(),
             update_check: true,
+            update_skip_tag: String::new(),
         }
     }
 }
