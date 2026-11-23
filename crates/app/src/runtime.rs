@@ -41,13 +41,20 @@ pub enum UserEvent {
 
 use crate::discord_presence::{resolve_app_id, DiscordPresence};
 use crate::display_caps::OsDisplayCaps;
+use crate::export::FrameExport;
+use crate::health::HealthMonitor;
 use crate::i18n::{I18n, Lang};
+use crate::lut::{CubeLut1d, GradePrefs};
 use crate::prefs::{
     load_audio_prefs, load_ui_prefs, save_audio_prefs, save_ui_prefs, AudioPrefs, UiPrefs,
 };
+use crate::profiles::NamedProfile;
+use crate::replay::ReplayBuffer;
 use crate::ui::{
     self, AudioUiState, ColorUiState, EffectsUiState, OverlayState, UiChrome, UiSelection,
 };
+use crate::update_check::UpdateChecker;
+use winit::window::WindowLevel;
 
 /// Result of a background Media Foundation presence / enum poll.
 enum HotplugResult {
@@ -227,6 +234,12 @@ pub struct App {
     /// Cached Windows HDR / DXGI tearing probe (refreshed ~1 Hz).
     os_display_caps: OsDisplayCaps,
     last_display_caps_at: Instant,
+    replay: ReplayBuffer,
+    health: HealthMonitor,
+    export: FrameExport,
+    update: UpdateChecker,
+    /// Optional 1D LUT loaded from .cube (CPU preview / future GPU upload).
+    cube_lut: Option<CubeLut1d>,
 }
 
 impl Default for App {
@@ -389,6 +402,25 @@ impl Default for App {
             }
         };
 
+        let mut replay = ReplayBuffer::default();
+        replay.set_enabled(ui_prefs.replay_enabled);
+        replay.set_seconds(ui_prefs.replay_seconds);
+        let mut health = HealthMonitor::default();
+        health.prefs = ui_prefs.health.clone();
+        let mut export = FrameExport::default();
+        export.prefs = ui_prefs.export.clone();
+        export.refresh_probe();
+        let cube_lut = if ui_prefs.cube_lut_path.trim().is_empty() {
+            None
+        } else {
+            CubeLut1d::load_path(std::path::Path::new(&ui_prefs.cube_lut_path)).ok()
+        };
+        let mut profiles = ui_prefs.profiles.clone();
+        profiles.ensure_builtins();
+        // Keep prefs in sync with ensured builtins.
+        let mut ui_prefs = ui_prefs;
+        ui_prefs.profiles = profiles;
+
         Self {
             gpu: None,
             devices,
@@ -472,6 +504,11 @@ impl Default for App {
             last_display_caps_at: Instant::now()
                 .checked_sub(Duration::from_secs(2))
                 .unwrap_or_else(Instant::now),
+            replay,
+            health,
+            export,
+            update: UpdateChecker::default(),
+            cube_lut,
         }
     }
 }
@@ -612,6 +649,11 @@ impl ApplicationHandler<UserEvent> for App {
         self.apply_color_convert();
         self.apply_present_mode_for_profile();
         self.sync_present_overlay();
+        self.apply_grade_to_gpu();
+        self.apply_window_level();
+        if self.ui_prefs.update_check {
+            self.update.request_check(false);
+        }
 
         if let Err(e) = self.open_and_start(self.selection.device_idx, self.current_format.clone()) {
             tracing::error!(error = %e, "failed to start capture; falling back to mock");
@@ -1744,6 +1786,104 @@ impl App {
             self.apply_color_convert();
             self.persist_ui_prefs();
         }
+
+        if let Some(id) = actions.apply_profile {
+            self.apply_named_profile(&id);
+        }
+        if let Some(id) = actions.save_profile {
+            self.save_into_named_profile(&id);
+        }
+        if actions.toggle_hud {
+            self.ui_prefs.hud_enabled = !self.ui_prefs.hud_enabled;
+            self.persist_ui_prefs();
+        }
+        if let Some(on) = actions.hud_enabled_changed {
+            self.ui_prefs.hud_enabled = on;
+            self.persist_ui_prefs();
+        }
+        if let Some(on) = actions.hud_always_on_top_changed {
+            self.ui_prefs.hud_always_on_top = on;
+            self.apply_window_level();
+            self.persist_ui_prefs();
+        }
+        if let Some(on) = actions.replay_enabled_changed {
+            self.ui_prefs.replay_enabled = on;
+            self.replay.set_enabled(on);
+            self.persist_ui_prefs();
+        }
+        if let Some(secs) = actions.replay_seconds_changed {
+            self.ui_prefs.replay_seconds = secs.clamp(3, 30);
+            self.replay.set_seconds(self.ui_prefs.replay_seconds);
+            self.persist_ui_prefs();
+        }
+        if actions.save_replay_clip {
+            self.save_replay_clip();
+        }
+        if let Some((w, h, num, den)) = actions.resolution_preset {
+            self.apply_resolution_preset(w, h, Rational::new(num, den));
+        }
+        if let Some(g) = actions.grade_changed {
+            self.ui_prefs.grade = g.clamp();
+            self.apply_grade_to_gpu();
+            self.ui_prefs.profiles.active = "custom".into();
+            self.persist_ui_prefs();
+        }
+        if actions.grade_reset {
+            self.ui_prefs.grade = GradePrefs::default();
+            self.apply_grade_to_gpu();
+            self.persist_ui_prefs();
+        }
+        if let Some(path) = actions.cube_path_changed {
+            self.load_cube_lut(path);
+        }
+        if actions.cube_clear {
+            self.cube_lut = None;
+            self.ui_prefs.cube_lut_path.clear();
+            self.ui_prefs.grade.lut_mix = 0.0;
+            self.apply_grade_to_gpu();
+            self.persist_ui_prefs();
+        }
+        if let Some(on) = actions.spout_enabled_changed {
+            self.export.prefs.spout_enabled = on;
+            self.ui_prefs.export.spout_enabled = on;
+            self.export.sync_active_flags();
+            self.persist_ui_prefs();
+        }
+        if let Some(on) = actions.ndi_enabled_changed {
+            self.export.prefs.ndi_enabled = on;
+            self.ui_prefs.export.ndi_enabled = on;
+            self.export.sync_active_flags();
+            self.persist_ui_prefs();
+        }
+        if let Some(name) = actions.spout_name_changed {
+            self.export.prefs.spout_name = name.clone();
+            self.ui_prefs.export.spout_name = name;
+            self.persist_ui_prefs();
+        }
+        if let Some(name) = actions.ndi_name_changed {
+            self.export.prefs.ndi_name = name.clone();
+            self.ui_prefs.export.ndi_name = name;
+            self.persist_ui_prefs();
+        }
+        if actions.export_refresh {
+            self.export.refresh_probe();
+        }
+        if let Some(on) = actions.health_auto_reinit_changed {
+            self.health.prefs.auto_reinit = on;
+            self.ui_prefs.health.auto_reinit = on;
+            self.persist_ui_prefs();
+        }
+        if let Some(secs) = actions.health_stall_secs_changed {
+            self.health.prefs.stall_secs = secs.clamp(2, 15);
+            self.ui_prefs.health.stall_secs = self.health.prefs.stall_secs;
+            self.persist_ui_prefs();
+        }
+        if actions.update_check {
+            self.update.request_check(true);
+        }
+        if actions.update_open {
+            self.update.open_latest();
+        }
     }
 
     fn persist_ui_prefs(&mut self) {
@@ -1757,9 +1897,196 @@ impl App {
         self.ui_prefs.deinterlace_mode = self.effects_ui.deinterlace_mode.clone();
         self.ui_prefs.vsync_mode = normalize_vsync_mode(&self.effects_ui.vsync_mode);
         self.ui_prefs.hdr_output = self.effects_ui.hdr_output;
+        self.ui_prefs.export = self.export.prefs.clone();
+        self.ui_prefs.health = self.health.prefs.clone();
         // Debounce disk writes — sync save on every slider tick froze the picture.
         self.prefs_dirty = true;
         self.prefs_dirty_at = Instant::now();
+    }
+
+    fn apply_grade_to_gpu(&mut self) {
+        let grade = self.ui_prefs.grade.as_gpu();
+        if let Some(gpu) = self.gpu.as_mut() {
+            gpu.pipeline.set_grade(grade);
+            gpu.upscale.set_grade(grade);
+            gpu.interpolate.set_grade(grade);
+        }
+    }
+
+    fn apply_window_level(&mut self) {
+        let Some(gpu) = self.gpu.as_ref() else {
+            return;
+        };
+        let level = if self.ui_prefs.hud_always_on_top {
+            WindowLevel::AlwaysOnTop
+        } else {
+            WindowLevel::Normal
+        };
+        gpu.window.set_window_level(level);
+    }
+
+    fn apply_named_profile(&mut self, id: &str) {
+        self.ui_prefs.profiles.ensure_builtins();
+        let Some(profile) = self.ui_prefs.profiles.get(id).cloned() else {
+            return;
+        };
+        self.effects_ui.mode = profile.upscale_mode.clone();
+        self.effects_ui.sharpness = profile.sharpness;
+        self.effects_ui.interp_mode = profile.interp_mode.clone();
+        self.effects_ui.interp_motion_blur = profile.interp_motion_blur;
+        self.effects_ui.dlssg_multiplier = profile.dlssg_multiplier.clone();
+        self.effects_ui.vsync_mode = profile.vsync_mode.clone();
+        self.effects_ui.hdr_output = profile.hdr_output;
+        self.ui_prefs.upscale_mode = profile.upscale_mode.clone();
+        self.ui_prefs.sharpness = profile.sharpness;
+        self.ui_prefs.interp_mode = profile.interp_mode.clone();
+        self.ui_prefs.interp_motion_blur = profile.interp_motion_blur;
+        self.ui_prefs.dlssg_multiplier = profile.dlssg_multiplier.clone();
+        self.ui_prefs.display_fps_limit = profile.display_fps_limit;
+        self.ui_prefs.vsync_mode = profile.vsync_mode.clone();
+        self.ui_prefs.hdr_output = profile.hdr_output;
+        self.ui_prefs.monitor = profile.monitor.clone();
+        self.ui_prefs.profiles.active = profile.id.clone();
+        if let Some(gpu) = self.gpu.as_mut() {
+            gpu.upscale
+                .set_mode(UpscaleMode::from_str_lossy(&profile.upscale_mode));
+            gpu.upscale.set_sharpness(profile.sharpness);
+            gpu.interpolate
+                .set_mode(InterpMode::from_str_lossy(&profile.interp_mode));
+            gpu.interpolate
+                .set_motion_blur(profile.interp_motion_blur);
+            gpu.upscale
+                .dlss
+                .set_fg_multiplier(DlssGMultiplier::from_str_lossy(&profile.dlssg_multiplier));
+        }
+        self.apply_present_mode_for_profile();
+        self.refresh_os_display_caps(true);
+        self.apply_hdr_output();
+        self.persist_ui_prefs();
+        self.show_toast(self.i18n.t("msg_profile_applied"));
+    }
+
+    fn save_into_named_profile(&mut self, id: &str) {
+        self.ui_prefs.profiles.ensure_builtins();
+        let snap = NamedProfile {
+            id: id.to_string(),
+            label_key: self
+                .ui_prefs
+                .profiles
+                .get(id)
+                .map(|p| p.label_key.clone())
+                .unwrap_or_else(|| id.to_string()),
+            upscale_mode: self.effects_ui.mode.clone(),
+            sharpness: self.effects_ui.sharpness,
+            interp_mode: self.effects_ui.interp_mode.clone(),
+            interp_motion_blur: self.effects_ui.interp_motion_blur,
+            dlssg_multiplier: self.effects_ui.dlssg_multiplier.clone(),
+            display_fps_limit: self.ui_prefs.display_fps_limit,
+            vsync_mode: normalize_vsync_mode(&self.effects_ui.vsync_mode),
+            hdr_output: self.effects_ui.hdr_output,
+            monitor: self.ui_prefs.monitor.clone(),
+        };
+        if let Some(slot) = self.ui_prefs.profiles.get_mut(id) {
+            *slot = snap;
+        } else {
+            self.ui_prefs.profiles.profiles.push(snap);
+        }
+        self.ui_prefs.profiles.active = id.to_string();
+        self.persist_ui_prefs();
+        self.show_toast(self.i18n.t("msg_profile_saved"));
+    }
+
+    fn apply_resolution_preset(&mut self, w: u32, h: u32, rate: Rational) {
+        let caps = &self.devices[self.selection.device_idx].formats;
+        let fmt = modes::pick_format_at(caps, w, h, rate).or_else(|| {
+            modes::rates_for_resolution(caps, w, h)
+                .first()
+                .and_then(|r| modes::pick_format_at(caps, w, h, *r))
+        });
+        if let Some(fmt) = fmt {
+            let msg = self.i18n.t("err_resolution");
+            if self.restart_with_fallback(fmt, &msg) {
+                self.request_window_for_capture();
+                self.show_toast(self.i18n.t("msg_hotswap_ok"));
+            }
+        }
+        self.selection.width = self.current_format.width;
+        self.selection.height = self.current_format.height;
+        self.selection.rate = self
+            .current_format
+            .frame_rates
+            .first()
+            .copied()
+            .unwrap_or(self.selection.rate);
+    }
+
+    fn load_cube_lut(&mut self, path: String) {
+        let path = path.trim().to_string();
+        if path.is_empty() {
+            self.cube_lut = None;
+            self.ui_prefs.cube_lut_path.clear();
+            self.ui_prefs.grade.lut_mix = 0.0;
+            self.apply_grade_to_gpu();
+            self.persist_ui_prefs();
+            return;
+        }
+        match CubeLut1d::load_path(std::path::Path::new(&path)) {
+            Ok(lut) => {
+                self.cube_lut = Some(lut);
+                self.ui_prefs.cube_lut_path = path;
+                if self.ui_prefs.grade.lut_mix < 0.01 {
+                    self.ui_prefs.grade.lut_mix = 1.0;
+                }
+                self.apply_grade_to_gpu();
+                self.persist_ui_prefs();
+                self.show_toast(self.i18n.t("msg_cube_loaded"));
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "cube lut load failed");
+                self.show_toast(self.i18n.t("msg_cube_err"));
+            }
+        }
+    }
+
+    fn save_replay_clip(&mut self) {
+        match self.replay.save_clip() {
+            Ok(dir) => {
+                self.show_toast(format!(
+                    "{} {}",
+                    self.i18n.t("msg_replay_saved"),
+                    dir.display()
+                ));
+            }
+            Err(e) if e.contains("empty") => {
+                self.show_toast(self.i18n.t("msg_replay_empty"));
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "replay save failed");
+                self.show_toast(self.i18n.t("msg_replay_err"));
+            }
+        }
+    }
+
+    fn sync_feature_overlay(&mut self) {
+        self.update.poll();
+        self.overlay.hud_enabled = self.ui_prefs.hud_enabled;
+        self.overlay.hud_always_on_top = self.ui_prefs.hud_always_on_top;
+        self.overlay.replay_enabled = self.ui_prefs.replay_enabled;
+        self.overlay.replay_seconds = self.ui_prefs.replay_seconds;
+        self.overlay.replay_frames = self.replay.frame_count() as u32;
+        self.overlay.grade = self.ui_prefs.grade;
+        self.overlay.cube_lut_path = self.ui_prefs.cube_lut_path.clone();
+        self.overlay.health = self.health.ui.clone();
+        self.overlay.health_auto_reinit = self.health.prefs.auto_reinit;
+        self.overlay.health_stall_secs = self.health.prefs.stall_secs;
+        self.overlay.export = self.export.status.clone();
+        self.overlay.spout_enabled = self.export.prefs.spout_enabled;
+        self.overlay.ndi_enabled = self.export.prefs.ndi_enabled;
+        self.overlay.spout_name = self.export.prefs.spout_name.clone();
+        self.overlay.ndi_name = self.export.prefs.ndi_name.clone();
+        self.overlay.update = self.update.status.clone();
+        self.overlay.current_version = env!("CARGO_PKG_VERSION").into();
+        self.overlay.profiles = self.ui_prefs.profiles.clone();
     }
 
     fn flush_prefs_if_due(&mut self) {
@@ -2041,6 +2368,10 @@ impl App {
 
         if let Some(ref frame) = latest {
             self.last_frame_at = Instant::now();
+            self.health.note_frame();
+            self.replay.push_frame(frame);
+            self.export
+                .on_frame(frame.width, frame.height);
             if approx_black(frame) {
                 self.black_since.get_or_insert_with(Instant::now);
             } else {
@@ -2057,6 +2388,25 @@ impl App {
             stream_health,
             StreamHealth::DeviceBusy | StreamHealth::StreamError
         );
+        let drops_now = self
+            .source
+            .as_ref()
+            .map(|s| s.receiver().dropped_count())
+            .unwrap_or(self.last_channel_drops);
+        if self.health.tick(
+            stream_health,
+            drops_now,
+            self.capture_restarting,
+            device_busy,
+        ) {
+            let fmt = self.current_format.clone();
+            let idx = self.selection.device_idx;
+            if let Err(e) = self.open_and_start(idx, fmt) {
+                self.apply_capture_err(&e);
+            } else {
+                self.show_toast(self.i18n.t("msg_health_reinit"));
+            }
+        }
         // True HDMI black / no input — never during an intentional capture restart.
         let no_signal = !device_busy
             && !self.capture_restarting
@@ -2106,6 +2456,7 @@ impl App {
 
         // Keep monitor toggles live even if prefs were edited elsewhere.
         self.overlay.monitor = self.ui_prefs.monitor.clone();
+        self.sync_feature_overlay();
 
         // Refresh process / system samples ~2 Hz (UI thread only).
         if self.process_sample_at.elapsed() >= Duration::from_millis(500) {

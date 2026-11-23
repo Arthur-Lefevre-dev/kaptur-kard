@@ -17,6 +17,8 @@ Desktop preview app for generic UVC / capture-card sources. Product / window nam
 | Frame interp / FSR1 / NIS / audio / metrics | **Done** (steps c–g) |
 | VRR (G-Sync / FreeSync) + HDR output | **Done** — Immediate/Mailbox present, scRGB when Windows HDR on — [docs/VRR-HDR.md](./docs/VRR-HDR.md) |
 | DLSS 5 NR Mode C + DLSS-G probe | **Wired / FG pending present hook** — BYO DLLs, RTX path kept for future users; AMD refuses cleanly — [docs/DLSS.md](./docs/DLSS.md) |
+| Profiles / HUD / replay / LUT / health / updates | **Done (v0.3)** — Stream·Edit·Low-latency, F3 HUD, F9 replay, calibration, capture health, GitHub update check |
+| Spout / NDI export | **Probe + prefs** — BYO runtimes — [docs/EXPORT.md](./docs/EXPORT.md) |
 
 ## Platform matrix
 
@@ -74,9 +76,19 @@ cargo build -p capture --target aarch64-apple-darwin
 # Capture remains scaffolding until AVFoundation is implemented.
 ```
 
+## Shortcuts (QOL)
+
+| Key | Action |
+|-----|--------|
+| F1 | Settings |
+| F2 | Metrics overlay |
+| F3 | Compact HUD (FPS / 1% low / latency) |
+| F9 | Save replay clip |
+| F11 | Full screen |
+
 ## Effects pipeline
 
-upload → color convert → **deinterlace (Bob)** → **interpolate** → **upscale (FSR1 / NIS / DLSS)** → present
+upload → color convert → **deinterlace (Bob)** → **interpolate** → **upscale (FSR1 / NIS / DLSS)** → present (+ light calibration)
 
 - **Deinterlace**: Auto (default) enables Bob when the active format is flagged interlaced; user can force Off or Bob.
 - **Interpolation**: Off / x2 / Auto (~one source frame of added delay when on).

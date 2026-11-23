@@ -14,6 +14,8 @@ const COPY_ALIGN: u32 = 256;
 struct ParamsGpu {
     scale_offset: [f32; 4],
     format_pad: [u32; 4],
+    /// brightness, contrast, gamma, pad
+    grade: [f32; 4],
 }
 
 fn align_up(v: u32, align: u32) -> u32 {
@@ -36,6 +38,8 @@ pub struct VideoPipeline {
     pub mode: GpuPixelMode,
     /// YUV → RGB range/matrix flags (ignored for BGRA).
     pub color: ColorConvertParams,
+    /// Present-time grade (identity during offscreen convert).
+    pub grade: [f32; 4],
 }
 
 impl VideoPipeline {
@@ -114,6 +118,7 @@ impl VideoPipeline {
                 scale_offset: [1.0, 1.0, 0.0, 0.0],
                 // Default: limited + BT.709 (HD capture-card friendly).
                 format_pad: [0, 1, 1, 0],
+                grade: [0.0, 1.0, 1.0, 0.0],
             }),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -152,11 +157,16 @@ impl VideoPipeline {
                 limited: true,
                 bt709: true,
             },
+            grade: [0.0, 1.0, 1.0, 0.0],
         }
     }
 
     pub fn set_color_convert(&mut self, color: ColorConvertParams) {
         self.color = color;
+    }
+
+    pub fn set_grade(&mut self, grade: [f32; 4]) {
+        self.grade = grade;
     }
 
     fn format_pad(&self, nearest: bool) -> [u32; 4] {
@@ -305,6 +315,7 @@ impl VideoPipeline {
             bytemuck::bytes_of(&ParamsGpu {
                 scale_offset: fit.scale_offset,
                 format_pad: self.format_pad(nearest),
+                grade: self.grade,
             }),
         );
     }
@@ -330,6 +341,8 @@ impl VideoPipeline {
                 scale_offset: [1.0, 1.0, 0.0, 0.0],
                 // Convert is always 1:1 into rgba_src — sample filter unused for identity UV.
                 format_pad: self.format_pad(false),
+                // Identity grade so convert does not bake calibration twice.
+                grade: [0.0, 1.0, 1.0, 0.0],
             }),
         );
     }

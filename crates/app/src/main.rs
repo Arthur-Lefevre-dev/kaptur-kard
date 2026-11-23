@@ -11,11 +11,17 @@
 mod brand;
 mod discord_presence;
 mod display_caps;
+mod export;
+mod health;
 mod i18n;
 mod logging;
+mod lut;
 mod prefs;
+mod profiles;
+mod replay;
 mod runtime;
 mod ui;
+mod update_check;
 
 use anyhow::Context;
 use winit::event_loop::{ControlFlow, EventLoop};

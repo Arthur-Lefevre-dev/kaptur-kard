@@ -6,8 +6,13 @@ use capture::{
 };
 use egui::{Color32, Context, Key, Modifiers, RichText, Sense};
 
+use crate::export::ExportStatus;
+use crate::health::{CaptureHealthKind, CaptureHealthUi};
 use crate::i18n::I18n;
+use crate::lut::GradePrefs;
 use crate::prefs::MonitorPrefs;
+use crate::profiles::ProfilesPrefs;
+use crate::update_check::UpdateStatus;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SettingsTab {
@@ -140,6 +145,25 @@ pub struct OverlayState {
     pub lag_test_running: bool,
     pub lag_test_ms: f32,
     pub lag_flash: bool,
+    /// Compact HUD visible (F3), independent of F2 metrics mode.
+    pub hud_enabled: bool,
+    pub hud_always_on_top: bool,
+    pub replay_enabled: bool,
+    pub replay_seconds: u32,
+    pub replay_frames: u32,
+    pub grade: GradePrefs,
+    pub cube_lut_path: String,
+    pub health: CaptureHealthUi,
+    pub health_auto_reinit: bool,
+    pub health_stall_secs: u32,
+    pub export: ExportStatus,
+    pub spout_enabled: bool,
+    pub ndi_enabled: bool,
+    pub spout_name: String,
+    pub ndi_name: String,
+    pub update: UpdateStatus,
+    pub current_version: String,
+    pub profiles: ProfilesPrefs,
 }
 
 impl Default for OverlayState {
@@ -198,6 +222,24 @@ impl Default for OverlayState {
             lag_test_running: false,
             lag_test_ms: 0.0,
             lag_flash: false,
+            hud_enabled: false,
+            hud_always_on_top: false,
+            replay_enabled: false,
+            replay_seconds: 8,
+            replay_frames: 0,
+            grade: GradePrefs::default(),
+            cube_lut_path: String::new(),
+            health: CaptureHealthUi::default(),
+            health_auto_reinit: false,
+            health_stall_secs: 3,
+            export: ExportStatus::default(),
+            spout_enabled: false,
+            ndi_enabled: false,
+            spout_name: "KapturKard".into(),
+            ndi_name: "KapturKard".into(),
+            update: UpdateStatus::default(),
+            current_version: env!("CARGO_PKG_VERSION").into(),
+            profiles: ProfilesPrefs::default(),
         }
     }
 }
@@ -316,6 +358,28 @@ pub struct UiActions {
     pub dismiss_launch_tips: bool,
     /// Full replacement of monitor graph / HUD toggles (apply immediately).
     pub monitor_prefs_changed: Option<MonitorPrefs>,
+    pub apply_profile: Option<String>,
+    pub save_profile: Option<String>,
+    pub toggle_hud: bool,
+    pub hud_enabled_changed: Option<bool>,
+    pub hud_always_on_top_changed: Option<bool>,
+    pub replay_enabled_changed: Option<bool>,
+    pub replay_seconds_changed: Option<u32>,
+    pub save_replay_clip: bool,
+    pub resolution_preset: Option<(u32, u32, u32, u32)>,
+    pub grade_changed: Option<GradePrefs>,
+    pub grade_reset: bool,
+    pub cube_path_changed: Option<String>,
+    pub cube_clear: bool,
+    pub spout_enabled_changed: Option<bool>,
+    pub ndi_enabled_changed: Option<bool>,
+    pub spout_name_changed: Option<String>,
+    pub ndi_name_changed: Option<String>,
+    pub export_refresh: bool,
+    pub health_auto_reinit_changed: Option<bool>,
+    pub health_stall_secs_changed: Option<u32>,
+    pub update_check: bool,
+    pub update_open: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -443,6 +507,12 @@ pub fn draw_ui(ctx: &Context, input: DrawInput<'_>) -> UiActions {
         if i.key_pressed(Key::F2) {
             actions.cycle_metrics = true;
         }
+        if i.key_pressed(Key::F3) {
+            actions.toggle_hud = true;
+        }
+        if i.key_pressed(Key::F9) {
+            actions.save_replay_clip = true;
+        }
         if i.key_pressed(Key::F11) {
             actions.toggle_fullscreen = true;
         }
@@ -478,6 +548,9 @@ pub fn draw_ui(ctx: &Context, input: DrawInput<'_>) -> UiActions {
 
     if input.overlay.metrics_mode != MetricsMode::Off {
         draw_metrics_overlay(ctx, i18n, input.overlay, input.chrome, &mut actions);
+    }
+    if input.overlay.hud_enabled {
+        draw_compact_hud(ctx, i18n, input.overlay);
     }
 
     if input.chrome.toolbar_visible {
@@ -731,6 +804,8 @@ fn draw_image_tab(ui: &mut egui::Ui, input: &DrawInput<'_>, actions: &mut UiActi
     let devices = input.devices;
     let selection = input.selection;
 
+    draw_profiles_block(ui, i18n, &input.overlay.profiles, actions);
+
     option_block(
         ui,
         i18n,
@@ -766,6 +841,7 @@ fn draw_image_tab(ui: &mut egui::Ui, input: &DrawInput<'_>, actions: &mut UiActi
         .get(selection.device_idx)
         .map(|d| d.formats.as_slice())
         .unwrap_or(&[]);
+    draw_resolution_presets(ui, i18n, caps, actions);
     let resolutions = capture::modes::unique_resolutions(caps);
 
     option_block(
@@ -1369,6 +1445,19 @@ fn draw_info_tab(ui: &mut egui::Ui, input: &DrawInput<'_>, actions: &mut UiActio
     draw_monitor_prefs(ui, i18n, &o.monitor, actions);
     ui.add_space(8.0);
     ui.separator();
+    draw_hud_prefs(ui, i18n, o, actions);
+    ui.add_space(6.0);
+    draw_replay_prefs(ui, i18n, o, actions);
+    ui.add_space(6.0);
+    draw_grade_prefs(ui, i18n, o, actions);
+    ui.add_space(6.0);
+    draw_export_prefs(ui, i18n, o, actions);
+    ui.add_space(6.0);
+    draw_health_prefs(ui, i18n, o, actions);
+    ui.add_space(6.0);
+    draw_update_prefs(ui, i18n, o, actions);
+    ui.add_space(8.0);
+    ui.separator();
     draw_metrics_body(ui, i18n, o, true);
     ui.add_space(8.0);
     ui.separator();
@@ -1619,6 +1708,289 @@ fn draw_monitor_prefs(
     }
 }
 
+fn draw_profiles_block(
+    ui: &mut egui::Ui,
+    i18n: &I18n,
+    profiles: &ProfilesPrefs,
+    actions: &mut UiActions,
+) {
+    ui.label(RichText::new(i18n.t("section_profiles")).strong());
+    ui.label(RichText::new(i18n.t("tip_profiles")).small().italics());
+    ui.horizontal_wrapped(|ui| {
+        for p in &profiles.profiles {
+            let selected = profiles.active == p.id;
+            let label = i18n.t(&p.label_key);
+            if ui.selectable_label(selected, label).clicked() {
+                actions.apply_profile = Some(p.id.clone());
+            }
+        }
+    });
+    if profiles.active != "custom" {
+        if ui
+            .button(i18n.t("btn_profile_save"))
+            .on_hover_text(i18n.t("tip_profiles"))
+            .clicked()
+        {
+            actions.save_profile = Some(profiles.active.clone());
+        }
+    }
+    ui.add_space(6.0);
+}
+
+fn draw_resolution_presets(
+    ui: &mut egui::Ui,
+    i18n: &I18n,
+    caps: &[FormatDesc],
+    actions: &mut UiActions,
+) {
+    ui.label(RichText::new(i18n.t("section_presets_res")).strong());
+    ui.label(RichText::new(i18n.t("tip_presets_res")).small().italics());
+    let presets = [
+        (1920, 1080, 60, 1, "preset_1080p60"),
+        (1920, 1080, 30, 1, "preset_1080p30"),
+        (1280, 720, 60, 1, "preset_720p60"),
+        (640, 480, 60, 1, "preset_480p60"),
+    ];
+    ui.horizontal_wrapped(|ui| {
+        for (w, h, num, den, key) in presets {
+            let rate = Rational::new(num, den);
+            let available = capture::modes::pick_format_at(caps, w, h, rate).is_some()
+                || caps.iter().any(|f| f.width == w && f.height == h);
+            ui.add_enabled_ui(available, |ui| {
+                if ui.button(i18n.t(key)).clicked() {
+                    actions.resolution_preset = Some((w, h, num, den));
+                }
+            });
+        }
+    });
+    ui.add_space(6.0);
+}
+
+fn draw_compact_hud(ctx: &Context, i18n: &I18n, overlay: &OverlayState) {
+    let frame = egui::Frame::NONE
+        .fill(Color32::from_rgba_unmultiplied(12, 14, 18, 190))
+        .corner_radius(egui::CornerRadius::same(6))
+        .inner_margin(egui::Margin::symmetric(10, 8))
+        .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(60, 70, 90)));
+    egui::Window::new("hud_compact")
+        .title_bar(false)
+        .resizable(false)
+        .collapsible(false)
+        .anchor(egui::Align2::LEFT_TOP, [12.0, 12.0])
+        .frame(frame)
+        .show(ctx, |ui| {
+            ui.label(
+                RichText::new(format!(
+                    "{} {:.0}  ·  {} {:.0}  ·  {} {:.1} ms",
+                    i18n.t("hud_fps"),
+                    overlay.fps,
+                    i18n.t("hud_one_pct"),
+                    overlay.one_percent_low_fps,
+                    i18n.t("hud_latency"),
+                    overlay.pipeline_delay_ms
+                ))
+                .monospace()
+                .size(13.0),
+            );
+            if overlay.health.kind != CaptureHealthKind::Ok {
+                ui.colored_label(
+                    Color32::from_rgb(255, 180, 100),
+                    health_label(i18n, overlay.health.kind),
+                );
+            }
+        });
+}
+
+fn health_label(i18n: &I18n, kind: CaptureHealthKind) -> String {
+    let key = match kind {
+        CaptureHealthKind::Ok => "health_ok",
+        CaptureHealthKind::WaitingForSignal => "health_waiting",
+        CaptureHealthKind::DeviceBusy => "health_busy",
+        CaptureHealthKind::StreamError => "health_error",
+        CaptureHealthKind::Stall => "health_stall",
+    };
+    format!("{}: {}", i18n.t("label_health_status"), i18n.t(key))
+}
+
+fn draw_hud_prefs(ui: &mut egui::Ui, i18n: &I18n, o: &OverlayState, actions: &mut UiActions) {
+    ui.label(RichText::new(i18n.t("section_hud")).strong());
+    ui.label(RichText::new(i18n.t("tip_hud")).small().italics());
+    let mut hud = o.hud_enabled;
+    if ui.checkbox(&mut hud, i18n.t("label_hud_enable")).changed() {
+        actions.hud_enabled_changed = Some(hud);
+    }
+    let mut top = o.hud_always_on_top;
+    if ui
+        .checkbox(&mut top, i18n.t("label_hud_always_on_top"))
+        .changed()
+    {
+        actions.hud_always_on_top_changed = Some(top);
+    }
+}
+
+fn draw_replay_prefs(ui: &mut egui::Ui, i18n: &I18n, o: &OverlayState, actions: &mut UiActions) {
+    ui.label(RichText::new(i18n.t("section_replay")).strong());
+    ui.label(RichText::new(i18n.t("tip_replay")).small().italics());
+    let mut on = o.replay_enabled;
+    if ui
+        .checkbox(&mut on, i18n.t("label_replay_enable"))
+        .changed()
+    {
+        actions.replay_enabled_changed = Some(on);
+    }
+    let mut secs = o.replay_seconds;
+    if ui
+        .add(egui::Slider::new(&mut secs, 3..=30).text(i18n.t("label_replay_seconds")))
+        .changed()
+    {
+        actions.replay_seconds_changed = Some(secs);
+    }
+    ui.small(format!("{}: {}", i18n.t("btn_replay_save"), o.replay_frames));
+    if ui.button(i18n.t("btn_replay_save")).clicked() {
+        actions.save_replay_clip = true;
+    }
+}
+
+fn draw_grade_prefs(ui: &mut egui::Ui, i18n: &I18n, o: &OverlayState, actions: &mut UiActions) {
+    ui.label(RichText::new(i18n.t("section_grade")).strong());
+    ui.label(RichText::new(i18n.t("tip_grade")).small().italics());
+    let mut g = o.grade;
+    let mut changed = false;
+    changed |= ui
+        .add(egui::Slider::new(&mut g.brightness, -0.5..=0.5).text(i18n.t("label_brightness")))
+        .changed();
+    changed |= ui
+        .add(egui::Slider::new(&mut g.contrast, 0.5..=2.0).text(i18n.t("label_contrast")))
+        .changed();
+    changed |= ui
+        .add(egui::Slider::new(&mut g.gamma, 0.4..=2.5).text(i18n.t("label_gamma")))
+        .changed();
+    if changed {
+        actions.grade_changed = Some(g.clamp());
+    }
+    ui.horizontal(|ui| {
+        if ui.button(i18n.t("btn_grade_reset")).clicked() {
+            actions.grade_reset = true;
+        }
+        if ui.button(i18n.t("btn_cube_clear")).clicked() {
+            actions.cube_clear = true;
+        }
+    });
+    let mut path = o.cube_lut_path.clone();
+    ui.horizontal(|ui| {
+        ui.label(i18n.t("label_cube_path"));
+        if ui
+            .add(egui::TextEdit::singleline(&mut path).desired_width(220.0))
+            .lost_focus()
+            && path != o.cube_lut_path
+        {
+            actions.cube_path_changed = Some(path);
+        }
+    });
+}
+
+fn draw_export_prefs(ui: &mut egui::Ui, i18n: &I18n, o: &OverlayState, actions: &mut UiActions) {
+    ui.label(RichText::new(i18n.t("section_export")).strong());
+    ui.label(RichText::new(i18n.t("tip_export")).small().italics());
+    let mut spout = o.spout_enabled;
+    if ui.checkbox(&mut spout, i18n.t("label_spout")).changed() {
+        actions.spout_enabled_changed = Some(spout);
+    }
+    ui.small(&o.export.spout_detail);
+    let mut spout_name = o.spout_name.clone();
+    if ui
+        .add(
+            egui::TextEdit::singleline(&mut spout_name)
+                .desired_width(160.0)
+                .hint_text(i18n.t("label_export_name")),
+        )
+        .changed()
+    {
+        actions.spout_name_changed = Some(spout_name);
+    }
+    let mut ndi = o.ndi_enabled;
+    if ui.checkbox(&mut ndi, i18n.t("label_ndi")).changed() {
+        actions.ndi_enabled_changed = Some(ndi);
+    }
+    ui.small(&o.export.ndi_detail);
+    let mut ndi_name = o.ndi_name.clone();
+    if ui
+        .add(
+            egui::TextEdit::singleline(&mut ndi_name)
+                .desired_width(160.0)
+                .hint_text(i18n.t("label_export_name")),
+        )
+        .changed()
+    {
+        actions.ndi_name_changed = Some(ndi_name);
+    }
+    if ui.button(i18n.t("btn_export_refresh")).clicked() {
+        actions.export_refresh = true;
+    }
+}
+
+fn draw_health_prefs(ui: &mut egui::Ui, i18n: &I18n, o: &OverlayState, actions: &mut UiActions) {
+    ui.label(RichText::new(i18n.t("section_health")).strong());
+    ui.label(RichText::new(i18n.t("tip_health")).small().italics());
+    ui.label(health_label(i18n, o.health.kind));
+    ui.small(format!(
+        "{}: {} · reinit ×{}",
+        i18n.t("label_dropped"),
+        o.health.dropped,
+        o.health.reinit_count
+    ));
+    let mut auto = o.health_auto_reinit;
+    if ui
+        .checkbox(&mut auto, i18n.t("label_health_auto"))
+        .changed()
+    {
+        actions.health_auto_reinit_changed = Some(auto);
+    }
+    let mut stall = o.health_stall_secs;
+    if ui
+        .add(egui::Slider::new(&mut stall, 2..=15).text(i18n.t("label_health_stall")))
+        .changed()
+    {
+        actions.health_stall_secs_changed = Some(stall);
+    }
+}
+
+fn draw_update_prefs(ui: &mut egui::Ui, i18n: &I18n, o: &OverlayState, actions: &mut UiActions) {
+    ui.label(RichText::new(i18n.t("section_update")).strong());
+    ui.label(RichText::new(i18n.t("tip_update")).small().italics());
+    ui.small(format!(
+        "{}: v{}",
+        i18n.t("label_current_version"),
+        o.current_version
+    ));
+    if o.update.checking {
+        ui.label(i18n.t("update_checking"));
+    } else if !o.update.error.is_empty() {
+        ui.colored_label(
+            Color32::from_rgb(220, 120, 90),
+            format!("{} {}", i18n.t("update_error"), o.update.error),
+        );
+    } else if o.update.newer {
+        ui.colored_label(
+            Color32::from_rgb(120, 200, 140),
+            format!("{}: {}", i18n.t("update_available"), o.update.latest_tag),
+        );
+        if !o.update.body.is_empty() {
+            ui.small(o.update.body.chars().take(240).collect::<String>());
+        }
+    } else if !o.update.latest_tag.is_empty() {
+        ui.label(i18n.t("update_up_to_date"));
+    }
+    ui.horizontal(|ui| {
+        if ui.button(i18n.t("btn_update_check")).clicked() {
+            actions.update_check = true;
+        }
+        if ui.button(i18n.t("btn_update_open")).clicked() {
+            actions.update_open = true;
+        }
+    });
+}
+
 fn draw_sparkline(ui: &mut egui::Ui, values: &[f32], max_hint: f32, color_fn: impl Fn(f32) -> Color32) {
     if values.is_empty() {
         ui.weak("—");
@@ -1782,6 +2154,8 @@ fn draw_metrics_body(ui: &mut egui::Ui, i18n: &I18n, o: &OverlayState, detailed:
     } else {
         ui.label(format!("{}: {}", i18n.t("label_dropped"), o.dropped_frames));
     }
+    ui.label(health_label(i18n, o.health.kind));
+
     if m.process_ram {
         ui.label(format!(
             "{}: {:.0}%  ·  {}: {:.0} Mo",
@@ -1924,6 +2298,8 @@ fn draw_launch_tips(
     let rows = [
         ("launch_tips_key_f1", "launch_tips_desc_f1"),
         ("launch_tips_key_f2", "launch_tips_desc_f2"),
+        ("launch_tips_key_f3", "launch_tips_desc_f3"),
+        ("launch_tips_key_f9", "launch_tips_desc_f9"),
         ("launch_tips_key_f11", "launch_tips_desc_f11"),
         ("launch_tips_key_esc", "launch_tips_desc_esc"),
         ("launch_tips_key_pin", "launch_tips_desc_pin"),
