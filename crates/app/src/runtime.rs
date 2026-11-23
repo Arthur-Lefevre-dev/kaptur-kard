@@ -541,14 +541,34 @@ impl ApplicationHandler<UserEvent> for App {
         let mut attrs = Window::default_attributes()
             .with_title(self.i18n.t("app_title"))
             .with_inner_size(LogicalSize::new(1280.0, 720.0));
+        // ICON_SMALL → title bar / Alt-Tab; without ICON_BIG the taskbar shows the
+        // generic Windows window glyph (winit class registers hIcon=0).
         if let Some(icon) = crate::brand::window_icon() {
             attrs = attrs.with_window_icon(Some(icon));
+        }
+        #[cfg(windows)]
+        {
+            use winit::platform::windows::WindowAttributesExtWindows;
+            if let Some(icon) = crate::brand::taskbar_icon() {
+                attrs = attrs.with_taskbar_icon(Some(icon));
+            }
         }
         let window = Arc::new(
             event_loop
                 .create_window(attrs)
                 .expect("create window"),
         );
+        // Belt-and-suspenders: re-apply after HWND exists (some shells cache class icons).
+        #[cfg(windows)]
+        {
+            use winit::platform::windows::WindowExtWindows;
+            if let Some(icon) = crate::brand::window_icon() {
+                window.set_window_icon(Some(icon));
+            }
+            if let Some(icon) = crate::brand::taskbar_icon() {
+                window.set_taskbar_icon(Some(icon));
+            }
+        }
 
         self.refresh_os_display_caps(true);
         let prefer_hdr = self.want_hdr_swapchain();
