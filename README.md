@@ -2,6 +2,55 @@
 
 Desktop preview app for generic UVC / capture-card sources. Product / window name **KapturKard**; workspace/binary crate **`captureview`**; repository folder **`kaptur-kard`**. Brand mark: `assets/kapturkard-logo.png` (Windows `.ico` embedded in the exe).
 
+## Screenshots / Captures d’écran
+
+Captured from a Windows release build (`captureview.exe`) with the mock color-bars source. UI shown in **French** (switch language under **Infos**).  
+Captures prises depuis un build release Windows avec la source mock. Interface en **français** (langue changeable dans **Infos**).
+
+### Preview / Aperçu
+
+Mock 1080p @ 60 Hz preview (frame counter from the synthetic source).  
+Aperçu mock 1080p @ 60 Hz (compteur de frames de la source synthétique).
+
+![KapturKard preview / aperçu](docs/images/preview.png)
+
+### Image settings / Réglages Image
+
+Source, resolution (**Qualité d’image**), refresh (**Fluidité**), plus impact hints (latency / GPU). Floating toolbar: Image · Son · Effets · Infos · Plein écran.  
+Source, résolution, fluidité, et indicateurs d’impact (retard / GPU). Barre flottante : Image · Son · Effets · Infos · Plein écran.
+
+![Image settings / Réglages Image](docs/images/settings-image.png)
+
+### Sound / Son
+
+HDMI capture audio in, speakers/headset out, mute, volume, and level meter.  
+Entrée audio HDMI, sortie casque/haut-parleurs, mute, volume et niveau.
+
+![Sound settings / Réglages Son](docs/images/settings-sound.png)
+
+### Effects — FSR / frame gen / Effets
+
+**Mode A — FSR 1**, sharpness (RCAS), optical-flow **interpolation x2**, motion blur, DLSS-G multipliers (RTX path; greyed on AMD), display FPS limit.  
+**Mode A — FSR 1**, netteté (RCAS), **interpolation x2**, flou de mouvement, multiplicateurs DLSS-G (chemin RTX ; grisé sur AMD), limite FPS écran.
+
+![Effects settings / Réglages Effets](docs/images/settings-effects.png)
+
+### Infos — monitoring, VRR / HDR, language
+
+Live FPS (capture / after interpolation / display), pipeline delay, VSync, **VRR** (G-Sync / FreeSync path), **HDR** status, 1% lows, CPU/RAM/GPU, frame-time graph, language (English / Français), Discord presence, logs, manual lag flash test.  
+FPS live (capture / après interpolation / écran), retard pipeline, VSync, **VRR**, statut **HDR**, 1 % bas, CPU/RAM/GPU, courbe temps par image, langue, Discord, journaux, test flash de retard.
+
+![Infos monitoring VRR HDR](docs/images/settings-info.png)
+
+### Metrics overlay (F2) / Mesures
+
+**Simple** and **Detailed** overlays — same VRR/HDR lines, plus detailed CPU/RAM/GPU and frame-time graph in detailed mode.  
+Overlays **simple** et **détail** — mêmes lignes VRR/HDR ; détail ajoute CPU/RAM/GPU et la courbe.
+
+| Simple | Detailed / Détail |
+|--------|-------------------|
+| ![Mesures simple](docs/images/metrics-simple.png) | ![Mesures détail](docs/images/metrics-detailed.png) |
+
 ## Status
 
 **Step (h)** — extended compatibility (last planned brief step).
