@@ -1848,6 +1848,15 @@ impl App {
             self.export.prefs.spout_enabled = on;
             self.ui_prefs.export.spout_enabled = on;
             self.export.sync_active_flags();
+            if on {
+                self.export.ensure_spout();
+            } else {
+                #[cfg(windows)]
+                {
+                    // Drop sender when disabled (ensure_spout no-ops when off).
+                    self.export.ensure_spout();
+                }
+            }
             self.persist_ui_prefs();
         }
         if let Some(on) = actions.ndi_enabled_changed {
@@ -1868,6 +1877,28 @@ impl App {
         }
         if actions.export_refresh {
             self.export.refresh_probe();
+        }
+        if actions.ndi_open_download {
+            crate::export::open_url(crate::export::NDI_DOWNLOAD_URL);
+        }
+        if actions.ndi_open_folder {
+            let folder = if !self.export.status.ndi_folder.is_empty() {
+                std::path::PathBuf::from(&self.export.status.ndi_folder)
+            } else {
+                crate::export::find_ndi_folder().unwrap_or_default()
+            };
+            if !folder.as_os_str().is_empty() {
+                crate::export::open_folder(&folder);
+            }
+        }
+        if actions.dlss_open_docs {
+            crate::export::open_url(crate::export::DLSS_DOCS_URL);
+        }
+        if actions.dlss_open_folder {
+            if let Some(dir) = crate::export::dlss_byo_dir() {
+                let _ = std::fs::create_dir_all(&dir);
+                crate::export::open_folder(&dir);
+            }
         }
         if let Some(on) = actions.health_auto_reinit_changed {
             self.health.prefs.auto_reinit = on;
@@ -2387,8 +2418,12 @@ impl App {
             self.last_frame_at = Instant::now();
             self.health.note_frame();
             self.replay.push_frame(frame);
-            self.export
-                .on_frame(frame.width, frame.height);
+            self.export.on_frame(
+                frame.width,
+                frame.height,
+                frame.pixel_format,
+                frame.data.as_slice(),
+            );
             if approx_black(frame) {
                 self.black_since.get_or_insert_with(Instant::now);
             } else {

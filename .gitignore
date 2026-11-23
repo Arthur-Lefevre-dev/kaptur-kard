@@ -6,6 +6,8 @@
 *.pdb
 *.exe
 *.dll
+!third_party/spout/*.dll
+!native/spout/bin/*.dll
 *.ilk
 *.obj
 .DS_Store

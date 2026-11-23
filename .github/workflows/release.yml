@@ -71,6 +71,21 @@ jobs:
             New-Item -ItemType Directory -Force -Path "$out/assets" | Out-Null
             Copy-Item "assets/kapturkard-logo.png" "$out/assets/"
           }
+          # Spout2 BSD runtime (never ship NDI DLLs)
+          if (Test-Path "native/spout/build_native.ps1") {
+            powershell -ExecutionPolicy Bypass -File native/spout/build_native.ps1
+          }
+          foreach ($dll in @("SpoutLibrary.dll", "spout_bridge.dll")) {
+            if (Test-Path "third_party/spout/$dll") {
+              Copy-Item "third_party/spout/$dll" "$out/$dll"
+            } elseif (Test-Path "native/spout/bin/$dll") {
+              Copy-Item "native/spout/bin/$dll" "$out/$dll"
+            }
+          }
+          if (Test-Path "third_party/spout/licence.txt") {
+            New-Item -ItemType Directory -Force -Path "$out/licenses" | Out-Null
+            Copy-Item "third_party/spout/licence.txt" "$out/licenses/SPOUT-BSD.txt"
+          }
           @"
           CaptureView / KapturKard ${{ github.ref_name }}
           Windows x64 release build.
@@ -78,6 +93,7 @@ jobs:
           Run: captureview.exe
           Mock source works without a capture card.
           Logs: %APPDATA%\CaptureView\logs\
+          Spout: SpoutLibrary.dll bundled. NDI is BYO (https://ndi.video/).
           "@ | Set-Content -Encoding utf8 "$out/RELEASE.txt"
           Compress-Archive -Path "$out/*" -DestinationPath "dist/${{ matrix.artifact }}.zip" -Force
 

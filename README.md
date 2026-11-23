@@ -60,7 +60,7 @@ HDMI capture audio in, speakers/headset out, mute, volume, and level meter.
 | VRR (G-Sync / FreeSync) + HDR output | **Done** — Immediate/Mailbox present, scRGB when Windows HDR on — [docs/VRR-HDR.md](./docs/VRR-HDR.md) |
 | DLSS 5 NR Mode C + DLSS-G probe | **Wired / FG pending present hook** — BYO DLLs, RTX path kept for future users; AMD refuses cleanly — [docs/DLSS.md](./docs/DLSS.md) |
 | Profiles / HUD / replay / LUT / health / updates | **Done (v0.3)** — Stream·Edit·Low-latency, F3 HUD, F9 replay, calibration, capture health, GitHub update check |
-| Spout / NDI export | **Probe + prefs** — BYO runtimes — [docs/EXPORT.md](./docs/EXPORT.md) |
+| Spout / NDI export | **Spout bundled** (CPU SendImage) + NDI setup button (BYO) — [docs/EXPORT.md](./docs/EXPORT.md) |
 
 ## Platform matrix
 
