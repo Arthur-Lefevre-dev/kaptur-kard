@@ -1,6 +1,10 @@
 fn main() {
+    // Resolve from this crate so windres/rc (cwd = OUT_DIR) still finds the .ico.
+    let manifest_dir = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+    let icon = manifest_dir.join("../../assets/kapturkard-logo.ico");
+    let icon = std::fs::canonicalize(&icon).unwrap_or(icon);
+
     // Re-run when the Windows icon changes.
-    let icon = std::path::Path::new("../../assets/kapturkard-logo.ico");
     println!("cargo:rerun-if-changed={}", icon.display());
     println!("cargo:rerun-if-changed=../../.git/HEAD");
     println!("cargo:rerun-if-env-changed=CAPTUREVIEW_GIT_HASH");
@@ -30,14 +34,16 @@ fn main() {
     {
         if icon.exists() {
             let mut res = winres::WindowsResource::new();
+            // Absolute path: relative paths in the generated .rc break when RC runs from OUT_DIR.
             res.set_icon(icon.to_str().expect("icon path utf-8"));
             res.set("ProductName", "KapturKard");
             res.set("FileDescription", "KapturKard");
             if let Err(e) = res.compile() {
-                println!("cargo:warning=winres icon embed failed: {e}");
+                // Fail the build so a missing RC toolchain cannot ship an iconless exe.
+                panic!("winres icon embed failed: {e}");
             }
         } else {
-            println!("cargo:warning=missing {}", icon.display());
+            panic!("missing Windows icon at {}", icon.display());
         }
     }
 }
