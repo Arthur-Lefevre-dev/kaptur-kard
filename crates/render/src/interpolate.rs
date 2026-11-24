@@ -7,7 +7,7 @@ use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
 use crate::pipeline::VideoPipeline;
-use crate::present::{compute_present_fit, PresentFilter, PresentFit};
+use crate::present::{compute_present_fit_ex, PresentFilter, PresentFit};
 
 const OVER_BUDGET_LIMIT: u32 = 45;
 /// Display present dt is not GPU cost — only trip on real stalls (Arthur: CPU spin).
@@ -714,12 +714,13 @@ impl InterpolateEngine {
         view_w: u32,
         view_h: u32,
         clear: wgpu::Color,
+        fill_viewport: bool,
     ) {
         let PresentFit {
             scale_offset,
             filter,
             ..
-        } = compute_present_fit(content.0, content.1, view_w, view_h);
+        } = compute_present_fit_ex(content.0, content.1, view_w, view_h, fill_viewport);
         let nearest = matches!(filter, PresentFilter::Nearest) as u32;
         queue.write_buffer(
             &self.present_buf,

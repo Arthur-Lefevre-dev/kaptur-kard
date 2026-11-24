@@ -165,6 +165,12 @@ pub struct MonitorPrefs {
     /// Frame-time / present-load sparkline (GPU present cost).
     #[serde(default = "default_true")]
     pub graph_gpu: bool,
+    /// Dedicated VRAM usage sparkline (MiB).
+    #[serde(default)]
+    pub graph_vram: bool,
+    /// Display FPS + 1% low sparkline.
+    #[serde(default)]
+    pub graph_fps_1pct: bool,
     /// Per-core bars + process affinity highlight.
     #[serde(default)]
     pub cpu_cores: bool,
@@ -194,6 +200,8 @@ impl Default for MonitorPrefs {
             graph_cpu: true,
             graph_ram: true,
             graph_gpu: true,
+            graph_vram: false,
+            graph_fps_1pct: false,
             cpu_cores: false,
             vram: false,
             process_ram: true,

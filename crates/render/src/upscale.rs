@@ -14,7 +14,7 @@ use crate::dlss::{
     FgPresentFrame,
 };
 use crate::pipeline::VideoPipeline;
-use crate::present::{compute_present_fit, PresentFilter, PresentFit};
+use crate::present::{compute_present_fit_ex, PresentFilter, PresentFit};
 
 /// Frames over budget before auto-disable.
 const OVER_BUDGET_LIMIT: u32 = 45;
@@ -579,6 +579,9 @@ impl UpscaleEngine {
     }
 
     /// Color-convert → upscale → present into `surface_view`. Returns true if handled.
+    ///
+    /// `fill_viewport` (F11) forces contain-fit targets so NIS/FSR enlarge into the
+    /// monitor instead of leaving 1:1 black gutters.
     pub fn encode(
         &mut self,
         device: &wgpu::Device,
@@ -589,6 +592,7 @@ impl UpscaleEngine {
         view_w: u32,
         view_h: u32,
         clear: wgpu::Color,
+        fill_viewport: bool,
     ) -> bool {
         let (cw, ch) = video.content_size;
         if cw == 0 || ch == 0 || !self.should_run((cw, ch), (view_w, view_h)) {
@@ -599,7 +603,7 @@ impl UpscaleEngine {
             (cw, ch)
         } else {
             // Snap near-1:1 / integer so FSR RCAS stays sharpen_only (no soft EASU).
-            target_size(cw, ch, view_w, view_h)
+            target_size_ex(cw, ch, view_w, view_h, fill_viewport)
         };
         let Some(src_bg) = video.bind_group_ref() else {
             return false;
@@ -654,7 +658,18 @@ impl UpscaleEngine {
             UpscaleMode::Off => return false,
         }
 
-        self.present_dst(device, queue, encoder, out_w, out_h, surface_view, view_w, view_h, clear);
+        self.present_dst(
+            device,
+            queue,
+            encoder,
+            out_w,
+            out_h,
+            surface_view,
+            view_w,
+            view_h,
+            clear,
+            fill_viewport,
+        );
         true
     }
 
@@ -674,6 +689,7 @@ impl UpscaleEngine {
         view_w: u32,
         view_h: u32,
         clear: wgpu::Color,
+        fill_viewport: bool,
     ) -> bool {
         if src_w == 0 || src_h == 0 || !self.should_run((src_w, src_h), (view_w, view_h)) {
             return false;
@@ -681,7 +697,7 @@ impl UpscaleEngine {
         let (out_w, out_h) = if self.mode == UpscaleMode::Dlss {
             (src_w, src_h)
         } else {
-            target_size(src_w, src_h, view_w, view_h)
+            target_size_ex(src_w, src_h, view_w, view_h, fill_viewport)
         };
         self.ensure_slots(device, src_w, src_h, out_w, out_h);
 
@@ -711,7 +727,18 @@ impl UpscaleEngine {
             }
             UpscaleMode::Off => return false,
         }
-        self.present_dst(device, queue, encoder, out_w, out_h, surface_view, view_w, view_h, clear);
+        self.present_dst(
+            device,
+            queue,
+            encoder,
+            out_w,
+            out_h,
+            surface_view,
+            view_w,
+            view_h,
+            clear,
+            fill_viewport,
+        );
         true
     }
 
@@ -726,6 +753,7 @@ impl UpscaleEngine {
         view_w: u32,
         view_h: u32,
         clear: wgpu::Color,
+        fill_viewport: bool,
     ) -> bool {
         let (w, h) = (frame.width, frame.height);
         if w == 0 || h == 0 || frame.rgba.len() < (w as usize) * (h as usize) * 4 {
@@ -736,7 +764,18 @@ impl UpscaleEngine {
             return false;
         };
         write_rgba8_texture(queue, &dst.texture, w, h, &frame.rgba);
-        self.present_dst(device, queue, encoder, w, h, surface_view, view_w, view_h, clear);
+        self.present_dst(
+            device,
+            queue,
+            encoder,
+            w,
+            h,
+            surface_view,
+            view_w,
+            view_h,
+            clear,
+            fill_viewport,
+        );
         true
     }
 
@@ -864,16 +903,18 @@ impl UpscaleEngine {
         view_w: u32,
         view_h: u32,
         clear: wgpu::Color,
+        fill_viewport: bool,
     ) {
         if self.rgba_dst.is_none() {
             return;
         }
         // Fit the upscale output into the window: 1:1 / integer → nearest, else linear.
+        // F11 uses fill_viewport so mid/dst that already match the monitor stay full-bleed.
         let PresentFit {
             scale_offset,
             filter,
             ..
-        } = compute_present_fit(out_w, out_h, view_w, view_h);
+        } = compute_present_fit_ex(out_w, out_h, view_w, view_h, fill_viewport);
         let nearest = matches!(filter, PresentFilter::Nearest) as u32;
         queue.write_buffer(
             &self.present_buf,
@@ -1215,8 +1256,9 @@ impl UpscaleEngine {
             tracing::warn!("NIS Mode B selected but pipeline missing");
             return;
         }
-        // Curve sharpness so 0.7–1 is clearly stronger than Off on soft captures.
-        let sharp = (self.sharpness * self.sharpness * 0.35 + self.sharpness * 0.9).min(1.25);
+        // Gentle curve: high Netteté must not sketch/edge-detect (Arthur F11 screenshots).
+        // Cap well below the old 1.25 USM that hatched Switch UI at 0.8–1.0.
+        let sharp = (self.sharpness * 0.55 + self.sharpness * self.sharpness * 0.2).min(0.75);
         let params = NisGpu {
             scale: [
                 in_w as f32 / out_w as f32,
@@ -1366,7 +1408,17 @@ fn ensure_tex(
 }
 
 pub fn target_size(content_w: u32, content_h: u32, view_w: u32, view_h: u32) -> (u32, u32) {
-    let fit = compute_present_fit(content_w, content_h, view_w, view_h);
+    target_size_ex(content_w, content_h, view_w, view_h, false)
+}
+
+pub fn target_size_ex(
+    content_w: u32,
+    content_h: u32,
+    view_w: u32,
+    view_h: u32,
+    fill_viewport: bool,
+) -> (u32, u32) {
+    let fit = compute_present_fit_ex(content_w, content_h, view_w, view_h, fill_viewport);
     (fit.out_w, fit.out_h)
 }
 
