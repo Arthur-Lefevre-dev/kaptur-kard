@@ -163,6 +163,18 @@ pub struct OverlayState {
     pub cpu_history: Vec<f32>,
     /// Recent process RAM MiB for the RAM graph.
     pub ram_history: Vec<f32>,
+    /// Recent dedicated VRAM MiB for the VRAM graph.
+    pub vram_history: Vec<f32>,
+    /// Recent display FPS for the FPS graph.
+    pub fps_history: Vec<f32>,
+    /// Recent 1% low FPS for the FPS graph.
+    pub fps_1pct_history: Vec<f32>,
+    /// Live capture audio channel count (0 when idle / muted source).
+    pub audio_input_channels: u16,
+    /// Live capture sample rate in Hz.
+    pub audio_input_rate_hz: u32,
+    /// Playback device sample rate in Hz.
+    pub audio_output_rate_hz: u32,
     /// Which monitor graphs / lines are enabled (from prefs).
     pub monitor: MonitorPrefs,
     pub mode_label: String,
@@ -255,6 +267,12 @@ impl Default for OverlayState {
             io_write_mbps: 0.0,
             cpu_history: Vec::new(),
             ram_history: Vec::new(),
+            vram_history: Vec::new(),
+            fps_history: Vec::new(),
+            fps_1pct_history: Vec::new(),
+            audio_input_channels: 0,
+            audio_input_rate_hz: 0,
+            audio_output_rate_hz: 0,
             monitor: MonitorPrefs::default(),
             mode_label: String::new(),
             format_label: String::new(),
@@ -1213,6 +1231,44 @@ fn draw_sound_tab(ui: &mut egui::Ui, input: &DrawInput<'_>, actions: &mut UiActi
         );
     });
 
+    // Live capture format — helps diagnose Switch 2 5.1 vs stereo-only cards (HD60).
+    let ch = input.overlay.audio_input_channels;
+    let in_hz = input.overlay.audio_input_rate_hz;
+    let out_hz = input.overlay.audio_output_rate_hz;
+    if ch > 0 && in_hz > 0 {
+        let ch_label = match ch {
+            1 => i18n.t("audio_ch_mono"),
+            2 => i18n.t("audio_ch_stereo"),
+            6 => i18n.t("audio_ch_51"),
+            8 => i18n.t("audio_ch_71"),
+            n => format!("{n} ch"),
+        };
+        ui.label(format!(
+            "{}: {} · {} Hz",
+            i18n.t("label_audio_capture_format"),
+            ch_label,
+            in_hz
+        ));
+        if out_hz > 0 {
+            ui.label(format!(
+                "{}: {} Hz",
+                i18n.t("label_audio_output_rate"),
+                out_hz
+            ));
+        }
+        ui.label(
+            RichText::new(i18n.t("tip_audio_card_limits"))
+                .small()
+                .weak(),
+        );
+    } else {
+        ui.label(
+            RichText::new(i18n.t("audio_capture_idle"))
+                .small()
+                .weak(),
+        );
+    }
+
     ui.collapsing(i18n.t("section_advanced"), |ui| {
         option_block(
             ui,
@@ -1858,6 +1914,12 @@ fn draw_monitor_prefs(
             .changed();
         changed |= ui
             .checkbox(&mut next.graph_gpu, i18n.t("mon_graph_gpu"))
+            .changed();
+        changed |= ui
+            .checkbox(&mut next.graph_vram, i18n.t("mon_graph_vram"))
+            .changed();
+        changed |= ui
+            .checkbox(&mut next.graph_fps_1pct, i18n.t("mon_graph_fps_1pct"))
             .changed();
     });
     ui.horizontal_wrapped(|ui| {
@@ -2728,6 +2790,58 @@ fn draw_monitor_graphs(ui: &mut egui::Ui, i18n: &I18n, o: &OverlayState) {
                     Color32::from_rgb(90, 180, 140)
                 }
             });
+        }
+    }
+    if m.graph_vram {
+        ui.add_space(4.0);
+        let budget = if o.vram_budget_mb > 0.0 {
+            format!(" / {:.0} Mo", o.vram_budget_mb)
+        } else {
+            String::new()
+        };
+        ui.label(format!(
+            "{} · {:.0} Mo{}",
+            i18n.t("label_graph_vram"),
+            o.vram_used_mb,
+            budget
+        ));
+        let max_hint = o
+            .vram_history
+            .iter()
+            .copied()
+            .fold(o.vram_budget_mb.max(256.0), f32::max);
+        draw_sparkline(ui, &o.vram_history, max_hint, |_| {
+            Color32::from_rgb(80, 170, 200)
+        });
+    }
+    if m.graph_fps_1pct {
+        ui.add_space(4.0);
+        ui.label(format!(
+            "{} · {:.0} / {:.0}",
+            i18n.t("label_graph_fps_1pct"),
+            o.fps,
+            o.one_percent_low_fps
+        ));
+        // Overlay 1% low (amber) under display FPS (green) by drawing FPS first.
+        let max_hint = o
+            .fps_history
+            .iter()
+            .chain(o.fps_1pct_history.iter())
+            .copied()
+            .fold(60.0f32, f32::max)
+            .max(30.0);
+        if !o.fps_1pct_history.is_empty() {
+            draw_sparkline(ui, &o.fps_1pct_history, max_hint, |_| {
+                Color32::from_rgb(220, 160, 70)
+            });
+        }
+        if !o.fps_history.is_empty() {
+            draw_sparkline(ui, &o.fps_history, max_hint, |_| {
+                Color32::from_rgb(90, 180, 140)
+            });
+        }
+        if o.fps_history.is_empty() && o.fps_1pct_history.is_empty() {
+            ui.weak("—");
         }
     }
     if m.cpu_cores {

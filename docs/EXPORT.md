@@ -41,8 +41,19 @@ Mode C / DLSS-G never ship NVIDIA proprietary DLLs. Effects / Infos show a clear
 
 Live monitoring (WASAPI via cpal) prefers a **stereo** input config when the capture card exposes one, so multi-channel fold does not unnecessarily duck levels. True stereo is passthrough; multi-channel fold keeps **center at full level** and does not apply a global headroom duck when only FL/FR carry energy. Live volume boost goes up to **300%** with soft-clip (clips still record pre-volume PCM).
 
+### NZXT Signal HD60 vs Switch 2 HDMI audio
+
+| Source | Official audio |
+|--------|----------------|
+| **NZXT Signal HD60** | HDMI capture: **2 ch stereo, 16-bit, 48 kHz** only ([manual](https://cdn-g.nzxt.com/dl/1676419258-streaming_sprite_signal_hd60_digital-manual_v2_en_2211.pdf)) |
+| **Nintendo Switch 2** (TV/dock) | HDMI: **Linear PCM** — System Settings → Audio → TV Sound: Automatic / **Stereo** / **Linear PCM 5.1 Surround** ([Nintendo specs](https://www.nintendo.com/us/gaming-systems/switch-2/tech-specs/)) |
+
+**Conclusion:** Quiet live cutscene voices with headset-on-Switch OK are usually **card / HDMI mix**, not a KapturKard center drop. The HD60 cannot capture discrete 5.1; if Switch 2 is set to LPCM 5.1, the card’s stereo path may keep only FL/FR and under-represent center dialogue. Prefer **TV Sound → Stereo** on Switch 2 when capturing with HD60. In-app Sound shows live **channels + Hz** so you can confirm what WASAPI opened.
+
 **How to verify if voices stay quiet after this release:**
 
-1. In Sound, raise Volume above 100% during a cutscene — dialogue should lift on the live path.
-2. Compare the same HDMI feed in the capture card’s own preview app / TV. If dialogue is also quiet there, the mix is **game or card**, not KapturKard.
-3. Check logs for `preferring stereo over multi-channel` / `input_channels=` when the engine starts.
+1. In Sound, check **Capture audio** (channels · Hz). HD60 should read Stereo · 48000 Hz.
+2. On Switch 2, set **TV Sound → Stereo**, then retest a cutscene.
+3. Raise Volume above 100% during a cutscene — dialogue should lift on the live path when the channel is present.
+4. Compare the same HDMI feed in the capture card’s own preview app / TV. If dialogue is also quiet there, the mix is **game or card**, not KapturKard.
+5. Check logs for `preferring stereo over multi-channel` / `input_channels=` when the engine starts.

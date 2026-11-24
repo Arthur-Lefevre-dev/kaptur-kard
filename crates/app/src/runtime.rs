@@ -2648,24 +2648,41 @@ impl App {
                 .current_monitor()
                 .or_else(|| gpu.window.primary_monitor());
             if let Some(monitor) = monitor.clone() {
-                let size = monitor.size();
+                let monitor_size = monitor.size();
                 gpu.window
                     .set_fullscreen(Some(winit::window::Fullscreen::Borderless(Some(
                         monitor,
                     ))));
-                if size.width > 0 && size.height > 0 {
-                    gpu.config.width = size.width;
-                    gpu.config.height = size.height;
+                // Prefer the size Windows actually gave the borderless client —
+                // monitor.size() can disagree with DPI / multi-monitor layouts and
+                // leave NIS presenting into the wrong swapchain (letterbox gutters).
+                let inner = gpu.window.inner_size();
+                let (w, h) = if inner.width > 0 && inner.height > 0 {
+                    (inner.width, inner.height)
+                } else {
+                    (monitor_size.width, monitor_size.height)
+                };
+                if w > 0 && h > 0 {
+                    gpu.config.width = w;
+                    gpu.config.height = h;
                     gpu.surface.configure(&gpu.device, &gpu.config);
                     tracing::info!(
-                        width = size.width,
-                        height = size.height,
+                        width = w,
+                        height = h,
+                        monitor_w = monitor_size.width,
+                        monitor_h = monitor_size.height,
                         "fullscreen surface configured for upscale"
                     );
                 }
             } else {
                 gpu.window
                     .set_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
+                let inner = gpu.window.inner_size();
+                if inner.width > 0 && inner.height > 0 {
+                    gpu.config.width = inner.width;
+                    gpu.config.height = inner.height;
+                    gpu.surface.configure(&gpu.device, &gpu.config);
+                }
             }
         } else {
             gpu.window.set_fullscreen(None);
@@ -2859,6 +2876,11 @@ impl App {
                 HISTORY,
             );
             push_history(&mut self.overlay.ram_history, self.overlay.ram_mb, HISTORY);
+            push_history(
+                &mut self.overlay.vram_history,
+                self.overlay.vram_used_mb,
+                HISTORY,
+            );
             self.process_sample_at = Instant::now();
         }
 
@@ -2892,6 +2914,13 @@ impl App {
                 .collect();
             self.overlay.one_percent_low_fps = self.cached_one_percent_low;
             self.overlay.frame_times_ms.clone_from(&self.cached_frame_times_ms);
+            const FPS_HISTORY: usize = 60;
+            push_history(&mut self.overlay.fps_history, self.overlay.fps, FPS_HISTORY);
+            push_history(
+                &mut self.overlay.fps_1pct_history,
+                self.cached_one_percent_low,
+                FPS_HISTORY,
+            );
         } else {
             self.overlay.one_percent_low_fps = self.cached_one_percent_low;
         }
@@ -2930,7 +2959,11 @@ impl App {
         self.overlay.device_busy = device_busy;
         self.overlay.soft_black = soft_black;
         self.overlay.level = self.audio.meter().take_peak();
-        self.overlay.audio_notice = self.audio.status().notice.clone();
+        let audio_st = self.audio.status();
+        self.overlay.audio_notice = audio_st.notice.clone();
+        self.overlay.audio_input_channels = audio_st.input_channels;
+        self.overlay.audio_input_rate_hz = audio_st.input_rate;
+        self.overlay.audio_output_rate_hz = audio_st.output_rate;
         if let Some(until) = self.toast_until {
             if Instant::now() > until {
                 self.overlay.toast.clear();
@@ -3025,8 +3058,14 @@ impl App {
             }
         }
 
-        gpu.pipeline
-            .update_letterbox(&gpu.queue, gpu.config.width, gpu.config.height);
+        // Use cloned chrome — self.gpu is already mutably borrowed.
+        let fill_viewport = chrome.fullscreen;
+        gpu.pipeline.update_letterbox(
+            &gpu.queue,
+            gpu.config.width,
+            gpu.config.height,
+            fill_viewport,
+        );
 
         let frame = match gpu.surface.get_current_texture() {
             Ok(frame) => frame,
@@ -3154,6 +3193,7 @@ impl App {
                     gpu.config.width,
                     gpu.config.height,
                     clear,
+                    fill_viewport,
                 );
                 if presented {
                     self.gen_frames_in_window = self.gen_frames_in_window.saturating_add(1);
@@ -3215,6 +3255,7 @@ impl App {
                         gpu.config.width,
                         gpu.config.height,
                         clear,
+                        fill_viewport,
                     );
                     if !presented {
                         gpu.interpolate.present_view(
@@ -3227,6 +3268,7 @@ impl App {
                             gpu.config.width,
                             gpu.config.height,
                             clear,
+                            fill_viewport,
                         );
                         presented = true;
                     }
@@ -3246,6 +3288,7 @@ impl App {
                         gpu.config.width,
                         gpu.config.height,
                         clear,
+                        fill_viewport,
                     );
                     if !presented {
                         gpu.interpolate.present_view(
@@ -3258,6 +3301,7 @@ impl App {
                             gpu.config.width,
                             gpu.config.height,
                             clear,
+                            fill_viewport,
                         );
                         presented = true;
                     }
@@ -3272,6 +3316,7 @@ impl App {
                     gpu.config.width,
                     gpu.config.height,
                     clear,
+                    fill_viewport,
                 );
             }
         }

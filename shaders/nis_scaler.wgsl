@@ -4,9 +4,10 @@
 //
 // Vendor-neutral compute: runs on AMD / NVIDIA / Intel via wgpu (not a
 // driver feature). At 1:1, sharp=0 is a true passthrough.
+// USM is intentionally mild — high sharpness must not sketch / hatch UI.
 
 struct NisParams {
-    scale: vec4<f32>,      // xy = src/dst scale, zw = sharpness (0..1) + detect
+    scale: vec4<f32>,      // xy = src/dst scale, zw = sharpness (0..~0.75) + detect
     src_norm: vec4<f32>,   // xy = 1/srcSize
     dst_size: vec4<f32>,   // xy = dst size
 }
@@ -45,7 +46,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let src = dst * params.scale.xy;
     let src_uv_base = src * params.src_norm.xy;
     let c0 = textureSampleLevel(src_tex, src_samp, src_uv_base, 0.0).rgb;
-    let sharp = params.scale.z; // 0..1 UI (1 = max sharp)
+    let sharp = params.scale.z; // mapped UI sharpness (already capped in Rust)
     let detect = params.scale.w;
     let native = abs(params.scale.x - 1.0) < 0.001 && abs(params.scale.y - 1.0) < 0.001;
 
@@ -78,9 +79,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let gx = luma(cx1) - luma(cx0);
     let gy = luma(cy1) - luma(cy0);
-    let edge = clamp(length(vec2<f32>(gx, gy)) * 4.0, 0.0, 1.0);
-    // Stronger USM so Mode B Netteté 0.7–1 is clearly visible vs Off (Arthur A/B).
-    let usm = (c0 - scaled) * (sharp * (0.65 + 0.85 * edge) * detect);
+    // Soft edge gate — avoid pencil/sketch outlines on Switch UI tiles.
+    let edge = clamp(length(vec2<f32>(gx, gy)) * 2.5, 0.0, 1.0);
+    // Mild USM: base sharpen + light edge lift (was 0.65 + 0.85*edge → hatched).
+    let usm_gain = sharp * (0.32 + 0.18 * edge) * detect;
+    let usm = (c0 - scaled) * usm_gain;
 
     // Upscale: scaled + USM. Native sharpen: c0 + USM (base stays sharp).
     let base = select(scaled, c0, native);
