@@ -1017,6 +1017,7 @@ pub fn pooled_len(data: &Arc<PooledBytes>) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pixel_convert::frame_to_bgra_scaled;
     use capture::PixelFormat;
 
     #[test]

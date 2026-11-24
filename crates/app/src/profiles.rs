@@ -40,6 +40,7 @@ impl NamedProfile {
                 graph_gpu: true,
                 graph_vram: false,
                 graph_fps_1pct: true,
+                graph_latency: true,
                 cpu_cores: false,
                 vram: false,
                 process_ram: false,
@@ -69,6 +70,7 @@ impl NamedProfile {
                 graph_gpu: true,
                 graph_vram: true,
                 graph_fps_1pct: true,
+                graph_latency: true,
                 cpu_cores: false,
                 vram: true,
                 process_ram: true,
@@ -98,6 +100,39 @@ impl NamedProfile {
                 graph_gpu: false,
                 graph_vram: false,
                 graph_fps_1pct: true,
+                graph_latency: true,
+                cpu_cores: false,
+                vram: false,
+                process_ram: false,
+                fps_1pct: true,
+                present_latency: true,
+                framegen_rate: false,
+                disk_io: false,
+            },
+        }
+    }
+
+    /// Switch / Switch 2 dock: 1080p60 limited BT.709 feel via soft NIS, stereo audio prefs
+    /// applied separately, Spout 60, VSync Auto.
+    pub fn switch_dock() -> Self {
+        Self {
+            id: "switch_dock".into(),
+            label_key: "profile_switch_dock".into(),
+            upscale_mode: "nis".into(),
+            sharpness: 0.35,
+            interp_mode: "off".into(),
+            interp_motion_blur: 0.0,
+            dlssg_multiplier: "off".into(),
+            display_fps_limit: 60,
+            vsync_mode: "auto".into(),
+            hdr_output: false,
+            monitor: MonitorPrefs {
+                graph_cpu: false,
+                graph_ram: false,
+                graph_gpu: false,
+                graph_vram: false,
+                graph_fps_1pct: true,
+                graph_latency: true,
                 cpu_cores: false,
                 vram: false,
                 process_ram: false,
@@ -128,6 +163,7 @@ fn default_profiles() -> Vec<NamedProfile> {
         NamedProfile::stream(),
         NamedProfile::edit(),
         NamedProfile::low_latency(),
+        NamedProfile::switch_dock(),
     ]
 }
 
@@ -166,9 +202,10 @@ mod tests {
     #[test]
     fn builtins_have_distinct_ids() {
         let p = ProfilesPrefs::default();
-        assert_eq!(p.profiles.len(), 3);
+        assert_eq!(p.profiles.len(), 4);
         assert!(p.get("stream").is_some());
         assert!(p.get("edit").is_some());
         assert!(p.get("low_latency").is_some());
+        assert!(p.get("switch_dock").is_some());
     }
 }

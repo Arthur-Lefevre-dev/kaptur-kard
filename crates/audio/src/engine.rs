@@ -11,19 +11,48 @@ use ringbuf::{
     traits::{Consumer, Observer, Producer, Split},
     HeapRb,
 };
+use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use crate::clock::{AudioClock, DriftCorrector};
 use crate::device::{
-    default_output_id, find_input_device, find_output_device, AudioError, NONE_INPUT_ID,
+    default_output_id, find_input_device, find_output_device, max_output_channels, AudioError,
+    NONE_INPUT_ID,
 };
 use crate::level::LevelMeter;
 use crate::replay_tap::SharedReplayTap;
-use crate::resample::{fold_to_stereo_interleaved, StereoResampler};
+use crate::resample::{
+    fold_to_stereo_interleaved, pack_to_surround51_interleaved, StereoResampler,
+};
 
 const TARGET_BUFFER_MS_DEFAULT: f32 = 30.0;
 const TARGET_BUFFER_MS_MIN: f32 = 20.0;
 const TARGET_BUFFER_MS_MAX: f32 = 40.0;
+
+/// Playback layout preference (actual device may force a fold).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputMode {
+    #[default]
+    Stereo,
+    Surround51,
+}
+
+impl OutputMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stereo => "stereo",
+            Self::Surround51 => "surround51",
+        }
+    }
+
+    pub fn from_str_lossy(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "surround51" | "5.1" | "51" | "surround" => Self::Surround51,
+            _ => Self::Stereo,
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct AudioEngineConfig {
@@ -35,6 +64,11 @@ pub struct AudioEngineConfig {
     pub delay_ms: f32,
     /// Ring target latency before delay (20..=40 ms).
     pub buffer_ms: f32,
+    /// Preferred playback layout.
+    pub output_mode: OutputMode,
+    /// When true (default), multi-channel capture folds to stereo with full center.
+    /// Forced on when the output device cannot open 5.1.
+    pub downmix_51_to_stereo: bool,
 }
 
 impl Default for AudioEngineConfig {
@@ -46,6 +80,8 @@ impl Default for AudioEngineConfig {
             muted: false,
             delay_ms: 0.0,
             buffer_ms: TARGET_BUFFER_MS_DEFAULT,
+            output_mode: OutputMode::Stereo,
+            downmix_51_to_stereo: true,
         }
     }
 }
@@ -57,6 +93,16 @@ pub struct AudioStatus {
     pub output_rate: u32,
     /// Capture channel count actually opened (2 preferred when the device allows it).
     pub input_channels: u16,
+    /// Channels opened on the playback device (2 or 6).
+    pub output_channels: u16,
+    /// Max channels the output device reported supporting.
+    pub output_device_max_channels: u16,
+    /// True when user asked for 5.1 but the WASAPI endpoint is stereo-only.
+    pub surround_unavailable: bool,
+    /// Effective layout after capability + downmix policy.
+    pub effective_output_mode: OutputMode,
+    /// Whether the live path is folding multi-ch → stereo.
+    pub downmix_active: bool,
     pub running: bool,
 }
 
@@ -181,6 +227,11 @@ impl AudioEngine {
             .store((config.volume * 1000.0).round() as u32, Ordering::Relaxed);
         self.shared.muted.store(config.muted, Ordering::Relaxed);
         self.status.notice.clear();
+        self.status.surround_unavailable = false;
+        self.status.downmix_active = false;
+        self.status.output_channels = 0;
+        self.status.output_device_max_channels = 0;
+        self.status.effective_output_mode = OutputMode::Stereo;
 
         if config.input_id == NONE_INPUT_ID {
             self.status.running = false;
@@ -206,9 +257,31 @@ impl AudioEngine {
                 }
             };
 
+        let out_max = max_output_channels(&output_dev);
+        self.status.output_device_max_channels = out_max;
+
+        // Resolve effective layout: 5.1 only when requested, not downmixed, and device can do ≥6.
+        let want_surround = config.output_mode == OutputMode::Surround51
+            && !config.downmix_51_to_stereo;
+        let (effective_mode, surround_unavailable) = if want_surround && out_max >= 6 {
+            (OutputMode::Surround51, false)
+        } else if config.output_mode == OutputMode::Surround51 && out_max < 6 {
+            (OutputMode::Stereo, true)
+        } else {
+            (OutputMode::Stereo, false)
+        };
+        self.status.surround_unavailable = surround_unavailable;
+        self.status.effective_output_mode = effective_mode;
+        let out_channels: u16 = match effective_mode {
+            OutputMode::Surround51 => 6,
+            OutputMode::Stereo => 2,
+        };
+        // Prefer stereo capture when the live path will fold anyway (HD60 / stereo speakers).
+        let prefer_stereo_in = effective_mode == OutputMode::Stereo || config.downmix_51_to_stereo;
+
         // If configured output vanished mid-check, try default once more after open config fails.
-        let (in_cfg, in_format) = pick_input_config(&input_dev)?;
-        let out_cfg = match pick_output_config(&output_dev) {
+        let (in_cfg, in_format) = pick_input_config(&input_dev, prefer_stereo_in)?;
+        let out_cfg = match pick_output_config(&output_dev, out_channels) {
             Ok(c) => c,
             Err(e) => {
                 warn!(error = %e, "output config failed; trying default");
@@ -216,17 +289,62 @@ impl AudioEngine {
                     "Périphérique audio de sortie introuvable, retour au défaut système.".into();
                 output_dev = find_output_device("default")?;
                 output_id = default_output_id().unwrap_or_else(|| "default".into());
-                pick_output_config(&output_dev)?
+                let out_max = max_output_channels(&output_dev);
+                self.status.output_device_max_channels = out_max;
+                if out_channels == 6 && out_max < 6 {
+                    self.status.surround_unavailable = true;
+                    self.status.effective_output_mode = OutputMode::Stereo;
+                    pick_output_config(&output_dev, 2)?
+                } else {
+                    pick_output_config(&output_dev, out_channels)?
+                }
             }
         };
+        let out_channels = out_cfg.channels;
+        let effective_mode = if out_channels >= 6 {
+            OutputMode::Surround51
+        } else {
+            OutputMode::Stereo
+        };
+        self.status.effective_output_mode = effective_mode;
+        self.status.output_channels = out_channels;
 
         self.config.output_id = output_id;
         let in_rate = in_cfg.sample_rate.0;
-        let out_rate = out_cfg.sample_rate.0;
+        let mut out_cfg = out_cfg;
+        let mut out_rate = out_cfg.sample_rate.0;
         let in_channels = in_cfg.channels as usize;
         self.status.input_rate = in_rate;
         self.status.output_rate = out_rate;
         self.status.input_channels = in_cfg.channels;
+
+        let mut use_surround_path =
+            effective_mode == OutputMode::Surround51 && out_channels >= 6 && in_rate == out_rate;
+        // Surround + rate mismatch: soft fall back to stereo fold (rubato path is stereo).
+        if effective_mode == OutputMode::Surround51 && !use_surround_path {
+            warn!(
+                in_rate,
+                out_rate, "5.1 output needs matching sample rates or 6ch device; folding to stereo"
+            );
+            if self.status.notice.is_empty() {
+                self.status.notice =
+                    "5.1 indisponible (périphérique ou fréquences) — repli stéréo.".into();
+            }
+            self.status.surround_unavailable = true;
+            self.status.effective_output_mode = OutputMode::Stereo;
+            out_cfg = pick_output_config(&output_dev, 2)?;
+            out_rate = out_cfg.sample_rate.0;
+            self.status.output_rate = out_rate;
+            self.status.output_channels = 2;
+            use_surround_path = false;
+        }
+
+        let path_channels = if use_surround_path { 6 } else { 2 };
+        self.status.downmix_active = !use_surround_path && in_channels > 2;
+        if !use_surround_path {
+            self.status.output_channels = 2;
+            self.status.effective_output_mode = OutputMode::Stereo;
+        }
 
         let delay_frames = AudioClock::new(out_rate).ms_to_frames(config.delay_ms);
         let buffer_frames = AudioClock::new(out_rate).ms_to_frames(config.buffer_ms);
@@ -237,9 +355,9 @@ impl AudioEngine {
             .target_buffer_frames
             .store(buffer_frames as u32, Ordering::Relaxed);
 
-        // Capacity: ~500ms delay + 100ms slack + buffer, in stereo samples.
+        // Capacity: ~500ms delay + 100ms slack + buffer, in path_channels samples.
         let capacity_frames = AudioClock::new(out_rate).ms_to_frames(600.0) + buffer_frames * 2;
-        let capacity_samples = capacity_frames * 2;
+        let capacity_samples = capacity_frames * path_channels;
         let rb = HeapRb::<f32>::new(capacity_samples.max(1024));
         let (prod, cons) = rb.split();
         let prod = Arc::new(Mutex::new(prod));
@@ -256,67 +374,89 @@ impl AudioEngine {
         let pending_cb = Arc::clone(&pending_in);
         let tap_cb = self.replay_tap.clone();
 
-        let input_stream = build_input_stream(
-            &input_dev,
-            &in_cfg,
-            in_format,
-            move |data: &[f32]| {
-                let stereo = fold_to_stereo_interleaved(data, in_channels);
-                meter_in.observe_interleaved_stereo(&stereo);
-                let mut pending = pending_cb.lock();
-                pending.extend_from_slice(&stereo);
-                let mut resampler = resampler_cb.lock();
-                let chunk_samples = resampler.chunk_frames() * 2;
-                while pending.len() >= chunk_samples || resampler.is_identity() {
-                    if resampler.is_identity() {
-                        if let Some(tap) = tap_cb.as_ref() {
-                            tap.lock().push_stereo(&pending);
-                        }
-                        let mut prod = prod_cb.lock();
-                        let _ = prod.push_slice(&pending);
-                        pending.clear();
-                        break;
+        let input_stream = if use_surround_path {
+            build_input_stream(
+                &input_dev,
+                &in_cfg,
+                in_format,
+                move |data: &[f32]| {
+                    meter_in.observe_interleaved_channels(data, in_channels);
+                    let surround = pack_to_surround51_interleaved(data, in_channels);
+                    // Replay tap stays stereo (ITU fold) for clip mux.
+                    if let Some(tap) = tap_cb.as_ref() {
+                        let stereo = fold_to_stereo_interleaved(data, in_channels);
+                        tap.lock().push_stereo(&stereo);
                     }
-                    let chunk: Vec<f32> = pending.drain(..chunk_samples).collect();
-                    match resampler.process_interleaved(&chunk) {
-                        Ok(out) if !out.is_empty() => {
+                    let mut prod = prod_cb.lock();
+                    let _ = prod.push_slice(&surround);
+                },
+            )?
+        } else {
+            build_input_stream(
+                &input_dev,
+                &in_cfg,
+                in_format,
+                move |data: &[f32]| {
+                    meter_in.observe_interleaved_channels(data, in_channels);
+                    let stereo = fold_to_stereo_interleaved(data, in_channels);
+                    let mut pending = pending_cb.lock();
+                    pending.extend_from_slice(&stereo);
+                    let mut resampler = resampler_cb.lock();
+                    let chunk_samples = resampler.chunk_frames() * 2;
+                    while pending.len() >= chunk_samples || resampler.is_identity() {
+                        if resampler.is_identity() {
                             if let Some(tap) = tap_cb.as_ref() {
-                                tap.lock().push_stereo(&out);
+                                tap.lock().push_stereo(&pending);
                             }
                             let mut prod = prod_cb.lock();
-                            let _ = prod.push_slice(&out);
+                            let _ = prod.push_slice(&pending);
+                            pending.clear();
+                            break;
                         }
-                        Ok(_) => {}
-                        Err(e) => warn!(error = %e, "resample failed"),
+                        let chunk: Vec<f32> = pending.drain(..chunk_samples).collect();
+                        match resampler.process_interleaved(&chunk) {
+                            Ok(out) if !out.is_empty() => {
+                                if let Some(tap) = tap_cb.as_ref() {
+                                    tap.lock().push_stereo(&out);
+                                }
+                                let mut prod = prod_cb.lock();
+                                let _ = prod.push_slice(&out);
+                            }
+                            Ok(_) => {}
+                            Err(e) => warn!(error = %e, "resample failed"),
+                        }
                     }
-                }
-            },
-        )?;
+                },
+            )?
+        };
 
         let shared = Arc::clone(&self.shared);
         let meter_out = Arc::clone(&self.meter);
         let cons_cb = Arc::clone(&cons);
         let drift = DriftCorrector::default();
         let capacity_samples_u = capacity_samples;
+        let play_channels = if use_surround_path { 6u16 } else { 2u16 };
 
         let output_stream = build_output_stream(
             &output_dev,
             &out_cfg,
+            play_channels,
             move |out: &mut [f32]| {
                 out.fill(0.0);
                 let mut cons = cons_cb.lock();
                 let occupied = cons.occupied_len();
                 let fill = occupied as f32 / capacity_samples_u as f32;
-                let delay_needed = shared.delay_frames.load(Ordering::Relaxed) as usize * 2;
+                let ch = play_channels as usize;
+                let delay_needed = shared.delay_frames.load(Ordering::Relaxed) as usize * ch;
                 if occupied < delay_needed {
                     return; // wait to build delay / prebuffer
                 }
-                let target = shared.target_buffer_frames.load(Ordering::Relaxed) as usize * 2;
+                let target = shared.target_buffer_frames.load(Ordering::Relaxed) as usize * ch;
                 let _ = target; // informational; delay gate is primary
                 let corr = drift.correction_frames(fill);
                 if corr > 0 {
                     // Skip frames (drop samples).
-                    let skip = (corr as usize) * 2;
+                    let skip = (corr as usize) * ch;
                     let mut discard = vec![0.0f32; skip.min(occupied)];
                     let _ = cons.pop_slice(&mut discard);
                 }
@@ -341,7 +481,11 @@ impl AudioEngine {
                         *s = apply_monitor_gain(*s, vol);
                     }
                 }
-                meter_out.observe_interleaved_stereo(out);
+                if ch == 2 {
+                    meter_out.observe_interleaved_stereo(out);
+                } else {
+                    meter_out.observe_interleaved_channels(out, ch);
+                }
             },
         )?;
 
@@ -359,6 +503,10 @@ impl AudioEngine {
             in_rate,
             out_rate,
             in_channels = in_cfg.channels,
+            out_channels = play_channels,
+            effective = ?self.status.effective_output_mode,
+            downmix = self.status.downmix_active,
+            surround_unavailable = self.status.surround_unavailable,
             delay_ms = config.delay_ms,
             buffer_ms = config.buffer_ms,
             volume = config.volume,
@@ -388,14 +536,17 @@ fn apply_monitor_gain(sample: f32, vol: f32) -> f32 {
     (v * drive).tanh() / drive.tanh()
 }
 
-fn pick_input_config(dev: &cpal::Device) -> Result<(StreamConfig, SampleFormat), AudioError> {
+fn pick_input_config(
+    dev: &cpal::Device,
+    prefer_stereo: bool,
+) -> Result<(StreamConfig, SampleFormat), AudioError> {
     let default = dev
         .default_input_config()
         .map_err(|e| AudioError::Config(e.to_string()))?;
 
-    // Prefer stereo when available. Multi-channel defaults force a fold; some capture cards
-    // expose 6/8ch WASAPI endpoints even for stereo HDMI, which used to apply headroom ducking.
-    let chosen = if default.channels() == 2 {
+    // Prefer stereo when the live path will fold — some capture cards expose 6/8ch WASAPI
+    // endpoints even for stereo HDMI, which used to apply headroom ducking on silent surrounds.
+    let chosen = if !prefer_stereo || default.channels() == 2 {
         default
     } else {
         let stereo = dev.supported_input_configs().ok().and_then(|configs| {
@@ -446,13 +597,51 @@ fn pick_input_config(dev: &cpal::Device) -> Result<(StreamConfig, SampleFormat),
     ))
 }
 
-fn pick_output_config(dev: &cpal::Device) -> Result<StreamConfig, AudioError> {
-    let cfg = dev
+fn pick_output_config(dev: &cpal::Device, want_channels: u16) -> Result<StreamConfig, AudioError> {
+    let default = dev
         .default_output_config()
         .map_err(|e| AudioError::Config(e.to_string()))?;
+    let def_rate = default.sample_rate();
+
+    if want_channels <= 2 {
+        return Ok(StreamConfig {
+            channels: 2,
+            sample_rate: def_rate,
+            buffer_size: cpal::BufferSize::Default,
+        });
+    }
+
+    // Prefer a supported 6ch (or ≥6) config at the default rate.
+    let surround = dev.supported_output_configs().ok().and_then(|configs| {
+        let mut at_rate = None;
+        let mut any = None;
+        for range in configs {
+            if range.channels() < 6 {
+                continue;
+            }
+            if def_rate >= range.min_sample_rate() && def_rate <= range.max_sample_rate() {
+                at_rate = Some(range.with_sample_rate(def_rate));
+                break;
+            }
+            if any.is_none() {
+                any = Some(range.with_sample_rate(range.max_sample_rate()));
+            }
+        }
+        at_rate.or(any)
+    });
+
+    if let Some(c) = surround {
+        return Ok(StreamConfig {
+            channels: 6.min(c.channels()),
+            sample_rate: c.sample_rate(),
+            buffer_size: cpal::BufferSize::Default,
+        });
+    }
+
+    // Fall back to stereo when 5.1 is unavailable.
     Ok(StreamConfig {
         channels: 2,
-        sample_rate: cfg.sample_rate(),
+        sample_rate: def_rate,
         buffer_size: cpal::BufferSize::Default,
     })
 }
@@ -508,6 +697,7 @@ where
 fn build_output_stream<F>(
     device: &cpal::Device,
     config: &StreamConfig,
+    channels: u16,
     mut on_data: F,
 ) -> Result<Stream, AudioError>
 where
@@ -517,11 +707,11 @@ where
     let supported = device
         .default_output_config()
         .map_err(|e| AudioError::Config(e.to_string()))?;
-    // We request stereo f32-ish config; match device format.
+    // Match device sample format; channel count comes from the resolved layout.
     match supported.sample_format() {
         SampleFormat::F32 => {
             let mut cfg = config.clone();
-            cfg.channels = 2;
+            cfg.channels = channels;
             device
                 .build_output_stream(
                     &cfg,
@@ -533,7 +723,7 @@ where
         }
         SampleFormat::I16 => {
             let mut cfg = config.clone();
-            cfg.channels = 2;
+            cfg.channels = channels;
             device
                 .build_output_stream(
                     &cfg,
@@ -551,7 +741,7 @@ where
         }
         SampleFormat::U16 => {
             let mut cfg = config.clone();
-            cfg.channels = 2;
+            cfg.channels = channels;
             device
                 .build_output_stream(
                     &cfg,
@@ -572,4 +762,3 @@ where
         ))),
     }
 }
-

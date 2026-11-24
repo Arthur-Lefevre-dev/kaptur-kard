@@ -5,7 +5,7 @@ use capture::PixelFormat;
 use wgpu::util::DeviceExt;
 
 use crate::color::{gpu_mode, ColorConvertParams, GpuPixelMode};
-use crate::present::{compute_present_fit_ex, PresentFilter};
+use crate::present::{compute_present_fit_mode, AspectMode, PresentFilter};
 
 const COPY_ALIGN: u32 = 256;
 
@@ -309,11 +309,22 @@ impl VideoPipeline {
         view_h: u32,
         fill_viewport: bool,
     ) {
+        self.update_letterbox_mode(queue, view_w, view_h, fill_viewport, AspectMode::Auto);
+    }
+
+    pub fn update_letterbox_mode(
+        &self,
+        queue: &wgpu::Queue,
+        view_w: u32,
+        view_h: u32,
+        fill_viewport: bool,
+        aspect: AspectMode,
+    ) {
         let (cw, ch) = self.content_size;
         if cw == 0 || ch == 0 {
             return;
         }
-        let fit = compute_present_fit_ex(cw, ch, view_w, view_h, fill_viewport);
+        let fit = compute_present_fit_mode(cw, ch, view_w, view_h, fill_viewport, aspect);
         let nearest = matches!(fit.filter, PresentFilter::Nearest);
         queue.write_buffer(
             &self.params_buf,

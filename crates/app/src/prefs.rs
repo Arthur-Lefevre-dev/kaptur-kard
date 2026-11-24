@@ -19,6 +19,16 @@ pub struct AudioPrefs {
     pub muted: bool,
     pub delay_ms: f32,
     pub buffer_ms: f32,
+    /// Preferred playback layout: "stereo" | "surround51".
+    #[serde(default = "default_output_mode")]
+    pub output_mode: String,
+    /// ITU-ish 5.1→stereo fold (full center). Default ON for stereo cards / speakers.
+    #[serde(default = "default_true")]
+    pub downmix_51_to_stereo: bool,
+}
+
+fn default_output_mode() -> String {
+    "stereo".into()
 }
 
 impl Default for AudioPrefs {
@@ -30,6 +40,8 @@ impl Default for AudioPrefs {
             muted: false,
             delay_ms: 0.0,
             buffer_ms: 30.0,
+            output_mode: default_output_mode(),
+            downmix_51_to_stereo: true,
         }
     }
 }
@@ -103,6 +115,9 @@ pub struct UiPrefs {
     /// Per-device overrides (id → range/matrix).
     #[serde(default)]
     pub device_colors: Vec<DeviceColorPrefs>,
+    /// Present aspect: auto | contain | fill | stretch | pixel | force16x9.
+    #[serde(default = "default_aspect_mode")]
+    pub aspect_mode: String,
     /// Live monitoring graphs / HUD line toggles (Infos + F2 overlay).
     #[serde(default)]
     pub monitor: MonitorPrefs,
@@ -171,6 +186,9 @@ pub struct MonitorPrefs {
     /// Display FPS + 1% low sparkline.
     #[serde(default)]
     pub graph_fps_1pct: bool,
+    /// Capture→present latency sparkline (ms).
+    #[serde(default = "default_true")]
+    pub graph_latency: bool,
     /// Per-core bars + process affinity highlight.
     #[serde(default)]
     pub cpu_cores: bool,
@@ -202,6 +220,7 @@ impl Default for MonitorPrefs {
             graph_gpu: true,
             graph_vram: false,
             graph_fps_1pct: false,
+            graph_latency: true,
             cpu_cores: false,
             vram: false,
             process_ram: true,
@@ -254,6 +273,10 @@ fn default_color_matrix() -> String {
     "auto".into()
 }
 
+fn default_aspect_mode() -> String {
+    "auto".into()
+}
+
 impl Default for UiPrefs {
     fn default() -> Self {
         Self {
@@ -284,6 +307,7 @@ impl Default for UiPrefs {
             color_range: "auto".into(),
             color_matrix: "auto".into(),
             device_colors: Vec::new(),
+            aspect_mode: default_aspect_mode(),
             monitor: MonitorPrefs::default(),
             profiles: ProfilesPrefs::default(),
             hud_enabled: false,

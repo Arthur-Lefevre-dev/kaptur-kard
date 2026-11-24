@@ -19,6 +19,42 @@ fn soft_limit(x: f32) -> f32 {
     }
 }
 
+/// Pack arbitrary channel counts into interleaved 5.1 (FL FR FC LFE BL BR).
+/// Stereo sources land on FL/FR; missing surrounds stay silent.
+pub fn pack_to_surround51_interleaved(input: &[f32], channels: usize) -> Vec<f32> {
+    if channels == 0 || input.is_empty() {
+        return Vec::new();
+    }
+    let frames = input.len() / channels;
+    let mut out = Vec::with_capacity(frames * 6);
+    for f in 0..frames {
+        let base = f * channels;
+        let sample = |i: usize| {
+            if i < channels {
+                input[base + i]
+            } else {
+                0.0
+            }
+        };
+        match channels {
+            1 => {
+                let m = sample(0);
+                out.extend_from_slice(&[m, m, 0.0, 0.0, 0.0, 0.0]);
+            }
+            2 => out.extend_from_slice(&[sample(0), sample(1), 0.0, 0.0, 0.0, 0.0]),
+            _ => out.extend_from_slice(&[
+                sample(0),
+                sample(1),
+                sample(2),
+                sample(3),
+                sample(4),
+                sample(5),
+            ]),
+        }
+    }
+    out
+}
+
 /// Downmix arbitrary channel counts to interleaved stereo f32.
 pub fn fold_to_stereo_interleaved(input: &[f32], channels: usize) -> Vec<f32> {
     if channels == 0 || input.is_empty() {
@@ -176,6 +212,23 @@ mod tests {
         let st = fold_to_stereo_interleaved(&frame, 6);
         assert!((st[0] - 0.7).abs() < 1e-5);
         assert!((st[1] - 0.7).abs() < 1e-5);
+    }
+
+    #[test]
+    fn surround_pack_keeps_center() {
+        let mut frame = vec![0.0f32; 6];
+        frame[0] = 0.1;
+        frame[1] = 0.2;
+        frame[2] = 0.8;
+        let s = pack_to_surround51_interleaved(&frame, 6);
+        assert_eq!(s.len(), 6);
+        assert!((s[2] - 0.8).abs() < 1e-5);
+    }
+
+    #[test]
+    fn stereo_upmixes_to_fl_fr() {
+        let s = pack_to_surround51_interleaved(&[0.5, -0.25], 2);
+        assert_eq!(s, vec![0.5, -0.25, 0.0, 0.0, 0.0, 0.0]);
     }
 
     #[test]

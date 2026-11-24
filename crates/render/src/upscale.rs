@@ -14,7 +14,7 @@ use crate::dlss::{
     FgPresentFrame,
 };
 use crate::pipeline::VideoPipeline;
-use crate::present::{compute_present_fit_ex, PresentFilter, PresentFit};
+use crate::present::{compute_present_fit_mode, AspectMode, PresentFilter, PresentFit};
 
 /// Frames over budget before auto-disable.
 const OVER_BUDGET_LIMIT: u32 = 45;
@@ -130,6 +130,8 @@ pub struct UpscaleEngine {
     pub sharpness: f32,
     /// Present grade: brightness, contrast, gamma, lut_mix.
     pub grade: [f32; 4],
+    /// Present aspect policy (Contain / Fill / Stretch / …).
+    pub aspect: AspectMode,
     pub compute_ok: bool,
     pub block: UpscaleBlockReason,
     pub vendor: String,
@@ -467,6 +469,7 @@ impl UpscaleEngine {
             mode: UpscaleMode::Off,
             sharpness: 0.4,
             grade: [0.0, 1.0, 1.0, 0.0],
+            aspect: AspectMode::Auto,
             compute_ok,
             block,
             vendor,
@@ -526,6 +529,10 @@ impl UpscaleEngine {
 
     pub fn dlss_availability(&self) -> DlssAvailability {
         self.dlss.availability()
+    }
+
+    pub fn set_aspect_mode(&mut self, mode: AspectMode) {
+        self.aspect = mode;
     }
 
     pub fn set_grade(&mut self, grade: [f32; 4]) {
@@ -603,7 +610,7 @@ impl UpscaleEngine {
             (cw, ch)
         } else {
             // Snap near-1:1 / integer so FSR RCAS stays sharpen_only (no soft EASU).
-            target_size_ex(cw, ch, view_w, view_h, fill_viewport)
+            target_size_mode(cw, ch, view_w, view_h, fill_viewport, self.aspect)
         };
         let Some(src_bg) = video.bind_group_ref() else {
             return false;
@@ -697,7 +704,7 @@ impl UpscaleEngine {
         let (out_w, out_h) = if self.mode == UpscaleMode::Dlss {
             (src_w, src_h)
         } else {
-            target_size_ex(src_w, src_h, view_w, view_h, fill_viewport)
+            target_size_mode(src_w, src_h, view_w, view_h, fill_viewport, self.aspect)
         };
         self.ensure_slots(device, src_w, src_h, out_w, out_h);
 
@@ -914,7 +921,7 @@ impl UpscaleEngine {
             scale_offset,
             filter,
             ..
-        } = compute_present_fit_ex(out_w, out_h, view_w, view_h, fill_viewport);
+        } = compute_present_fit_mode(out_w, out_h, view_w, view_h, fill_viewport, self.aspect);
         let nearest = matches!(filter, PresentFilter::Nearest) as u32;
         queue.write_buffer(
             &self.present_buf,
@@ -1418,7 +1425,26 @@ pub fn target_size_ex(
     view_h: u32,
     fill_viewport: bool,
 ) -> (u32, u32) {
-    let fit = compute_present_fit_ex(content_w, content_h, view_w, view_h, fill_viewport);
+    target_size_mode(
+        content_w,
+        content_h,
+        view_w,
+        view_h,
+        fill_viewport,
+        AspectMode::Auto,
+    )
+}
+
+pub fn target_size_mode(
+    content_w: u32,
+    content_h: u32,
+    view_w: u32,
+    view_h: u32,
+    fill_viewport: bool,
+    aspect: AspectMode,
+) -> (u32, u32) {
+    let fit =
+        compute_present_fit_mode(content_w, content_h, view_w, view_h, fill_viewport, aspect);
     (fit.out_w, fit.out_h)
 }
 
