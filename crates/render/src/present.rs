@@ -8,6 +8,48 @@ pub enum PresentFilter {
     Linear,
 }
 
+/// Explicit present aspect policy (persisted in UI prefs).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum AspectMode {
+    /// Smart: 1:1 / integer× when crisp, else contain. F11 → contain.
+    #[default]
+    Auto,
+    /// Letterbox / pillarbox — always fit inside.
+    Contain,
+    /// Cover the viewport (crop overflow).
+    Fill,
+    /// Ignore aspect — stretch to viewport.
+    Stretch,
+    /// Always 1:1 pixel mapping (bars or crop).
+    Pixel,
+    /// Treat content as 16:9 (for letterboxed HDMI sources).
+    Force16x9,
+}
+
+impl AspectMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Contain => "contain",
+            Self::Fill => "fill",
+            Self::Stretch => "stretch",
+            Self::Pixel => "pixel",
+            Self::Force16x9 => "force16x9",
+        }
+    }
+
+    pub fn from_str_lossy(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "contain" => Self::Contain,
+            "fill" | "cover" => Self::Fill,
+            "stretch" => Self::Stretch,
+            "pixel" | "1:1" | "pixel1to1" => Self::Pixel,
+            "force16x9" | "16:9" | "force_16x9" => Self::Force16x9,
+            _ => Self::Auto,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct LetterboxUniforms {
     /// xy = content scale in UV, zw = offset in UV.
@@ -62,10 +104,40 @@ pub fn compute_present_fit_ex(
     view_h: u32,
     fill_viewport: bool,
 ) -> PresentFit {
-    let cw = content_w.max(1);
-    let ch = content_h.max(1);
+    compute_present_fit_mode(
+        content_w,
+        content_h,
+        view_w,
+        view_h,
+        fill_viewport,
+        AspectMode::Auto,
+    )
+}
+
+/// Present fit with an explicit [`AspectMode`]. F11 still forces Contain when mode is Auto.
+pub fn compute_present_fit_mode(
+    content_w: u32,
+    content_h: u32,
+    view_w: u32,
+    view_h: u32,
+    fill_viewport: bool,
+    mode: AspectMode,
+) -> PresentFit {
+    let (cw, ch) = match mode {
+        AspectMode::Force16x9 => force_16x9_size(content_w.max(1), content_h.max(1)),
+        _ => (content_w.max(1), content_h.max(1)),
+    };
     let vw = view_w.max(1);
     let vh = view_h.max(1);
+
+    // Explicit modes (except Auto) win over the smart path.
+    match mode {
+        AspectMode::Contain | AspectMode::Force16x9 => return contain_linear(cw, ch, vw, vh),
+        AspectMode::Fill => return cover_linear(cw, ch, vw, vh),
+        AspectMode::Stretch => return stretch_linear(cw, ch, vw, vh),
+        AspectMode::Pixel => return pixel_perfect(cw, ch, vw, vh),
+        AspectMode::Auto => {}
+    }
 
     // Exact (or near) 1:1 — nearest, no gutters.
     if near_dim(vw, cw) && near_dim(vh, ch) {
@@ -112,8 +184,37 @@ pub fn present_out_size_ex(
     (fit.out_w, fit.out_h)
 }
 
+pub fn present_out_size_mode(
+    content_w: u32,
+    content_h: u32,
+    view_w: u32,
+    view_h: u32,
+    fill_viewport: bool,
+    mode: AspectMode,
+) -> (u32, u32) {
+    let fit = compute_present_fit_mode(content_w, content_h, view_w, view_h, fill_viewport, mode);
+    (fit.out_w, fit.out_h)
+}
+
 fn near_dim(a: u32, b: u32) -> bool {
     (a as i32 - b as i32).abs() <= NEAR_1TO1_PX
+}
+
+/// Remap content size so the fitted rectangle is 16:9 (pillar/letter from real pixels).
+fn force_16x9_size(cw: u32, ch: u32) -> (u32, u32) {
+    let aspect = cw as f32 / ch.max(1) as f32;
+    const TARGET: f32 = 16.0 / 9.0;
+    if (aspect - TARGET).abs() < 0.01 {
+        return (cw, ch);
+    }
+    if aspect > TARGET {
+        // Wider than 16:9 — keep height, shrink width for the virtual canvas.
+        let w = ((ch as f32) * TARGET).round().max(1.0) as u32;
+        (w, ch)
+    } else {
+        let h = ((cw as f32) / TARGET).round().max(1.0) as u32;
+        (cw, h)
+    }
 }
 
 /// 1:1 pixel mapping centered in the viewport (crop when content > view).
@@ -176,6 +277,49 @@ fn contain_linear(content_w: u32, content_h: u32, view_w: u32, view_h: u32) -> P
         filter: PresentFilter::Linear,
         out_w,
         out_h,
+    }
+}
+
+/// Cover: scale so content fills the viewport (crop overflow).
+fn cover_linear(content_w: u32, content_h: u32, view_w: u32, view_h: u32) -> PresentFit {
+    let cw = content_w.max(1) as f32;
+    let ch = content_h.max(1) as f32;
+    let vw = view_w.max(1) as f32;
+    let vh = view_h.max(1) as f32;
+
+    let content_aspect = cw / ch;
+    let view_aspect = vw / vh;
+
+    let (scale_x, scale_y) = if view_aspect > content_aspect {
+        // Fit width, crop height.
+        let sy = view_aspect / content_aspect;
+        (1.0, sy)
+    } else {
+        // Fit height, crop width.
+        let sx = content_aspect / view_aspect;
+        (sx, 1.0)
+    };
+
+    let offset_x = (1.0 - scale_x) * 0.5;
+    let offset_y = (1.0 - scale_y) * 0.5;
+    let out_w = (vw * scale_x.abs()).round().max(1.0) as u32;
+    let out_h = (vh * scale_y.abs()).round().max(1.0) as u32;
+
+    PresentFit {
+        scale_offset: [scale_x, scale_y, offset_x, offset_y],
+        filter: PresentFilter::Linear,
+        out_w: out_w.min(view_w.max(1)),
+        out_h: out_h.min(view_h.max(1)),
+    }
+}
+
+fn stretch_linear(content_w: u32, content_h: u32, view_w: u32, view_h: u32) -> PresentFit {
+    let _ = (content_w, content_h);
+    PresentFit {
+        scale_offset: [1.0, 1.0, 0.0, 0.0],
+        filter: PresentFilter::Linear,
+        out_w: view_w.max(1),
+        out_h: view_h.max(1),
     }
 }
 
@@ -250,5 +394,21 @@ mod tests {
         assert!(fit.out_w > 1920 && fit.out_h > 1080);
         assert!((fit.scale_offset[0] - 1.0).abs() < 1e-3);
         assert!((fit.scale_offset[1] - 1.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn stretch_fills_viewport() {
+        let fit = compute_present_fit_mode(1920, 1080, 1280, 1024, false, AspectMode::Stretch);
+        assert!((fit.scale_offset[0] - 1.0).abs() < 1e-5);
+        assert!((fit.scale_offset[1] - 1.0).abs() < 1e-5);
+        assert_eq!((fit.out_w, fit.out_h), (1280, 1024));
+    }
+
+    #[test]
+    fn contain_mode_letterboxes() {
+        let fit = compute_present_fit_mode(1920, 1080, 1920, 1200, false, AspectMode::Contain);
+        assert_eq!(fit.filter, PresentFilter::Linear);
+        assert!((fit.scale_offset[0] - 1.0).abs() < 1e-3);
+        assert!(fit.scale_offset[1] < 1.0);
     }
 }

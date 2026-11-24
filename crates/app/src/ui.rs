@@ -132,6 +132,21 @@ pub struct OverlayState {
     pub soft_black: bool,
     pub audio_notice: String,
     pub level: f32,
+    /// Per-channel VU (L/R; C/LFE when multi-ch capture is open).
+    pub level_left: f32,
+    pub level_right: f32,
+    pub level_center: f32,
+    pub level_lfe: f32,
+    /// Preferred output mode from prefs (stereo / surround51).
+    pub audio_output_mode: String,
+    pub audio_downmix_51: bool,
+    pub audio_output_channels: u16,
+    pub audio_output_max_channels: u16,
+    pub audio_effective_mode: String,
+    pub audio_downmix_active: bool,
+    pub audio_surround_unavailable: bool,
+    /// Stereo-only capture card hint (HD60 / 2ch WASAPI).
+    pub audio_stereo_card_hint: bool,
     pub toast: String,
     /// Visual severity for the status toast banner.
     pub toast_kind: ToastKind,
@@ -169,6 +184,10 @@ pub struct OverlayState {
     pub fps_history: Vec<f32>,
     /// Recent 1% low FPS for the FPS graph.
     pub fps_1pct_history: Vec<f32>,
+    /// Recent capture→present latency (ms) for the latency sparkline.
+    pub latency_history: Vec<f32>,
+    /// Present aspect mode string (auto/contain/fill/stretch/pixel/force16x9).
+    pub aspect_mode: String,
     /// Live capture audio channel count (0 when idle / muted source).
     pub audio_input_channels: u16,
     /// Live capture sample rate in Hz.
@@ -245,6 +264,18 @@ impl Default for OverlayState {
             soft_black: false,
             audio_notice: String::new(),
             level: 0.0,
+            level_left: 0.0,
+            level_right: 0.0,
+            level_center: 0.0,
+            level_lfe: 0.0,
+            audio_output_mode: "stereo".into(),
+            audio_downmix_51: true,
+            audio_output_channels: 0,
+            audio_output_max_channels: 0,
+            audio_effective_mode: "stereo".into(),
+            audio_downmix_active: false,
+            audio_surround_unavailable: false,
+            audio_stereo_card_hint: false,
             toast: String::new(),
             toast_kind: ToastKind::Neutral,
             toast_clip: false,
@@ -270,6 +301,8 @@ impl Default for OverlayState {
             vram_history: Vec::new(),
             fps_history: Vec::new(),
             fps_1pct_history: Vec::new(),
+            latency_history: Vec::new(),
+            aspect_mode: "auto".into(),
             audio_input_channels: 0,
             audio_input_rate_hz: 0,
             audio_output_rate_hz: 0,
@@ -325,6 +358,8 @@ pub struct AudioUiState {
     pub muted: bool,
     pub delay_ms: f32,
     pub buffer_ms: f32,
+    pub output_mode: String,
+    pub downmix_51_to_stereo: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -381,6 +416,11 @@ pub struct UiActions {
     pub mute_toggled: Option<bool>,
     pub delay_changed: Option<f32>,
     pub buffer_changed: Option<f32>,
+    /// "stereo" | "surround51"
+    pub audio_output_mode_changed: Option<&'static str>,
+    pub audio_downmix_changed: Option<bool>,
+    /// Present aspect: auto | contain | fill | stretch | pixel | force16x9
+    pub aspect_mode_changed: Option<&'static str>,
     pub open_settings: Option<SettingsTab>,
     pub close_settings: bool,
     pub toggle_advanced: bool,
@@ -957,6 +997,47 @@ fn draw_image_tab(ui: &mut egui::Ui, input: &DrawInput<'_>, actions: &mut UiActi
     option_block(
         ui,
         i18n,
+        &i18n.t("label_aspect_mode"),
+        &i18n.t("explain_aspect_mode"),
+        &i18n.t("tip_aspect_mode"),
+        Impact::None,
+        Impact::None,
+        |ui| {
+            let current = input.overlay.aspect_mode.as_str();
+            egui::ComboBox::from_id_salt("set_aspect")
+                .selected_text(match current {
+                    "contain" => i18n.t("aspect_contain"),
+                    "fill" => i18n.t("aspect_fill"),
+                    "stretch" => i18n.t("aspect_stretch"),
+                    "pixel" => i18n.t("aspect_pixel"),
+                    "force16x9" => i18n.t("aspect_force16x9"),
+                    _ => i18n.t("aspect_auto"),
+                })
+                .width(280.0)
+                .show_ui(ui, |ui| {
+                    for (id, key) in [
+                        ("auto", "aspect_auto"),
+                        ("contain", "aspect_contain"),
+                        ("fill", "aspect_fill"),
+                        ("stretch", "aspect_stretch"),
+                        ("pixel", "aspect_pixel"),
+                        ("force16x9", "aspect_force16x9"),
+                    ] {
+                        if ui
+                            .selectable_label(current == id, i18n.t(key))
+                            .clicked()
+                            && current != id
+                        {
+                            actions.aspect_mode_changed = Some(id);
+                        }
+                    }
+                });
+        },
+    );
+
+    option_block(
+        ui,
+        i18n,
         &i18n.t("label_device"),
         &i18n.t("explain_device"),
         &i18n.t("tip_device"),
@@ -1139,6 +1220,17 @@ fn draw_image_tab(ui: &mut egui::Ui, input: &DrawInput<'_>, actions: &mut UiActi
     });
 }
 
+fn draw_vu_bar(ui: &mut egui::Ui, label: &str, level: f32) {
+    ui.vertical(|ui| {
+        ui.small(label);
+        ui.add(
+            egui::ProgressBar::new(level.clamp(0.0, 1.0))
+                .desired_width(48.0)
+                .desired_height(10.0),
+        );
+    });
+}
+
 fn draw_sound_tab(ui: &mut egui::Ui, input: &DrawInput<'_>, actions: &mut UiActions) {
     let i18n = input.i18n;
     let audio = input.audio;
@@ -1224,12 +1316,81 @@ fn draw_sound_tab(ui: &mut egui::Ui, input: &DrawInput<'_>, actions: &mut UiActi
         {
             actions.volume_changed = Some(vol);
         }
-        ui.add(
-            egui::ProgressBar::new(input.overlay.level.clamp(0.0, 1.0))
-                .desired_width(70.0)
-                .text(i18n.t("label_level")),
-        );
     });
+
+    // Stereo (and optional C/LFE) VU meters.
+    ui.horizontal(|ui| {
+        ui.label(i18n.t("label_vu"));
+        draw_vu_bar(ui, "L", input.overlay.level_left);
+        draw_vu_bar(ui, "R", input.overlay.level_right);
+        if input.overlay.audio_input_channels >= 6 || input.overlay.level_center > 0.02 {
+            draw_vu_bar(ui, "C", input.overlay.level_center);
+            draw_vu_bar(ui, "LFE", input.overlay.level_lfe);
+        }
+    });
+
+    option_block(
+        ui,
+        i18n,
+        &i18n.t("label_audio_output_mode"),
+        &i18n.t("explain_audio_output_mode"),
+        &i18n.t("tip_audio_output_mode"),
+        Impact::None,
+        Impact::None,
+        |ui| {
+            let current = audio.output_mode.as_str();
+            ui.horizontal(|ui| {
+                for (id, key) in [
+                    ("stereo", "audio_mode_stereo"),
+                    ("surround51", "audio_mode_51"),
+                ] {
+                    if ui
+                        .selectable_label(current == id, i18n.t(key))
+                        .clicked()
+                        && current != id
+                    {
+                        actions.audio_output_mode_changed = Some(id);
+                    }
+                }
+            });
+            let max_ch = input.overlay.audio_output_max_channels;
+            if current == "surround51" && max_ch > 0 && max_ch < 6 {
+                ui.colored_label(
+                    Color32::from_rgb(220, 160, 80),
+                    i18n.t("audio_51_unavailable"),
+                );
+                ui.label(
+                    RichText::new(i18n.t("tip_audio_51_unavailable"))
+                        .small()
+                        .weak(),
+                );
+            }
+        },
+    );
+
+    let mut downmix = audio.downmix_51_to_stereo;
+    if ui
+        .checkbox(&mut downmix, i18n.t("label_audio_downmix"))
+        .on_hover_text(i18n.t("tip_audio_downmix"))
+        .changed()
+    {
+        actions.audio_downmix_changed = Some(downmix);
+    }
+
+    if input.overlay.audio_stereo_card_hint {
+        ui.add_space(4.0);
+        egui::Frame::NONE
+            .fill(Color32::from_rgb(48, 40, 22))
+            .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(200, 150, 60)))
+            .corner_radius(egui::CornerRadius::same(4))
+            .inner_margin(egui::Margin::symmetric(8, 6))
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new(i18n.t("banner_stereo_card"))
+                        .color(Color32::from_rgb(255, 220, 140)),
+                );
+            });
+    }
 
     // Live capture format — helps diagnose Switch 2 5.1 vs stereo-only cards (HD60).
     let ch = input.overlay.audio_input_channels;
@@ -1249,11 +1410,23 @@ fn draw_sound_tab(ui: &mut egui::Ui, input: &DrawInput<'_>, actions: &mut UiActi
             ch_label,
             in_hz
         ));
+        let eff = match input.overlay.audio_effective_mode.as_str() {
+            "surround51" => i18n.t("audio_mode_51"),
+            _ => i18n.t("audio_mode_stereo"),
+        };
+        let out_ch = input.overlay.audio_output_channels;
         if out_hz > 0 {
             ui.label(format!(
-                "{}: {} Hz",
-                i18n.t("label_audio_output_rate"),
-                out_hz
+                "{}: {} · {} ch · {} Hz{}",
+                i18n.t("label_audio_effective_out"),
+                eff,
+                out_ch.max(2),
+                out_hz,
+                if input.overlay.audio_downmix_active {
+                    format!(" · {}", i18n.t("audio_downmix_on"))
+                } else {
+                    String::new()
+                }
             ));
         }
         ui.label(
@@ -1921,6 +2094,9 @@ fn draw_monitor_prefs(
         changed |= ui
             .checkbox(&mut next.graph_fps_1pct, i18n.t("mon_graph_fps_1pct"))
             .changed();
+        changed |= ui
+            .checkbox(&mut next.graph_latency, i18n.t("mon_graph_latency"))
+            .changed();
     });
     ui.horizontal_wrapped(|ui| {
         changed |= ui
@@ -2014,6 +2190,8 @@ fn draw_compact_hud(ctx: &Context, i18n: &I18n, overlay: &OverlayState) {
         .corner_radius(egui::CornerRadius::same(6))
         .inner_margin(egui::Margin::symmetric(10, 8))
         .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(60, 70, 90)));
+    let budget_ms = 16.7f32;
+    let lat_warn = overlay.pipeline_delay_ms > budget_ms * 1.5;
     egui::Window::new("hud_compact")
         .title_bar(false)
         .resizable(false)
@@ -2032,8 +2210,24 @@ fn draw_compact_hud(ctx: &Context, i18n: &I18n, overlay: &OverlayState) {
                     overlay.pipeline_delay_ms
                 ))
                 .monospace()
-                .size(13.0),
+                .size(13.0)
+                .color(if lat_warn {
+                    Color32::from_rgb(255, 180, 100)
+                } else {
+                    Color32::WHITE
+                }),
             );
+            if overlay.monitor.graph_latency && !overlay.latency_history.is_empty() {
+                draw_sparkline(ui, &overlay.latency_history, budget_ms * 2.0, |ms| {
+                    if ms > budget_ms * 1.5 {
+                        Color32::from_rgb(220, 100, 90)
+                    } else if ms > budget_ms {
+                        Color32::from_rgb(220, 180, 80)
+                    } else {
+                        Color32::from_rgb(90, 180, 140)
+                    }
+                });
+            }
             if overlay.health.kind != CaptureHealthKind::Ok {
                 ui.colored_label(
                     Color32::from_rgb(255, 180, 100),
@@ -2842,6 +3036,29 @@ fn draw_monitor_graphs(ui: &mut egui::Ui, i18n: &I18n, o: &OverlayState) {
         }
         if o.fps_history.is_empty() && o.fps_1pct_history.is_empty() {
             ui.weak("—");
+        }
+    }
+    if m.graph_latency {
+        ui.add_space(4.0);
+        let budget = 16.7f32;
+        ui.label(format!(
+            "{} · {:.1} ms (budget {:.0})",
+            i18n.t("label_graph_latency"),
+            o.pipeline_delay_ms,
+            budget
+        ));
+        if o.latency_history.is_empty() {
+            ui.weak("—");
+        } else {
+            draw_sparkline(ui, &o.latency_history, budget * 2.0, |ms| {
+                if ms > budget * 1.5 {
+                    Color32::from_rgb(220, 100, 90)
+                } else if ms > budget {
+                    Color32::from_rgb(220, 180, 80)
+                } else {
+                    Color32::from_rgb(90, 180, 140)
+                }
+            });
         }
     }
     if m.cpu_cores {

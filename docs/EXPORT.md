@@ -48,7 +48,7 @@ Live monitoring (WASAPI via cpal) prefers a **stereo** input config when the cap
 | **NZXT Signal HD60** | HDMI capture: **2 ch stereo, 16-bit, 48 kHz** only ([manual](https://cdn-g.nzxt.com/dl/1676419258-streaming_sprite_signal_hd60_digital-manual_v2_en_2211.pdf)) |
 | **Nintendo Switch 2** (TV/dock) | HDMI: **Linear PCM** — System Settings → Audio → TV Sound: Automatic / **Stereo** / **Linear PCM 5.1 Surround** ([Nintendo specs](https://www.nintendo.com/us/gaming-systems/switch-2/tech-specs/)) |
 
-**Conclusion:** Quiet live cutscene voices with headset-on-Switch OK are usually **card / HDMI mix**, not a KapturKard center drop. The HD60 cannot capture discrete 5.1; if Switch 2 is set to LPCM 5.1, the card’s stereo path may keep only FL/FR and under-represent center dialogue. Prefer **TV Sound → Stereo** on Switch 2 when capturing with HD60. In-app Sound shows live **channels + Hz** so you can confirm what WASAPI opened.
+**Conclusion:** Quiet live cutscene voices with headset-on-Switch OK are usually **card / HDMI mix**, not a KapturKard center drop. The HD60 cannot capture discrete 5.1; if Switch 2 is set to LPCM 5.1, the card’s stereo path may keep only FL/FR and under-represent center dialogue. Prefer **TV Sound → Stereo** on Switch 2 when capturing with HD60. In-app Sound shows live **channels + Hz**, **output mode (Stereo / 5.1)**, and an explicit **Downmix 5.1 → Stereo** (full center, default ON). Stereo-only cards also get a hint banner.
 
 **How to verify if voices stay quiet after this release:**
 

@@ -10,7 +10,7 @@ use crossbeam_channel::{Receiver, TryRecvError};
 
 use audio::{
     list_inputs, list_outputs, suggest_input_for_video, AudioDeviceInfo, AudioEngine,
-    AudioEngineConfig, AudioReplayTap, SharedReplayTap, NONE_INPUT_ID,
+    AudioEngineConfig, AudioReplayTap, OutputMode, SharedReplayTap, NONE_INPUT_ID,
 };
 use capture::{
     hz_label, modes, CaptureError, CaptureMode, DeviceInfo, FormatDesc, FrameReceiver, FrameWake,
@@ -23,9 +23,9 @@ use render::pipeline::VideoPipeline;
 use render::upload::upload_frame;
 use render::{
     is_native_or_downscale, pick_present_mode, pick_surface_format, resolve_color_convert,
-    ColorMatrixMode, ColorRangeMode, DeinterlaceEngine, DeinterlaceMode, DlssGMultiplier,
-    InterpBlockReason, InterpMode, InterpolateEngine, PresentCaps, UpscaleBlockReason,
-    UpscaleEngine, UpscaleMode,
+    AspectMode, ColorMatrixMode, ColorRangeMode, DeinterlaceEngine, DeinterlaceMode,
+    DlssGMultiplier, InterpBlockReason, InterpMode, InterpolateEngine, PresentCaps,
+    UpscaleBlockReason, UpscaleEngine, UpscaleMode,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -351,6 +351,8 @@ impl Default for App {
             muted: prefs.muted,
             delay_ms: prefs.delay_ms,
             buffer_ms: prefs.buffer_ms,
+            output_mode: prefs.output_mode.clone(),
+            downmix_51_to_stereo: prefs.downmix_51_to_stereo,
         };
         let ui_prefs = ui_prefs_early;
         let i18n = I18n::load_pref(&ui_prefs.ui_language);
@@ -697,6 +699,7 @@ impl ApplicationHandler<UserEvent> for App {
         self.effects_ui.interp_compute_ok = gpu.interpolate.compute_ok;
         self.effects_ui.hdr_output = self.ui_prefs.hdr_output;
         self.gpu = Some(gpu);
+        self.apply_aspect_mode();
         self.apply_color_convert();
         self.apply_present_mode_for_profile();
         self.sync_present_overlay();
@@ -1011,6 +1014,7 @@ impl App {
         let dlssg = DlssGMultiplier::from_str_lossy(&self.effects_ui.dlssg_multiplier);
         let interp = InterpMode::from_str_lossy(&self.effects_ui.interp_mode);
         let blur = self.effects_ui.interp_motion_blur;
+        let aspect = AspectMode::from_str_lossy(&self.ui_prefs.aspect_mode);
 
         let mut rebuilt_meta: Option<(String, String, bool, bool)> = None;
         let rebuilt = {
@@ -1047,8 +1051,10 @@ impl App {
                 gpu.upscale.set_sharpness(sharpness);
                 gpu.upscale.dlss.set_boost(dlss_boost);
                 gpu.upscale.dlss.set_fg_multiplier(dlssg);
+                gpu.upscale.set_aspect_mode(aspect);
                 gpu.interpolate.set_mode(interp);
                 gpu.interpolate.set_motion_blur(blur);
+                gpu.interpolate.set_aspect_mode(aspect);
                 rebuilt_meta = Some((
                     gpu.upscale.vendor.clone(),
                     gpu.upscale.backend.clone(),
@@ -1413,6 +1419,8 @@ impl App {
             muted: self.audio_ui.muted,
             delay_ms: self.audio_ui.delay_ms,
             buffer_ms: self.audio_ui.buffer_ms,
+            output_mode: OutputMode::from_str_lossy(&self.audio_ui.output_mode),
+            downmix_51_to_stereo: self.audio_ui.downmix_51_to_stereo,
         }
     }
 
@@ -1448,6 +1456,8 @@ impl App {
             muted: self.audio_ui.muted,
             delay_ms: self.audio_ui.delay_ms,
             buffer_ms: self.audio_ui.buffer_ms,
+            output_mode: self.audio_ui.output_mode.clone(),
+            downmix_51_to_stereo: self.audio_ui.downmix_51_to_stereo,
         });
     }
 
@@ -1582,8 +1592,21 @@ impl App {
             self.audio.set_buffer_ms(b);
             self.persist_audio_prefs();
         }
+        if let Some(mode) = actions.audio_output_mode_changed {
+            self.audio_ui.output_mode = mode.to_string();
+            audio_restart = true;
+        }
+        if let Some(on) = actions.audio_downmix_changed {
+            self.audio_ui.downmix_51_to_stereo = on;
+            audio_restart = true;
+        }
         if audio_restart {
             self.restart_audio();
+        }
+        if let Some(mode) = actions.aspect_mode_changed {
+            self.ui_prefs.aspect_mode = mode.to_string();
+            self.apply_aspect_mode();
+            self.persist_ui_prefs();
         }
 
         if let Some(tab) = actions.open_settings {
@@ -2104,6 +2127,15 @@ impl App {
         gpu.window.set_window_level(level);
     }
 
+    fn apply_aspect_mode(&mut self) {
+        let mode = AspectMode::from_str_lossy(&self.ui_prefs.aspect_mode);
+        if let Some(gpu) = self.gpu.as_mut() {
+            gpu.upscale.set_aspect_mode(mode);
+            gpu.interpolate.set_aspect_mode(mode);
+        }
+        self.overlay.aspect_mode = mode.as_str().into();
+    }
+
     fn apply_named_profile(&mut self, id: &str) {
         self.ui_prefs.profiles.ensure_builtins();
         let Some(profile) = self.ui_prefs.profiles.get(id).cloned() else {
@@ -2126,6 +2158,17 @@ impl App {
         self.ui_prefs.hdr_output = profile.hdr_output;
         self.ui_prefs.monitor = profile.monitor.clone();
         self.ui_prefs.profiles.active = profile.id.clone();
+        // Switch dock: soft NIS, stereo audio + downmix, Spout 60, contain aspect.
+        if profile.id == "switch_dock" {
+            self.ui_prefs.aspect_mode = "contain".into();
+            self.audio_ui.output_mode = "stereo".into();
+            self.audio_ui.downmix_51_to_stereo = true;
+            self.export.prefs.spout_fps = 60;
+            self.ui_prefs.export.spout_fps = 60;
+            self.export.sync_active_flags();
+            self.persist_audio_prefs();
+            self.restart_audio();
+        }
         if let Some(gpu) = self.gpu.as_mut() {
             gpu.upscale
                 .set_mode(UpscaleMode::from_str_lossy(&profile.upscale_mode));
@@ -2138,6 +2181,7 @@ impl App {
                 .dlss
                 .set_fg_multiplier(DlssGMultiplier::from_str_lossy(&profile.dlssg_multiplier));
         }
+        self.apply_aspect_mode();
         self.apply_present_mode_for_profile();
         self.refresh_os_display_caps(true);
         self.apply_hdr_output();
@@ -2921,6 +2965,11 @@ impl App {
                 self.cached_one_percent_low,
                 FPS_HISTORY,
             );
+            push_history(
+                &mut self.overlay.latency_history,
+                self.overlay.pipeline_delay_ms,
+                FPS_HISTORY,
+            );
         } else {
             self.overlay.one_percent_low_fps = self.cached_one_percent_low;
         }
@@ -2958,12 +3007,37 @@ impl App {
         self.overlay.no_signal = no_signal;
         self.overlay.device_busy = device_busy;
         self.overlay.soft_black = soft_black;
-        self.overlay.level = self.audio.meter().take_peak();
+        let peaks = self.audio.meter().take_peaks();
+        self.overlay.level = peaks.peak;
+        self.overlay.level_left = peaks.left;
+        self.overlay.level_right = peaks.right;
+        self.overlay.level_center = peaks.center;
+        self.overlay.level_lfe = peaks.lfe;
         let audio_st = self.audio.status();
         self.overlay.audio_notice = audio_st.notice.clone();
         self.overlay.audio_input_channels = audio_st.input_channels;
         self.overlay.audio_input_rate_hz = audio_st.input_rate;
         self.overlay.audio_output_rate_hz = audio_st.output_rate;
+        self.overlay.audio_output_channels = audio_st.output_channels;
+        self.overlay.audio_output_max_channels = audio_st.output_device_max_channels;
+        self.overlay.audio_output_mode = self.audio_ui.output_mode.clone();
+        self.overlay.audio_downmix_51 = self.audio_ui.downmix_51_to_stereo;
+        self.overlay.audio_effective_mode = audio_st.effective_output_mode.as_str().into();
+        self.overlay.audio_downmix_active = audio_st.downmix_active;
+        self.overlay.audio_surround_unavailable = audio_st.surround_unavailable;
+        self.overlay.aspect_mode = self.ui_prefs.aspect_mode.clone();
+        // HD60 / stereo-only capture hint for known cards (and generic HDMI capture names).
+        let in_name = self
+            .audio_inputs
+            .iter()
+            .find(|d| d.id == self.audio_ui.input_id)
+            .map(|d| d.display_name.to_ascii_lowercase())
+            .unwrap_or_default();
+        let looks_stereo_card = ["hd60", "signal", "nzxt", "elgato", "avermedia", "capture", "hdmi"]
+            .iter()
+            .any(|n| in_name.contains(n));
+        self.overlay.audio_stereo_card_hint =
+            audio_st.running && audio_st.input_channels == 2 && looks_stereo_card;
         if let Some(until) = self.toast_until {
             if Instant::now() > until {
                 self.overlay.toast.clear();
@@ -3034,6 +3108,7 @@ impl App {
         let mut actions = ui::UiActions::default();
         let display_period =
             Duration::from_secs_f64(1.0 / self.target_display_hz());
+        let aspect = AspectMode::from_str_lossy(&self.ui_prefs.aspect_mode);
         {
         let Some(gpu) = self.gpu.as_mut() else {
             return;
@@ -3060,11 +3135,12 @@ impl App {
 
         // Use cloned chrome — self.gpu is already mutably borrowed.
         let fill_viewport = chrome.fullscreen;
-        gpu.pipeline.update_letterbox(
+        gpu.pipeline.update_letterbox_mode(
             &gpu.queue,
             gpu.config.width,
             gpu.config.height,
             fill_viewport,
+            aspect,
         );
 
         let frame = match gpu.surface.get_current_texture() {

@@ -26,7 +26,8 @@ pub use interpolate::{
     InterpBlockReason, InterpFrame, InterpMode, InterpolateEngine, InterpStatus,
 };
 pub use present::{
-    compute_present_fit, compute_present_fit_ex, PresentFilter, PresentFit,
+    compute_present_fit, compute_present_fit_ex, compute_present_fit_mode, AspectMode,
+    PresentFilter, PresentFit,
 };
 pub use swapchain::{
     format_label, pick_present_mode, pick_surface_format, present_mode_label, PresentCaps,

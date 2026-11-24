@@ -113,6 +113,20 @@ pub fn list_outputs() -> Result<Vec<AudioDeviceInfo>, AudioError> {
     Ok(out)
 }
 
+/// Highest channel count reported by any supported output config (0 if unknown).
+pub fn max_output_channels(dev: &cpal::Device) -> u16 {
+    let mut max = 0u16;
+    if let Ok(cfg) = dev.default_output_config() {
+        max = max.max(cfg.channels());
+    }
+    if let Ok(configs) = dev.supported_output_configs() {
+        for range in configs {
+            max = max.max(range.channels());
+        }
+    }
+    max
+}
+
 pub fn default_output_id() -> Option<String> {
     let host = cpal::default_host();
     let name = host.default_output_device()?.name().ok()?;

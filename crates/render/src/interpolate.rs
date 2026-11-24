@@ -7,7 +7,7 @@ use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
 use crate::pipeline::VideoPipeline;
-use crate::present::{compute_present_fit_ex, PresentFilter, PresentFit};
+use crate::present::{compute_present_fit_mode, AspectMode, PresentFilter, PresentFit};
 
 const OVER_BUDGET_LIMIT: u32 = 45;
 /// Display present dt is not GPU cost — only trip on real stalls (Arthur: CPU spin).
@@ -108,6 +108,8 @@ pub struct InterpolateEngine {
     pub motion_blur: f32,
     /// Present grade (mirrors upscale path).
     pub grade: [f32; 4],
+    /// Present aspect policy.
+    pub aspect: AspectMode,
     over_budget_streak: u32,
     auto_disabled: bool,
     /// After presenting Mid, the next present must show Curr (x2 cadence).
@@ -356,6 +358,7 @@ impl InterpolateEngine {
             last_gpu_ms: 0.0,
             motion_blur: 0.0,
             grade: [0.0, 1.0, 1.0, 0.0],
+            aspect: AspectMode::Auto,
             over_budget_streak: 0,
             auto_disabled: false,
             owed_curr: false,
@@ -389,6 +392,10 @@ impl InterpolateEngine {
             last_gpu_ms: self.last_gpu_ms,
             showing_mid: false,
         }
+    }
+
+    pub fn set_aspect_mode(&mut self, mode: AspectMode) {
+        self.aspect = mode;
     }
 
     pub fn set_mode(&mut self, mode: InterpMode) {
@@ -720,7 +727,7 @@ impl InterpolateEngine {
             scale_offset,
             filter,
             ..
-        } = compute_present_fit_ex(content.0, content.1, view_w, view_h, fill_viewport);
+        } = compute_present_fit_mode(content.0, content.1, view_w, view_h, fill_viewport, self.aspect);
         let nearest = matches!(filter, PresentFilter::Nearest) as u32;
         queue.write_buffer(
             &self.present_buf,
