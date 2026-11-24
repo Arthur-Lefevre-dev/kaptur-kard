@@ -13,6 +13,7 @@ mod discord_presence;
 mod display_caps;
 mod export;
 mod health;
+mod hotkeys;
 mod i18n;
 mod logging;
 mod lut;

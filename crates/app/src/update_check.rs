@@ -182,7 +182,8 @@ fn fetch_latest(current: &str) -> UpdateMsg {
     UpdateMsg::Ok {
         tag: release.tag_name,
         html_url: release.html_url,
-        body: release.body.chars().take(800).collect(),
+        // Keep enough of the release / CHANGELOG body for the in-app patch-notes panel.
+        body: release.body.chars().take(6000).collect(),
         newer,
     }
 }

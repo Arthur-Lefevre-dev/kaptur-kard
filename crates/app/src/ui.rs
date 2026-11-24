@@ -8,6 +8,7 @@ use egui::{Color32, Context, Key, Modifiers, RichText, Sense};
 
 use crate::export::ExportStatus;
 use crate::health::{CaptureHealthKind, CaptureHealthUi};
+use crate::hotkeys::{first_pressed_key, is_reserved, HotkeyAction, HotkeysPrefs};
 use crate::i18n::I18n;
 use crate::lut::GradePrefs;
 use crate::prefs::MonitorPrefs;
@@ -23,9 +24,12 @@ pub enum SettingsTab {
     Info,
     /// Replay buffer + saved clips (after Infos).
     Clips,
+    /// Remappable keyboard shortcuts (after Clips).
+    Keys,
 }
 
 /// F2 cycles metrics only (Off → Simple → Detailed → Off). F1 toggles settings.
+/// F3 toggles the compact FPS HUD. F4 toggles the audio VU HUD.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum MetricsMode {
     #[default]
@@ -132,11 +136,27 @@ pub struct OverlayState {
     pub soft_black: bool,
     pub audio_notice: String,
     pub level: f32,
-    /// Per-channel VU (L/R; C/LFE when multi-ch capture is open).
+    /// Per-channel VU (L/R; C/Ls/Rs/LFE when multi-ch capture is open).
     pub level_left: f32,
     pub level_right: f32,
     pub level_center: f32,
     pub level_lfe: f32,
+    pub level_ls: f32,
+    pub level_rs: f32,
+    /// Peak-hold needles (slow decay) for Sound tab + F4 HUD.
+    pub peak_hold_left: f32,
+    pub peak_hold_right: f32,
+    pub peak_hold_center: f32,
+    pub peak_hold_lfe: f32,
+    pub peak_hold_ls: f32,
+    pub peak_hold_rs: f32,
+    /// Recent per-channel levels for F4 graphs.
+    pub level_left_history: Vec<f32>,
+    pub level_right_history: Vec<f32>,
+    pub level_center_history: Vec<f32>,
+    pub level_lfe_history: Vec<f32>,
+    pub level_ls_history: Vec<f32>,
+    pub level_rs_history: Vec<f32>,
     /// Preferred output mode from prefs (stereo / surround51).
     pub audio_output_mode: String,
     pub audio_downmix_51: bool,
@@ -205,6 +225,8 @@ pub struct OverlayState {
     /// Compact HUD visible (F3), independent of F2 metrics mode.
     pub hud_enabled: bool,
     pub hud_always_on_top: bool,
+    /// Audio visualization HUD visible (F4).
+    pub audio_hud_enabled: bool,
     pub replay_enabled: bool,
     pub replay_seconds: u32,
     pub replay_frames: u32,
@@ -268,6 +290,20 @@ impl Default for OverlayState {
             level_right: 0.0,
             level_center: 0.0,
             level_lfe: 0.0,
+            level_ls: 0.0,
+            level_rs: 0.0,
+            peak_hold_left: 0.0,
+            peak_hold_right: 0.0,
+            peak_hold_center: 0.0,
+            peak_hold_lfe: 0.0,
+            peak_hold_ls: 0.0,
+            peak_hold_rs: 0.0,
+            level_left_history: Vec::new(),
+            level_right_history: Vec::new(),
+            level_center_history: Vec::new(),
+            level_lfe_history: Vec::new(),
+            level_ls_history: Vec::new(),
+            level_rs_history: Vec::new(),
             audio_output_mode: "stereo".into(),
             audio_downmix_51: true,
             audio_output_channels: 0,
@@ -315,6 +351,7 @@ impl Default for OverlayState {
             lag_flash: false,
             hud_enabled: false,
             hud_always_on_top: false,
+            audio_hud_enabled: false,
             replay_enabled: false,
             replay_seconds: 8,
             replay_frames: 0,
@@ -382,6 +419,8 @@ pub struct UiChrome {
     pub update_popup_open: bool,
     /// Capture-preview style: hide OS cursor after pointer idle over the window.
     pub hide_idle_cursor: bool,
+    /// Keys tab: waiting for a key press to rebind this action.
+    pub hotkey_rebind: Option<HotkeyAction>,
 }
 
 impl Default for UiChrome {
@@ -400,6 +439,7 @@ impl Default for UiChrome {
             launch_tips_alpha: 0.0,
             update_popup_open: false,
             hide_idle_cursor: false,
+            hotkey_rebind: None,
         }
     }
 }
@@ -473,6 +513,14 @@ pub struct UiActions {
     pub toggle_hud: bool,
     pub hud_enabled_changed: Option<bool>,
     pub hud_always_on_top_changed: Option<bool>,
+    pub toggle_audio_hud: bool,
+    pub audio_hud_enabled_changed: Option<bool>,
+    /// Start listening for a new binding (Keys tab).
+    pub hotkey_rebind_start: Option<HotkeyAction>,
+    pub hotkey_rebind_cancel: bool,
+    /// Apply a captured key to the pending rebind action.
+    pub hotkey_rebind_set: Option<(HotkeyAction, Key)>,
+    pub hotkey_reset_defaults: bool,
     pub replay_enabled_changed: Option<bool>,
     pub replay_seconds_changed: Option<u32>,
     pub replay_sample_fps_changed: Option<u32>,
@@ -609,6 +657,7 @@ pub struct DrawInput<'a> {
     pub chrome: &'a UiChrome,
     pub effects: &'a EffectsUiState,
     pub color: &'a ColorUiState,
+    pub hotkeys: &'a HotkeysPrefs,
     pub logo: Option<egui::TextureHandle>,
     /// First-frame preview for the top-left clip toast.
     pub clip_toast_tex: Option<egui::TextureHandle>,
@@ -631,43 +680,63 @@ pub fn draw_ui(ctx: &Context, input: DrawInput<'_>) -> UiActions {
         ctx.set_cursor_icon(egui::CursorIcon::None);
     }
 
-    // Keyboard shortcuts: F1 = settings menu, F2 = metrics only (no toolbar).
-    ctx.input(|i| {
-        if i.key_pressed(Key::F1) {
-            if input.chrome.settings_open {
-                actions.close_settings = true;
-            } else {
-                actions.open_settings = Some(SettingsTab::Image);
+    // Click-to-rebind capture (Keys tab) — consumes the next key, Esc cancels.
+    if let Some(action) = input.chrome.hotkey_rebind {
+        ctx.input(|i| {
+            if let Some(key) = first_pressed_key(i) {
+                if key == Key::Escape {
+                    actions.hotkey_rebind_cancel = true;
+                } else if !is_reserved(key) {
+                    actions.hotkey_rebind_set = Some((action, key));
+                }
             }
-        }
-        if i.key_pressed(Key::F2) {
-            actions.cycle_metrics = true;
-        }
-        if i.key_pressed(Key::F3) {
-            actions.toggle_hud = true;
-        }
-        if i.key_pressed(Key::F9) {
-            actions.save_replay_clip = true;
-        }
-        if i.key_pressed(Key::F11) {
-            actions.toggle_fullscreen = true;
-        }
-        if i.key_pressed(Key::M) && !i.modifiers.matches_logically(Modifiers::CTRL) {
-            actions.mute_toggled = Some(!input.audio.muted);
-        }
-        if i.key_pressed(Key::Escape) {
-            // Update popup → launch tips → settings → leave fullscreen.
-            if input.chrome.update_popup_open {
-                actions.dismiss_update_popup = true;
-            } else if input.chrome.launch_tips_alpha > 0.01 {
-                actions.dismiss_launch_tips = true;
-            } else if input.chrome.settings_open {
-                actions.close_settings = true;
-            } else if input.chrome.fullscreen {
+        });
+    } else {
+        // Remappable shortcuts (defaults: F1 settings, F2 metrics, F3 HUD, F4 audio HUD…).
+        let hk = input.hotkeys;
+        ctx.input(|i| {
+            if i.key_pressed(hk.key_for(HotkeyAction::ToggleSettings)) {
+                if input.chrome.settings_open {
+                    actions.close_settings = true;
+                } else {
+                    actions.open_settings = Some(SettingsTab::Image);
+                }
+            }
+            if i.key_pressed(hk.key_for(HotkeyAction::CycleMetrics)) {
+                actions.cycle_metrics = true;
+            }
+            if i.key_pressed(hk.key_for(HotkeyAction::ToggleHud)) {
+                actions.toggle_hud = true;
+            }
+            if i.key_pressed(hk.key_for(HotkeyAction::ToggleAudioHud)) {
+                actions.toggle_audio_hud = true;
+            }
+            if i.key_pressed(hk.key_for(HotkeyAction::SaveClip)) {
+                actions.save_replay_clip = true;
+            }
+            if i.key_pressed(hk.key_for(HotkeyAction::ToggleFullscreen)) {
                 actions.toggle_fullscreen = true;
             }
-        }
-    });
+            let mute_key = hk.key_for(HotkeyAction::Mute);
+            if i.key_pressed(mute_key)
+                && !(mute_key == Key::M && i.modifiers.matches_logically(Modifiers::CTRL))
+            {
+                actions.mute_toggled = Some(!input.audio.muted);
+            }
+            if i.key_pressed(Key::Escape) {
+                // Update popup → launch tips → settings → leave fullscreen.
+                if input.chrome.update_popup_open {
+                    actions.dismiss_update_popup = true;
+                } else if input.chrome.launch_tips_alpha > 0.01 {
+                    actions.dismiss_launch_tips = true;
+                } else if input.chrome.settings_open {
+                    actions.close_settings = true;
+                } else if input.chrome.fullscreen {
+                    actions.toggle_fullscreen = true;
+                }
+            }
+        });
+    }
 
     if input.chrome.wizard_open {
         draw_wizard(
@@ -690,24 +759,38 @@ pub fn draw_ui(ctx: &Context, input: DrawInput<'_>) -> UiActions {
     if input.overlay.hud_enabled {
         draw_compact_hud(ctx, i18n, input.overlay);
     }
+    if input.overlay.audio_hud_enabled {
+        draw_audio_hud(ctx, i18n, input.overlay);
+    }
 
     if input.chrome.toolbar_visible {
         draw_toolbar(ctx, i18n, input.chrome, &mut actions);
     }
 
-    if input.chrome.launch_tips_alpha > 0.01 {
+    let tips_visible = input.chrome.launch_tips_alpha > 0.01;
+    let update_visible = input.chrome.update_popup_open;
+    if tips_visible {
         draw_launch_tips(
             ctx,
             i18n,
             input.chrome.launch_tips_alpha,
             input.logo.as_ref(),
+            input.hotkeys,
+            update_visible,
             &mut actions,
         );
     }
 
     // Non-blocking: appears after background GitHub check finds a newer tag.
-    if input.chrome.update_popup_open {
-        draw_update_popup(ctx, i18n, input.overlay, input.logo.as_ref(), &mut actions);
+    if update_visible {
+        draw_update_popup(
+            ctx,
+            i18n,
+            input.overlay,
+            input.logo.as_ref(),
+            tips_visible,
+            &mut actions,
+        );
     }
 
     // Clip toast: top-right of the preview, with optional first-frame thumb.
@@ -854,6 +937,14 @@ fn draw_toolbar(ctx: &Context, i18n: &I18n, chrome: &UiChrome, actions: &mut UiA
                         );
                         toolbar_btn(
                             ui,
+                            "⌨",
+                            &i18n.t("toolbar_keys"),
+                            &i18n.t("tip_keys_tab"),
+                            chrome.settings_tab == SettingsTab::Keys && chrome.settings_open,
+                            || actions.open_settings = Some(SettingsTab::Keys),
+                        );
+                        toolbar_btn(
+                            ui,
                             "⛶",
                             &i18n.t("toolbar_fullscreen"),
                             &i18n.t("tip_fullscreen"),
@@ -909,6 +1000,7 @@ fn draw_settings(ctx: &Context, input: &DrawInput<'_>, actions: &mut UiActions) 
                     (SettingsTab::Effects, "tab_effects"),
                     (SettingsTab::Info, "tab_info"),
                     (SettingsTab::Clips, "tab_clips"),
+                    (SettingsTab::Keys, "tab_keys"),
                 ] {
                     let selected = input.chrome.settings_tab == tab;
                     if ui.selectable_label(selected, i18n.t(key)).clicked() {
@@ -938,6 +1030,7 @@ fn draw_settings(ctx: &Context, input: &DrawInput<'_>, actions: &mut UiActions) 
                 SettingsTab::Effects => draw_effects_tab(ui, input, actions),
                 SettingsTab::Info => draw_info_tab(ui, input, actions),
                 SettingsTab::Clips => draw_clips_tab(ui, input, actions),
+                SettingsTab::Keys => draw_keys_tab(ui, input, actions),
             }
 
             ui.separator();
@@ -1220,15 +1313,43 @@ fn draw_image_tab(ui: &mut egui::Ui, input: &DrawInput<'_>, actions: &mut UiActi
     });
 }
 
-fn draw_vu_bar(ui: &mut egui::Ui, label: &str, level: f32) {
+fn draw_vu_bar(ui: &mut egui::Ui, label: &str, level: f32, peak_hold: f32) {
     ui.vertical(|ui| {
         ui.small(label);
-        ui.add(
-            egui::ProgressBar::new(level.clamp(0.0, 1.0))
-                .desired_width(48.0)
-                .desired_height(10.0),
-        );
+        let w = 48.0_f32;
+        let h = 10.0_f32;
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(w, h), Sense::hover());
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 2.0, Color32::from_rgb(28, 32, 40));
+        let fill_w = (level.clamp(0.0, 1.0) * w).max(0.0);
+        if fill_w > 0.0 {
+            let fill = egui::Rect::from_min_size(rect.min, egui::vec2(fill_w, h));
+            let color = if level > 0.95 {
+                Color32::from_rgb(220, 90, 80)
+            } else if level > 0.75 {
+                Color32::from_rgb(220, 180, 80)
+            } else {
+                Color32::from_rgb(90, 180, 140)
+            };
+            painter.rect_filled(fill, 2.0, color);
+        }
+        let hold = peak_hold.clamp(0.0, 1.0);
+        if hold > 0.02 {
+            let x = rect.left() + hold * w;
+            painter.line_segment(
+                [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                egui::Stroke::new(1.5_f32, Color32::from_rgb(240, 245, 255)),
+            );
+        }
     });
+}
+
+fn surround_channels_present(o: &OverlayState) -> bool {
+    o.audio_input_channels >= 6
+        || o.level_center > 0.02
+        || o.level_lfe > 0.02
+        || o.level_ls > 0.02
+        || o.level_rs > 0.02
 }
 
 fn draw_sound_tab(ui: &mut egui::Ui, input: &DrawInput<'_>, actions: &mut UiActions) {
@@ -1318,16 +1439,24 @@ fn draw_sound_tab(ui: &mut egui::Ui, input: &DrawInput<'_>, actions: &mut UiActi
         }
     });
 
-    // Stereo (and optional C/LFE) VU meters.
+    // Stereo + optional 5.1 VU meters (same source as F4 audio HUD).
     ui.horizontal(|ui| {
         ui.label(i18n.t("label_vu"));
-        draw_vu_bar(ui, "L", input.overlay.level_left);
-        draw_vu_bar(ui, "R", input.overlay.level_right);
-        if input.overlay.audio_input_channels >= 6 || input.overlay.level_center > 0.02 {
-            draw_vu_bar(ui, "C", input.overlay.level_center);
-            draw_vu_bar(ui, "LFE", input.overlay.level_lfe);
+        let o = input.overlay;
+        draw_vu_bar(ui, "L", o.level_left, o.peak_hold_left);
+        draw_vu_bar(ui, "R", o.level_right, o.peak_hold_right);
+        if surround_channels_present(o) {
+            draw_vu_bar(ui, "C", o.level_center, o.peak_hold_center);
+            draw_vu_bar(ui, "LFE", o.level_lfe, o.peak_hold_lfe);
+            draw_vu_bar(ui, "Ls", o.level_ls, o.peak_hold_ls);
+            draw_vu_bar(ui, "Rs", o.level_rs, o.peak_hold_rs);
         }
     });
+    ui.label(
+        RichText::new(i18n.t("tip_audio_hud_f4"))
+            .small()
+            .italics(),
+    );
 
     option_block(
         ui,
@@ -2199,6 +2328,7 @@ fn draw_compact_hud(ctx: &Context, i18n: &I18n, overlay: &OverlayState) {
         .anchor(egui::Align2::LEFT_TOP, [12.0, 12.0])
         .frame(frame)
         .show(ctx, |ui| {
+            // Numeric FPS / 1% low / latency only — no latency sparkline strip.
             ui.label(
                 RichText::new(format!(
                     "{} {:.0}  ·  {} {:.0}  ·  {} {:.1} ms",
@@ -2217,17 +2347,6 @@ fn draw_compact_hud(ctx: &Context, i18n: &I18n, overlay: &OverlayState) {
                     Color32::WHITE
                 }),
             );
-            if overlay.monitor.graph_latency && !overlay.latency_history.is_empty() {
-                draw_sparkline(ui, &overlay.latency_history, budget_ms * 2.0, |ms| {
-                    if ms > budget_ms * 1.5 {
-                        Color32::from_rgb(220, 100, 90)
-                    } else if ms > budget_ms {
-                        Color32::from_rgb(220, 180, 80)
-                    } else {
-                        Color32::from_rgb(90, 180, 140)
-                    }
-                });
-            }
             if overlay.health.kind != CaptureHealthKind::Ok {
                 ui.colored_label(
                     Color32::from_rgb(255, 180, 100),
@@ -2235,6 +2354,217 @@ fn draw_compact_hud(ctx: &Context, i18n: &I18n, overlay: &OverlayState) {
                 );
             }
         });
+}
+
+/// F4 overlay: per-channel VU + short history graphs (synced with Sound-tab meters).
+fn draw_audio_hud(ctx: &Context, i18n: &I18n, overlay: &OverlayState) {
+    let frame = egui::Frame::NONE
+        .fill(Color32::from_rgba_unmultiplied(12, 14, 18, 200))
+        .corner_radius(egui::CornerRadius::same(8))
+        .inner_margin(egui::Margin::symmetric(12, 10))
+        .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(60, 70, 90)));
+    egui::Window::new("hud_audio")
+        .title_bar(false)
+        .resizable(false)
+        .collapsible(false)
+        .anchor(egui::Align2::LEFT_BOTTOM, [12.0, -12.0])
+        .frame(frame)
+        .show(ctx, |ui| {
+            ui.label(
+                RichText::new(i18n.t("audio_hud_title"))
+                    .strong()
+                    .size(13.0),
+            );
+            ui.add_space(4.0);
+            let surround = surround_channels_present(overlay);
+            ui.horizontal(|ui| {
+                draw_audio_channel_column(
+                    ui,
+                    "L",
+                    overlay.level_left,
+                    overlay.peak_hold_left,
+                    &overlay.level_left_history,
+                );
+                draw_audio_channel_column(
+                    ui,
+                    "R",
+                    overlay.level_right,
+                    overlay.peak_hold_right,
+                    &overlay.level_right_history,
+                );
+                if surround {
+                    draw_audio_channel_column(
+                        ui,
+                        "C",
+                        overlay.level_center,
+                        overlay.peak_hold_center,
+                        &overlay.level_center_history,
+                    );
+                    draw_audio_channel_column(
+                        ui,
+                        "LFE",
+                        overlay.level_lfe,
+                        overlay.peak_hold_lfe,
+                        &overlay.level_lfe_history,
+                    );
+                    draw_audio_channel_column(
+                        ui,
+                        "Ls",
+                        overlay.level_ls,
+                        overlay.peak_hold_ls,
+                        &overlay.level_ls_history,
+                    );
+                    draw_audio_channel_column(
+                        ui,
+                        "Rs",
+                        overlay.level_rs,
+                        overlay.peak_hold_rs,
+                        &overlay.level_rs_history,
+                    );
+                }
+            });
+            ui.add_space(2.0);
+            ui.label(
+                RichText::new(i18n.t("audio_hud_hint"))
+                    .small()
+                    .weak(),
+            );
+        });
+}
+
+fn draw_audio_channel_column(
+    ui: &mut egui::Ui,
+    label: &str,
+    level: f32,
+    peak_hold: f32,
+    history: &[f32],
+) {
+    ui.vertical(|ui| {
+        ui.set_min_width(44.0);
+        ui.label(RichText::new(label).small().strong());
+        // Vertical VU bar.
+        let bar_w = 18.0_f32;
+        let bar_h = 72.0_f32;
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(bar_w, bar_h), Sense::hover());
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 2.0, Color32::from_rgb(24, 28, 34));
+        let fill_h = (level.clamp(0.0, 1.0) * bar_h).max(0.0);
+        if fill_h > 0.0 {
+            let color = if level > 0.95 {
+                Color32::from_rgb(220, 90, 80)
+            } else if level > 0.75 {
+                Color32::from_rgb(220, 180, 80)
+            } else {
+                Color32::from_rgb(90, 180, 140)
+            };
+            let fill = egui::Rect::from_min_max(
+                egui::pos2(rect.left(), rect.bottom() - fill_h),
+                rect.max,
+            );
+            painter.rect_filled(fill, 2.0, color);
+        }
+        let hold = peak_hold.clamp(0.0, 1.0);
+        if hold > 0.02 {
+            let y = rect.bottom() - hold * bar_h;
+            painter.line_segment(
+                [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
+                egui::Stroke::new(1.5_f32, Color32::from_rgb(240, 245, 255)),
+            );
+        }
+        ui.add_space(4.0);
+        draw_mini_level_sparkline(ui, history);
+        ui.label(
+            RichText::new(format!("{:.0}", (level * 100.0).clamp(0.0, 200.0)))
+                .small()
+                .monospace(),
+        );
+    });
+}
+
+fn draw_mini_level_sparkline(ui: &mut egui::Ui, values: &[f32]) {
+    let size = egui::vec2(40.0, 22.0);
+    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 2.0, Color32::from_rgb(20, 24, 30));
+    if values.is_empty() {
+        return;
+    }
+    let n = values.len().max(1) as f32;
+    for (i, &v) in values.iter().enumerate() {
+        let x0 = rect.left() + rect.width() * (i as f32 / n);
+        let x1 = rect.left() + rect.width() * ((i as f32 + 1.0) / n);
+        let h = v.clamp(0.0, 1.0) * rect.height();
+        let bar = egui::Rect::from_min_max(
+            egui::pos2(x0, rect.bottom() - h),
+            egui::pos2(x1.max(x0 + 1.0), rect.bottom()),
+        );
+        painter.rect_filled(bar, 0.0, Color32::from_rgb(100, 170, 210));
+    }
+}
+
+fn draw_keys_tab(ui: &mut egui::Ui, input: &DrawInput<'_>, actions: &mut UiActions) {
+    let i18n = input.i18n;
+    ui.label(RichText::new(i18n.t("section_hotkeys")).strong());
+    ui.label(RichText::new(i18n.t("tip_hotkeys")).small().italics());
+    ui.add_space(8.0);
+
+    if let Some(pending) = input.chrome.hotkey_rebind {
+        ui.colored_label(
+            Color32::from_rgb(220, 200, 120),
+            format!(
+                "{} — {}",
+                i18n.t("hotkey_listening"),
+                i18n.t(pending.label_key())
+            ),
+        );
+        ui.label(RichText::new(i18n.t("hotkey_listening_hint")).small());
+        if ui.button(i18n.t("btn_hotkey_cancel")).clicked() {
+            actions.hotkey_rebind_cancel = true;
+        }
+        ui.add_space(8.0);
+    }
+
+    egui::Grid::new("hotkeys_grid")
+        .num_columns(3)
+        .spacing([16.0, 8.0])
+        .striped(true)
+        .show(ui, |ui| {
+            ui.label(RichText::new(i18n.t("hotkey_col_action")).strong());
+            ui.label(RichText::new(i18n.t("hotkey_col_key")).strong());
+            ui.label("");
+            ui.end_row();
+
+            for action in HotkeyAction::ALL {
+                let listening = input.chrome.hotkey_rebind == Some(action);
+                ui.label(i18n.t(action.label_key()));
+                let key_label = if listening {
+                    "…".to_string()
+                } else {
+                    input.hotkeys.get(action).to_string()
+                };
+                let btn = egui::Button::new(RichText::new(key_label).monospace().strong())
+                    .min_size(egui::vec2(72.0, 0.0));
+                if ui.add(btn).clicked() {
+                    actions.hotkey_rebind_start = Some(action);
+                }
+                if ui
+                    .small_button(i18n.t("btn_hotkey_reset_one"))
+                    .on_hover_text(i18n.t("tip_hotkey_reset_one"))
+                    .clicked()
+                {
+                    let defaults = HotkeysPrefs::default();
+                    let def_key = defaults.key_for(action);
+                    actions.hotkey_rebind_set = Some((action, def_key));
+                }
+                ui.end_row();
+            }
+        });
+
+    ui.add_space(12.0);
+    if ui.button(i18n.t("btn_hotkey_reset_all")).clicked() {
+        actions.hotkey_reset_defaults = true;
+    }
+    ui.label(RichText::new(i18n.t("hotkey_esc_reserved")).small().weak());
 }
 
 fn health_label(i18n: &I18n, kind: CaptureHealthKind) -> String {
@@ -2254,6 +2584,13 @@ fn draw_hud_prefs(ui: &mut egui::Ui, i18n: &I18n, o: &OverlayState, actions: &mu
     let mut hud = o.hud_enabled;
     if ui.checkbox(&mut hud, i18n.t("label_hud_enable")).changed() {
         actions.hud_enabled_changed = Some(hud);
+    }
+    let mut audio_hud = o.audio_hud_enabled;
+    if ui
+        .checkbox(&mut audio_hud, i18n.t("label_audio_hud_enable"))
+        .changed()
+    {
+        actions.audio_hud_enabled_changed = Some(audio_hud);
     }
     let mut top = o.hud_always_on_top;
     if ui
@@ -2610,24 +2947,32 @@ fn draw_update_prefs(ui: &mut egui::Ui, i18n: &I18n, o: &OverlayState, actions: 
 
 
 /// Startup modal when GitHub Releases reports a newer tag (once per session).
+/// When launch tips are also visible, sits below center so both stay readable.
 fn draw_update_popup(
     ctx: &Context,
     i18n: &I18n,
     overlay: &OverlayState,
     logo: Option<&egui::TextureHandle>,
+    tips_also_visible: bool,
     actions: &mut UiActions,
 ) {
     let screen = ctx.screen_rect();
-    // Dim layer absorbs clicks so capture UI underneath is not hit.
+    // Soft dim only when tips are gone — keep both boxes readable when stacked.
+    let dim_alpha = if tips_also_visible { 60 } else { 140 };
     egui::Area::new(egui::Id::new("update_popup_dim"))
         .fixed_pos(screen.min)
         .order(egui::Order::Foreground)
         .show(ctx, |ui| {
-            let _ = ui.allocate_response(screen.size(), egui::Sense::click());
+            let sense = if tips_also_visible {
+                egui::Sense::hover()
+            } else {
+                egui::Sense::click()
+            };
+            let _ = ui.allocate_response(screen.size(), sense);
             ui.painter().rect_filled(
                 screen,
                 0.0,
-                Color32::from_rgba_unmultiplied(0, 0, 0, 140),
+                Color32::from_rgba_unmultiplied(0, 0, 0, dim_alpha),
             );
         });
 
@@ -2638,11 +2983,16 @@ fn draw_update_popup(
     );
     let skip_id = egui::Id::new("update_popup_skip");
     let mut skip = ctx.data(|d| d.get_temp::<bool>(skip_id).unwrap_or(false));
+    let anchor_offset = if tips_also_visible {
+        [0.0, 160.0]
+    } else {
+        [0.0, 0.0]
+    };
     egui::Window::new(title)
         .id(egui::Id::new("update_popup"))
         .collapsible(false)
-        .resizable(false)
-        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .resizable(true)
+        .anchor(egui::Align2::CENTER_CENTER, anchor_offset)
         .order(egui::Order::Foreground)
         .frame(
             egui::Frame::NONE
@@ -2655,8 +3005,8 @@ fn draw_update_popup(
                 )),
         )
         .show(ctx, |ui| {
-            ui.set_min_width(380.0);
-            ui.set_max_width(480.0);
+            ui.set_min_width(400.0);
+            ui.set_max_width(520.0);
             ui.horizontal(|ui| {
                 if let Some(tex) = logo {
                     ui.add(egui::Image::new(tex).fit_to_exact_size(egui::vec2(28.0, 28.0)));
@@ -2674,15 +3024,17 @@ fn draw_update_popup(
                 });
             });
             ui.add_space(10.0);
+            // Patch notes from GitHub release body (CHANGELOG / What's Changed).
+            ui.label(RichText::new(i18n.t("update_popup_notes")).strong());
             if !overlay.update.body.is_empty() {
-                ui.label(RichText::new(i18n.t("update_popup_notes")).strong());
                 egui::ScrollArea::vertical()
                     .id_salt("update_popup_body")
-                    .max_height(180.0)
+                    .max_height(220.0)
                     .show(ui, |ui| {
+                        ui.set_min_width(360.0);
                         ui.label(
                             RichText::new(overlay.update.body.as_str())
-                                .small()
+                                .size(13.0)
                                 .color(Color32::from_rgb(200, 205, 215)),
                         );
                     });
@@ -3083,19 +3435,23 @@ fn draw_brand_header(
     ui.add_space(6.0);
 }
 
-/// Soft, centered shortcuts card shown once after launch (auto-fades; Esc/click dismiss).
+/// Soft shortcuts card shown once after launch (auto-fades; Esc/click dismiss).
+/// Offset upward when the update modal is also open so both stay readable.
 fn draw_launch_tips(
     ctx: &Context,
     i18n: &I18n,
     alpha: f32,
     logo: Option<&egui::TextureHandle>,
+    hotkeys: &HotkeysPrefs,
+    update_also_visible: bool,
     actions: &mut UiActions,
 ) {
     let a = alpha.clamp(0.0, 1.0);
     // Smooth fade without a busy loop (display FPS still caps presents).
     ctx.request_repaint_after(std::time::Duration::from_millis(16));
-    // Any click dismisses (button / card / empty space).
-    if ctx.input(|i| i.pointer.any_click()) {
+    // Any click dismisses unless the update modal is sharing the screen
+    // (clicks there should hit the update buttons, not wipe tips).
+    if !update_also_visible && ctx.input(|i| i.pointer.any_click()) {
         actions.dismiss_launch_tips = true;
     }
 
@@ -3103,19 +3459,30 @@ fn draw_launch_tips(
     let text = Color32::from_rgba_unmultiplied(235, 238, 245, (255.0 * a) as u8);
     let muted = Color32::from_rgba_unmultiplied(180, 186, 198, (220.0 * a) as u8);
 
-    let rows = [
-        ("launch_tips_key_f1", "launch_tips_desc_f1"),
-        ("launch_tips_key_f2", "launch_tips_desc_f2"),
-        ("launch_tips_key_f3", "launch_tips_desc_f3"),
-        ("launch_tips_key_f9", "launch_tips_desc_f9"),
-        ("launch_tips_key_f11", "launch_tips_desc_f11"),
-        ("launch_tips_key_esc", "launch_tips_desc_esc"),
-        ("launch_tips_key_pin", "launch_tips_desc_pin"),
-        ("launch_tips_key_mouse", "launch_tips_desc_mouse"),
+    // (key label, description i18n key) — remappable keys use live prefs.
+    let bound = |a: HotkeyAction| hotkeys.get(a).to_string();
+    let rows: [(String, &str); 9] = [
+        (bound(HotkeyAction::ToggleSettings), "launch_tips_desc_f1"),
+        (bound(HotkeyAction::CycleMetrics), "launch_tips_desc_f2"),
+        (bound(HotkeyAction::ToggleHud), "launch_tips_desc_f3"),
+        (bound(HotkeyAction::ToggleAudioHud), "launch_tips_desc_f4"),
+        (bound(HotkeyAction::SaveClip), "launch_tips_desc_f9"),
+        (
+            bound(HotkeyAction::ToggleFullscreen),
+            "launch_tips_desc_f11",
+        ),
+        (i18n.t("launch_tips_key_esc"), "launch_tips_desc_esc"),
+        (i18n.t("launch_tips_key_pin"), "launch_tips_desc_pin"),
+        (i18n.t("launch_tips_key_mouse"), "launch_tips_desc_mouse"),
     ];
 
+    let tip_offset = if update_also_visible {
+        [0.0, -200.0]
+    } else {
+        [0.0, 0.0]
+    };
     egui::Area::new(egui::Id::new("launch_tips"))
-        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .anchor(egui::Align2::CENTER_CENTER, tip_offset)
         .order(egui::Order::Foreground)
         .show(ctx, |ui| {
             let frame = egui::Frame::NONE
@@ -3133,7 +3500,12 @@ fn draw_launch_tips(
                         ui.add(
                             egui::Image::new(tex)
                                 .fit_to_exact_size(egui::vec2(28.0, 28.0))
-                                .tint(Color32::from_rgba_unmultiplied(255, 255, 255, (255.0 * a) as u8)),
+                                .tint(Color32::from_rgba_unmultiplied(
+                                    255,
+                                    255,
+                                    255,
+                                    (255.0 * a) as u8,
+                                )),
                         );
                     }
                     ui.label(
@@ -3144,14 +3516,19 @@ fn draw_launch_tips(
                     );
                 });
                 ui.add_space(12.0);
-                for (key_id, desc_id) in rows {
-                    draw_launch_tip_row(ui, a, &i18n.t(key_id), &i18n.t(desc_id), text);
+                for (key_disp, desc_id) in &rows {
+                    draw_launch_tip_row(ui, a, key_disp, &i18n.t(desc_id), text);
                     ui.add_space(6.0);
                 }
                 ui.add_space(6.0);
                 ui.label(RichText::new(i18n.t("launch_tips_hint")).small().color(muted));
                 ui.add_space(8.0);
-                let _ = ui.add_enabled(a > 0.4, egui::Button::new(i18n.t("launch_tips_dismiss")));
+                if ui
+                    .add_enabled(a > 0.4, egui::Button::new(i18n.t("launch_tips_dismiss")))
+                    .clicked()
+                {
+                    actions.dismiss_launch_tips = true;
+                }
             });
         });
 }

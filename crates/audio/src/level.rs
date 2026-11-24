@@ -1,4 +1,4 @@
-//! Peak level meters shared with the UI (stereo + optional center/LFE).
+//! Peak level meters shared with the UI (stereo + optional 5.1 channels).
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -11,6 +11,8 @@ pub struct LevelMeter {
     peak_r_milli: AtomicU32,
     peak_c_milli: AtomicU32,
     peak_lfe_milli: AtomicU32,
+    peak_ls_milli: AtomicU32,
+    peak_rs_milli: AtomicU32,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -20,6 +22,10 @@ pub struct ChannelPeaks {
     pub right: f32,
     pub center: f32,
     pub lfe: f32,
+    /// Surround / back left (WAVE 5.1 ch 4).
+    pub ls: f32,
+    /// Surround / back right (WAVE 5.1 ch 5).
+    pub rs: f32,
 }
 
 impl LevelMeter {
@@ -47,7 +53,7 @@ impl LevelMeter {
         Self::store_max(&self.peak_r_milli, (right * 1000.0).round() as u32);
     }
 
-    /// Observe pre-fold multi-channel frames (FL FR FC LFE …) for per-channel VU.
+    /// Observe pre-fold multi-channel frames (FL FR FC LFE BL BR …) for per-channel VU.
     pub fn observe_interleaved_channels(&self, samples: &[f32], channels: usize) {
         if channels == 0 || samples.is_empty() {
             return;
@@ -62,6 +68,8 @@ impl LevelMeter {
         let mut right = 0.0f32;
         let mut center = 0.0f32;
         let mut lfe = 0.0f32;
+        let mut ls = 0.0f32;
+        let mut rs = 0.0f32;
         for f in 0..frames {
             let base = f * channels;
             let fl = samples[base].abs();
@@ -83,12 +91,25 @@ impl LevelMeter {
                 lfe = lfe.max(lf);
                 peak = peak.max(lf);
             }
+            // WAVEFORMATEXTENSIBLE 5.1: ch4 = BL/SL, ch5 = BR/SR.
+            if channels > 4 {
+                let s = samples[base + 4].abs();
+                ls = ls.max(s);
+                peak = peak.max(s);
+            }
+            if channels > 5 {
+                let s = samples[base + 5].abs();
+                rs = rs.max(s);
+                peak = peak.max(s);
+            }
         }
         Self::store_max(&self.peak_milli, (peak * 1000.0).round() as u32);
         Self::store_max(&self.peak_l_milli, (left * 1000.0).round() as u32);
         Self::store_max(&self.peak_r_milli, (right * 1000.0).round() as u32);
         Self::store_max(&self.peak_c_milli, (center * 1000.0).round() as u32);
         Self::store_max(&self.peak_lfe_milli, (lfe * 1000.0).round() as u32);
+        Self::store_max(&self.peak_ls_milli, (ls * 1000.0).round() as u32);
+        Self::store_max(&self.peak_rs_milli, (rs * 1000.0).round() as u32);
     }
 
     fn take_slot(slot: &AtomicU32) -> f32 {
@@ -104,6 +125,8 @@ impl LevelMeter {
             right: Self::take_slot(&self.peak_r_milli),
             center: Self::take_slot(&self.peak_c_milli),
             lfe: Self::take_slot(&self.peak_lfe_milli),
+            ls: Self::take_slot(&self.peak_ls_milli),
+            rs: Self::take_slot(&self.peak_rs_milli),
         }
     }
 
@@ -114,5 +137,36 @@ impl LevelMeter {
 
     pub fn peek_peak(&self) -> f32 {
         self.peak_milli.load(Ordering::Relaxed) as f32 / 1000.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stereo_peaks() {
+        let m = LevelMeter::new();
+        m.observe_interleaved_stereo(&[0.5, -0.25, 0.1, 0.8]);
+        let p = m.take_peaks();
+        assert!((p.left - 0.5).abs() < 0.001);
+        assert!((p.right - 0.8).abs() < 0.001);
+        assert!((p.peak - 0.8).abs() < 0.001);
+    }
+
+    #[test]
+    fn surround_peaks_include_ls_rs() {
+        let m = LevelMeter::new();
+        // One 5.1 frame: FL FR FC LFE LS RS
+        let frame = [0.1, 0.2, 0.3, 0.4, 0.55, 0.66];
+        m.observe_interleaved_channels(&frame, 6);
+        let p = m.take_peaks();
+        assert!((p.left - 0.1).abs() < 0.001);
+        assert!((p.right - 0.2).abs() < 0.001);
+        assert!((p.center - 0.3).abs() < 0.001);
+        assert!((p.lfe - 0.4).abs() < 0.001);
+        assert!((p.ls - 0.55).abs() < 0.001);
+        assert!((p.rs - 0.66).abs() < 0.001);
+        assert!((p.peak - 0.66).abs() < 0.001);
     }
 }
