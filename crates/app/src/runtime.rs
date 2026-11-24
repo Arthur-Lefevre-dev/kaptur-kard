@@ -1914,9 +1914,33 @@ impl App {
             self.ui_prefs.hud_enabled = on;
             self.persist_ui_prefs();
         }
+        if actions.toggle_audio_hud {
+            self.ui_prefs.audio_hud_enabled = !self.ui_prefs.audio_hud_enabled;
+            self.persist_ui_prefs();
+        }
+        if let Some(on) = actions.audio_hud_enabled_changed {
+            self.ui_prefs.audio_hud_enabled = on;
+            self.persist_ui_prefs();
+        }
         if let Some(on) = actions.hud_always_on_top_changed {
             self.ui_prefs.hud_always_on_top = on;
             self.apply_window_level();
+            self.persist_ui_prefs();
+        }
+        if let Some(action) = actions.hotkey_rebind_start {
+            self.chrome.hotkey_rebind = Some(action);
+        }
+        if actions.hotkey_rebind_cancel {
+            self.chrome.hotkey_rebind = None;
+        }
+        if let Some((action, key)) = actions.hotkey_rebind_set {
+            self.ui_prefs.hotkeys.bind(action, key);
+            self.chrome.hotkey_rebind = None;
+            self.persist_ui_prefs();
+        }
+        if actions.hotkey_reset_defaults {
+            self.ui_prefs.hotkeys.reset_defaults();
+            self.chrome.hotkey_rebind = None;
             self.persist_ui_prefs();
         }
         if let Some(on) = actions.replay_enabled_changed {
@@ -2427,6 +2451,7 @@ impl App {
         self.maybe_open_update_popup();
         self.overlay.hud_enabled = self.ui_prefs.hud_enabled;
         self.overlay.hud_always_on_top = self.ui_prefs.hud_always_on_top;
+        self.overlay.audio_hud_enabled = self.ui_prefs.audio_hud_enabled;
         self.overlay.replay_enabled = self.ui_prefs.replay_enabled;
         self.overlay.replay_seconds = self.ui_prefs.replay_seconds;
         self.overlay.replay_frames = self.replay.frame_count() as u32;
@@ -2456,15 +2481,12 @@ impl App {
     }
 
     /// Open the startup update modal once when a newer release arrives (non-blocking).
+    /// May show alongside launch tips — UI stacks/offsets both so they stay readable.
     fn maybe_open_update_popup(&mut self) {
         if self.update_popup_dismissed || self.chrome.update_popup_open {
             return;
         }
         if self.chrome.wizard_open {
-            return;
-        }
-        // Avoid stacking on top of the brief launch shortcuts card.
-        if !self.launch_tips_dismissed && self.chrome.launch_tips_alpha > 0.01 {
             return;
         }
         if !self.ui_prefs.update_check {
@@ -3013,6 +3035,53 @@ impl App {
         self.overlay.level_right = peaks.right;
         self.overlay.level_center = peaks.center;
         self.overlay.level_lfe = peaks.lfe;
+        self.overlay.level_ls = peaks.ls;
+        self.overlay.level_rs = peaks.rs;
+        // Peak-hold needles (shared by Sound tab + F4 audio HUD).
+        let decay = |slot: &mut f32, current: f32| {
+            if current >= *slot {
+                *slot = current;
+            } else {
+                *slot = (*slot * 0.985).max(current);
+            }
+        };
+        decay(&mut self.overlay.peak_hold_left, peaks.left);
+        decay(&mut self.overlay.peak_hold_right, peaks.right);
+        decay(&mut self.overlay.peak_hold_center, peaks.center);
+        decay(&mut self.overlay.peak_hold_lfe, peaks.lfe);
+        decay(&mut self.overlay.peak_hold_ls, peaks.ls);
+        decay(&mut self.overlay.peak_hold_rs, peaks.rs);
+        const LEVEL_HISTORY: usize = 48;
+        push_history(
+            &mut self.overlay.level_left_history,
+            peaks.left.clamp(0.0, 1.0),
+            LEVEL_HISTORY,
+        );
+        push_history(
+            &mut self.overlay.level_right_history,
+            peaks.right.clamp(0.0, 1.0),
+            LEVEL_HISTORY,
+        );
+        push_history(
+            &mut self.overlay.level_center_history,
+            peaks.center.clamp(0.0, 1.0),
+            LEVEL_HISTORY,
+        );
+        push_history(
+            &mut self.overlay.level_lfe_history,
+            peaks.lfe.clamp(0.0, 1.0),
+            LEVEL_HISTORY,
+        );
+        push_history(
+            &mut self.overlay.level_ls_history,
+            peaks.ls.clamp(0.0, 1.0),
+            LEVEL_HISTORY,
+        );
+        push_history(
+            &mut self.overlay.level_rs_history,
+            peaks.rs.clamp(0.0, 1.0),
+            LEVEL_HISTORY,
+        );
         let audio_st = self.audio.status();
         self.overlay.audio_notice = audio_st.notice.clone();
         self.overlay.audio_input_channels = audio_st.input_channels;
@@ -3066,6 +3135,7 @@ impl App {
         let ui_keeps_cursor = self.chrome.settings_open
             || self.chrome.wizard_open
             || self.chrome.update_popup_open
+            || self.chrome.hotkey_rebind.is_some()
             || self.chrome.launch_tips_alpha > 0.01;
         let want_hide = !ui_keeps_cursor && self.last_pointer_at.elapsed() > CURSOR_IDLE_HIDE;
         self.chrome.hide_idle_cursor = want_hide;
@@ -3103,6 +3173,7 @@ impl App {
         self.sync_effects_ui();
         let effects = self.effects_ui.clone();
         let color = self.color_ui.clone();
+        let hotkeys = self.ui_prefs.hotkeys.clone();
         // Video presents every tick; egui widgets only draw when chrome/overlay is active.
 
         let mut actions = ui::UiActions::default();
@@ -3197,6 +3268,7 @@ impl App {
                     chrome: &chrome,
                     effects: &effects,
                     color: &color,
+                    hotkeys: &hotkeys,
                     logo: logo.clone(),
                     clip_toast_tex: clip_toast_tex.clone(),
                     clip_thumbs: &clip_thumbs,

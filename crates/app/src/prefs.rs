@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::export::ExportPrefs;
 use crate::health::HealthPrefs;
+use crate::hotkeys::HotkeysPrefs;
 use crate::lut::GradePrefs;
 use crate::profiles::ProfilesPrefs;
 
@@ -130,6 +131,12 @@ pub struct UiPrefs {
     /// Pin main window above others while the HUD is useful for monitoring.
     #[serde(default)]
     pub hud_always_on_top: bool,
+    /// F4 audio visualization HUD (per-channel VU / graphs).
+    #[serde(default)]
+    pub audio_hud_enabled: bool,
+    /// Remappable keyboard shortcuts.
+    #[serde(default)]
+    pub hotkeys: HotkeysPrefs,
     /// Rolling replay buffer (seconds, 3–30).
     #[serde(default = "default_replay_seconds")]
     pub replay_seconds: u32,
@@ -312,6 +319,8 @@ impl Default for UiPrefs {
             profiles: ProfilesPrefs::default(),
             hud_enabled: false,
             hud_always_on_top: false,
+            audio_hud_enabled: false,
+            hotkeys: HotkeysPrefs::default(),
             replay_seconds: default_replay_seconds(),
             replay_enabled: false,
             replay_sample_fps: default_replay_sample_fps(),
